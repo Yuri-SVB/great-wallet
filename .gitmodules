@@ -19,3 +19,6 @@
 [submodule "celestial-peace-nf-core"]
 	path = celestial-peace-nf-core
 	url = git@github.com:Yuri-SVB/celestial-peace-nf-core.git
+[submodule "mountain-dynasty"]
+	path = mountain-dynasty
+	url = git@github.com:Yuri-SVB/mountain-dynasty.git
