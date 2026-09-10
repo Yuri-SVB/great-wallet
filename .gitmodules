@@ -16,3 +16,6 @@
 [submodule "flying-turtle"]
 	path = flying-turtle
 	url = git@github.com:Yuri-SVB/flying-turtle.git
+[submodule "celestial-peace-nf-core"]
+	path = celestial-peace-nf-core
+	url = git@github.com:Yuri-SVB/celestial-peace-nf-core.git
