@@ -1,9 +1,9 @@
 [submodule "great-wall-core"]
 	path = great-wall-core
 	url = git@github.com:Yuri-SVB/great-wall-core.git
-[submodule "tlp-core"]
-	path = tlp-core
-	url = git@github.com:Yuri-SVB/tlp-core.git
+[submodule "star-clock"]
+	path = star-clock
+	url = git@github.com:Yuri-SVB/star-clock.git
 [submodule "great-wall-docs"]
 	path = great-wall-docs
 	url = git@github.com-yuri-svb:yuri-svb/great-wall-docs.git
@@ -13,3 +13,12 @@
 [submodule "namtso-the-sacred-salt"]
 	path = namtso-the-sacred-salt
 	url = git@github.com:yuri-svb/namtso-the-sacred-salt.git
+[submodule "flying-turtle"]
+	path = flying-turtle
+	url = git@github.com:Yuri-SVB/flying-turtle.git
+[submodule "celestial-peace-nf-core"]
+	path = celestial-peace-nf-core
+	url = git@github.com:Yuri-SVB/celestial-peace-nf-core.git
+[submodule "mountain-dynasty"]
+	path = mountain-dynasty
+	url = git@github.com:Yuri-SVB/mountain-dynasty.git
