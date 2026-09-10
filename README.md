@@ -155,6 +155,15 @@ ecosystem.
 
 ---
 
+## ⚡ Support
+
+This is free software. Nothing is gated, no release is delayed, and there is no
+paid edition.
+
+If it was worth something to you, there is a Lightning (BOLT12) offer and an
+on-chain silent payment address at **[github.com/Yuri-SVB/SUPPORT](https://github.com/Yuri-SVB/SUPPORT)**,
+alongside a dated log of what has actually shipped.
+
 ## License
 
 Great Wallet is dual-licensed under either of:
