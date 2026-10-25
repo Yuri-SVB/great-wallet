@@ -5349,6 +5349,38 @@ class _SetupScreenState extends State<SetupScreen> {
   /// `H(K_i ‖ label)` (the demoted `[A-Z0-9-]` pepper — one setup, many keys).
   /// `K` copies the conventional first-32-hex view; `Alt+K` ([full]) the whole
   /// digest. Cheap `H` throughout — no Argon2id pass, so no deriving spinner.
+  /// Entropy actually behind the exported key at [stage]: the placed points,
+  /// `Σ r_j × 32` bits over stages `0..stage`. This is what an attacker must
+  /// guess; the 512-bit state and the copied view can each *cap* what is
+  /// carried, never raise it.
+  int _placedEntropyBits(int stage) {
+    int bits = 0;
+    for (int i = 0; i <= stage && i <= _maxStage; i++) {
+      bits += _requiredFractals[i] * EncodingConstants.bitsPerPoint;
+    }
+    return bits;
+  }
+
+  /// One-line entropy readout for the export surfaces: how much is usable, and
+  /// which of the three limits is binding. [viewBits] is what the copied form
+  /// actually carries (4 bits per hex digit).
+  ///
+  /// Stated because the conventional 32-digit view is a *display* convention
+  /// inherited from the 1024-byte Argon2id export, not a statement about the
+  /// key — so the figure a holder is relying on is not otherwise visible.
+  String _exportEntropyNote(int stage, int viewBits) {
+    final int placed = _placedEntropyBits(stage);
+    const int stateBits = kOrbitPointLen * 8;
+    final int usable = math.min(placed, math.min(viewBits, stateBits));
+    final String limit = usable == placed
+        ? 'your placed points'
+        : usable == viewBits
+            ? 'this view — Alt+K copies all $stateBits bits'
+            : 'the orbit state';
+    return '$usable bits usable at stage $stage '
+        '($placed placed, $viewBits in this view; limited by $limit)';
+  }
+
   Future<void> _copyOrbitMaster({bool full = false}) async {
     final Uint8List? ki = _activeK;
     if (ki == null) {
@@ -5369,10 +5401,12 @@ class _SetupScreenState extends State<SetupScreen> {
     await Clipboard.setData(ClipboardData(text: secret));
     if (!mounted) return;
     _sounds.play(UiSound.exportOk);
-    // Confirmation never echoes the secret itself.
-    _toast(full
-        ? 'Full key copied ($chars chars) — paste it, then clear the clipboard.'
-        : 'Key copied — paste it, then clear the clipboard.');
+    // Confirmation never echoes the secret itself — only how much of it there is.
+    _toast('${full ? 'Full key' : 'Key'} copied ($chars chars) — '
+        '${_exportEntropyNote(_activeStage, chars * 4)}.'
+        '${_activeStage == 0 ? ' Stage 0 is σ-public and its points are assumed'
+            ' seizable, so this key carries no coercion resistance.' : ''}'
+        ' Paste it, then clear the clipboard.');
   }
 
   /// Append a line to the console log (the app's toast surface).
@@ -5480,8 +5514,12 @@ class _SetupScreenState extends State<SetupScreen> {
       case _Field.exportLabel:
         if (_isBoardSlot) {
           return 'Key (master-secret export): this stage’s orbit key '
-              'Kᵢ = H(oᵢ ‖ Shᵢ), fixed once rᵢ fractals are placed. '
-              'Paste into another wallet or use as a downstream pepper. This '
+              'Kᵢ = TH(tag, oᵢ ‖ Shᵢ), fixed once rᵢ fractals are placed and '
+              'domain-separated from the orbit advance — leaking it does not '
+              'expose the stages above. What you copy is Kᵢ salted by the label '
+              'below. '
+              '${_exportEntropyNote(_activeStage, MasterSecret.displayChars * 4)}. '
+              'Paste into another wallet or use as a downstream pepper. The '
               'optional salt versions the key (e.g. SIGNING-1, '
               'uppercase/digits/hyphen). Press K to copy — blind, never shown.';
         }
