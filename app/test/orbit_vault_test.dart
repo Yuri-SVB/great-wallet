@@ -21,14 +21,14 @@ void main() {
           // A deep stage: carries its memory-hard o_i so restore skips Argon2.
           OrbitVaultStage(
             required: 3,
-            orbit: <int>[for (int i = 0; i < 32; i++) i],
+            orbit: <int>[for (int i = 0; i < 64; i++) i],
             points: <OrbitVaultPoint>[point(1, 30), point(3, 40), point(5, 50)],
           ),
         ],
       );
 
-  group('settled orbit vault (v1)', () {
-    test('round-trips through JSON and stays version 1 / kind orbit', () {
+  group('settled orbit vault', () {
+    test('round-trips through JSON at the current version / kind orbit', () {
       final OrbitVault v = sample();
       final Map<String, dynamic> json = v.toJson();
       expect(json['v'], OrbitVault.formatVersion);
@@ -42,7 +42,7 @@ void main() {
       expect(back.stages[0].orbit, isNull);
       expect(back.stages[0].points.length, 2);
       expect(back.stages[1].required, 3);
-      expect(back.stages[1].orbit, hasLength(32));
+      expect(back.stages[1].orbit, hasLength(64));
       expect(back.stages[1].points[1].slot, 3);
       expect(back.stages[1].points[2].imRaw, 51);
     });
@@ -55,7 +55,7 @@ void main() {
     test('rejects an empty stage list', () {
       expect(
         () => OrbitVault.fromJson(<String, dynamic>{
-          'v': 1,
+          'v': OrbitVault.formatVersion,
           'kind': 'orbit',
           'sigma': 'AA',
           'iterations': 1,
@@ -67,7 +67,7 @@ void main() {
     });
   });
 
-  group('halted-advance resume section (v2)', () {
+  group('halted-advance resume section', () {
     OrbitVault halted() => OrbitVault(
           sigma: 'DEADBEEF',
           iterations: 8,
@@ -82,18 +82,18 @@ void main() {
           resume: OrbitVaultResume(
             stage: 1,
             pass: 3,
-            digest: <int>[for (int i = 0; i < 32; i++) 0x80 + i],
+            digest: <int>[for (int i = 0; i < 64; i++) (0x80 + i) & 0xFF],
           ),
         );
 
-    test('round-trips the checkpoint and writes version 2', () {
+    test('round-trips the checkpoint and writes the current version', () {
       final Map<String, dynamic> json = halted().toJson();
-      expect(json['v'], 2);
+      expect(json['v'], OrbitVault.formatVersion);
       final OrbitVault back = OrbitVault.fromJson(json);
       expect(back.resume, isNotNull);
       expect(back.resume!.stage, 1);
       expect(back.resume!.pass, 3);
-      expect(back.resume!.digest, hasLength(32));
+      expect(back.resume!.digest, hasLength(64));
     });
 
     test('a settled setup omits the section entirely', () {
@@ -101,17 +101,21 @@ void main() {
       expect(OrbitVault.fromJson(sample().toJson()).resume, isNull);
     });
 
-    test('a v1 file still loads, with no checkpoint', () {
-      // Exactly what the previous build wrote: version 1, no `resume` key.
-      final Map<String, dynamic> v1 = sample().toJson()..['v'] = 1;
-      final OrbitVault back = OrbitVault.fromJson(v1);
-      expect(back.resume, isNull);
-      expect(back.stages, hasLength(2));
+    test('pre-0.5.0 files are refused, not half-read', () {
+      // v1 and v2 hold 256-bit o_i. The 0.5.0 orbit cannot be rebuilt from them,
+      // and a short o_i would be zero-padded by the FFI marshalling and derive a
+      // different orbit in silence — so the version gate must reject them.
+      for (final int v in <int>[1, 2]) {
+        final Map<String, dynamic> old = sample().toJson()..['v'] = v;
+        expect(() => OrbitVault.fromJson(old), throwsFormatException,
+            reason: 'v$v is a 0.4.0 file');
+      }
     });
 
     test('a version newer than this build is refused', () {
-      final Map<String, dynamic> v3 = sample().toJson()..['v'] = 3;
-      expect(() => OrbitVault.fromJson(v3), throwsFormatException);
+      final Map<String, dynamic> next = sample().toJson()
+        ..['v'] = OrbitVault.formatVersion + 1;
+      expect(() => OrbitVault.fromJson(next), throwsFormatException);
     });
 
     test('an ill-formed checkpoint is refused, not ignored', () {
@@ -139,7 +143,7 @@ void main() {
       // A legacy chain SetupVault payload shape — no `kind`, has `text`.
       expect(
         () => OrbitVault.fromJson(<String, dynamic>{
-          'v': 1,
+          'v': OrbitVault.formatVersion,
           'text': 'SALT-1',
           'iterations': 7,
           'profile': Argon2Profile.basic.value,

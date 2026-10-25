@@ -4067,7 +4067,9 @@ class _SetupScreenState extends State<SetupScreen> {
         if (oI != null) return _vaultOpaqueError;
         orbits.add(widget.core.orbitRoot(sigma));
       } else {
-        if (oI == null || oI.isEmpty) return _vaultOpaqueError;
+        // Width is load-bearing, not cosmetic: a short o_i would be zero-padded
+        // by the FFI marshalling and derive a different orbit in silence.
+        if (oI == null || oI.length != kOrbitPointLen) return _vaultOpaqueError;
         orbits.add(Uint8List.fromList(oI));
       }
       // Under r_i placed points Sh_i is not fixed, so the stage would restore
@@ -4145,6 +4147,7 @@ class _SetupScreenState extends State<SetupScreen> {
           r.stage == deepest + 1 &&
           r.pass >= 1 &&
           r.pass < vault.iterations &&
+          r.digest.length == kOrbitPointLen &&
           _orbitK[deepest] != null) {
         _advanceCheckpoint = (
           stage: r.stage,

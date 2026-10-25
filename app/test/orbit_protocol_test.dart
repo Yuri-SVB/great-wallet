@@ -21,7 +21,7 @@ import 'package:great_wallet_app/src/ffi/library_loader.dart';
 ///     level). Byte-identical config to test_orbit_protocol.py's FAST_PARAMS.
 ///  2. Frozen-vector cross-check: reproduces the cheap per-stage derivations
 ///     (theta params, decoded chunks, Sh, K_i) from the FROZEN o_i in
-///     great-wall-core's test_vectors/orbit-v0.4.0/*.json — the same thing
+///     great-wall-core's test_vectors/orbit-v0.5.0/*.json — the same thing
 ///     test_orbit_vectors.py checks, now from Dart. Skipped unless the
 ///     great-wall-core submodule is checked out beside app/ AND its engine
 ///     version matches the linked engine (a version drift is reported, never a
@@ -378,7 +378,7 @@ int _resistanceAbscissa(int k) => 0x80000000 | (k + 1);
 /// core submodule inside great-wallet.
 Directory _locateVectorDir() {
   const String rel =
-      '../great-wall-core/burning_ship/test_vectors/orbit-v0.4.0';
+      '../great-wall-core/burning_ship/test_vectors/orbit-v0.5.0';
   return Directory(rel);
 }
 

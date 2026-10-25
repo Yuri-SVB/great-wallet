@@ -15,10 +15,9 @@ import '../ffi/core_bindings.dart' show Argon2Profile;
 /// [SetupController] chain session, so restoring it does **not** enter the
 /// legacy `memorise` phase.
 ///
-/// Only a **settled** orbit setup is representable (every stage complete, every
-/// `o_i` known). A halted, mid-advance ("resumable") orbit vault needs a
-/// checkpointable advance in the engine and is deferred
-/// (`next-steps/orbit-persistence-and-provisional-key-roles.md`, Role 1).
+/// A settled orbit is the common case; a halted, mid-advance one also rides
+/// here, via the optional [resume] checkpoint (Role 1 of
+/// `next-steps/orbit-persistence-and-provisional-key-roles.md`).
 ///
 /// SECURITY — this object **is the secret**. `o_i` (`i ≥ 1`) reconstructs the
 /// wallet from stage `i` onward, and the placed point coordinates are
@@ -38,16 +37,23 @@ class OrbitVault {
     this.resume,
   });
 
-  /// On-disk format version written by this build. Version 2 adds **optional
-  /// sections** alongside the settled orbit: [resume] (a halted advance's
-  /// checkpoint) and, when CPNF lands, the review deck. Because the sections are
-  /// optional and additive, a later one does **not** need another bump — only a
-  /// change to the existing fields would.
-  static const int formatVersion = 2;
+  /// On-disk format version written by this build.
+  ///
+  /// - **v1** — settled orbit, protocol 0.4.0 (256-bit `o_i`).
+  /// - **v2** — adds optional sections: [resume], and the CPNF deck when it
+  ///   lands. Still 0.4.0 widths.
+  /// - **v3** — protocol 0.5.0: `o_i` and the resume digest are 512-bit.
+  ///
+  /// The file stores `o_i`, so its version must move whenever the orbit's width
+  /// or derivation moves. Optional *sections* remain additive within a version —
+  /// the deck can join v3 without another bump — but a width change cannot.
+  static const int formatVersion = 3;
 
-  /// Oldest version still readable. A v1 file is a settled orbit with no
-  /// optional sections; it loads with [resume] null.
-  static const int minSupportedVersion = 1;
+  /// Oldest version still readable. v1 and v2 are 0.4.0 files whose `o_i` are
+  /// 256-bit; the 0.5.0 orbit cannot be rebuilt from them at all, so they are
+  /// **rejected** rather than half-read. There is no migration: a 0.4.0 setup
+  /// must be rebuilt and re-memorised.
+  static const int minSupportedVersion = 3;
 
   /// Payload discriminator so an orbit open of a legacy *chain* vault (or vice
   /// versa) fails cleanly on parse rather than misreading fields. Chain
@@ -150,7 +156,7 @@ class OrbitVault {
 /// after that many passes.
 ///
 /// `K_{stage-1}` is deliberately **not** stored — it is recomputed on restore
-/// from the stage's placed points (the same `H(o_i ‖ Sh_i)` the setup already
+/// from the stage's placed points (the same tagged derivation the setup already
 /// does), so the file carries no key it does not have to.
 ///
 /// SECURITY — [digest] is an intermediary of `H*(K_{stage-1})`. Continuing the
