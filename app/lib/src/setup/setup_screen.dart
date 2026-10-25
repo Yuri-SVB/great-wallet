@@ -214,7 +214,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// tap on "Copy master secret" is ignored until it finishes.
   bool _exporting = false;
 
-  /// True while the memory-hard orbit advance `o_{i+1} = H*(K_i)` is running in a
+  /// True while the memory-hard orbit advance `o_{i+1} = H*(u_i)` is running in a
   /// worker isolate (a forward stage navigation). Folds into [_busy] so the
   /// progress scrim shows and other hotkeys/navigation are blocked meanwhile.
   bool _advancing = false;
@@ -304,7 +304,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// The **orbit** stage cursor (`0..`[_maxStage]) — the screen-owned active
   /// stage while building the orbit pre-session. Stage 0 is rooted by σ; a deep
-  /// stage is entered by the forward memory-hard advance `o_i = H*(K_{i-1})`.
+  /// stage is entered by the forward memory-hard advance `o_i = H*(u_{i-1})`.
   /// (During a legacy chain session the active stage instead follows the
   /// controller's `displayStageIndex`; see [_activeStage].)
   int _orbitStage = 0;
@@ -376,7 +376,7 @@ class _SetupScreenState extends State<SetupScreen> {
   final List<int> _shareEncodeGen = List<int>.filled(_maxStage + 1, 0);
 
   /// Per-stage orbit point `o_i`. `o_0` is derived on the fly from σ (see
-  /// [_stageOrbit]); `o_i` (`i≥1`) is the memory-hard advance `o_i = H*(K_{i-1})`,
+  /// [_stageOrbit]); `o_i` (`i≥1`) is the memory-hard advance `o_i = H*(u_{i-1})`,
   /// filled when the user advances forward (P5 deep stages). Null until derived.
   /// Coercion-relevant — wiped on any placement clear / dispose.
   final List<Uint8List?> _orbitO = List<Uint8List?>.filled(_maxStage + 1, null);
@@ -1646,7 +1646,7 @@ class _SetupScreenState extends State<SetupScreen> {
       return;
     }
     // Forward into the immediate next stage: run the memory-hard advance
-    // o_{index} = H*(K_{index-1}) from the (now complete) preceding stage.
+    // o_{index} = H*(u_{index-1}) from the (now complete) preceding stage.
     if (index == _orbitReachableCeiling + 1) {
       unawaited(_advanceOrbitInto(index));
       return;
@@ -1685,7 +1685,7 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Advance the orbit forward into stage [target]: run the memory-hard step
-  /// `o_target = H*(K_{target-1})` (via [GreatWallCore.startOrbitAdvance] in a
+  /// `o_target = H*(u_{target-1})` (via [GreatWallCore.startOrbitAdvance] in a
   /// worker isolate, at the current `P`/`D` profile + derivation steps),
   /// streaming each completed pass to the stage bar and letting Halt cancel it;
   /// on success, store `o_target` and land on it. The preceding stage must be
@@ -2059,7 +2059,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// The orbit point `o_i` for [stage]. Stage 0 is `o_0 = H(σ)` (derived on the
   /// fly from slot 0's Namtso salt, so there is no separate `o_0` state to keep
-  /// in sync); a deep stage's `o_i = H*(K_{i-1})` is read from [_orbitO], filled
+  /// in sync); a deep stage's `o_i = H*(u_{i-1})` is read from [_orbitO], filled
   /// by the forward-navigation advance. Null when σ is unset/invalid (stage 0) or
   /// the stage has not been advanced into yet (deep stages).
   Uint8List? _stageOrbit(int stage) {
@@ -2439,7 +2439,7 @@ class _SetupScreenState extends State<SetupScreen> {
       _boardDerived[stage][slot] = false;
       _recomputeExtraShares(stage);
       // Changing a point in this stage re-roots every deeper stage
-      // (o_{i+1}=H*(K_i)), so their advanced o_i / K_i and any placed points no
+      // (o_{i+1}=H*(u_i)), so their advanced o_i / K_i and any placed points no
       // longer decode — drop them; the user re-advances from the settled prefix.
       _invalidateDeeperThan(stage);
       // Placing this point (and re-deriving the shares) invalidates the cached
@@ -4034,7 +4034,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Integrity is the envelope's job, not re-derivation's: the AEAD tag
   /// authenticates the whole payload, so a stored `o_i` cannot have been
   /// tampered with independently of the points. There is deliberately **no**
-  /// cheap `o_i == H*(K_{i-1})` check — that check *is* the memory-hard advance
+  /// cheap `o_i == H*(u_{i-1})` check — that check *is* the memory-hard advance
   /// this file exists to skip. (Phase 2's re-derivation walk performs it as a
   /// side effect; that is where it becomes an error locator.)
   ///

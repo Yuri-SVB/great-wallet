@@ -4,7 +4,7 @@ import '../core/great_wall_core.dart';
 import '../setup/setup_screen.dart';
 
 /// The great-wallet modes (ARCHITECTURE.md §"7. great-wallet"). **Setup** hosts
-/// both the legacy 0.3.0 chain and the 0.4.0 orbit board flow (the orbit build
+/// both the legacy 0.3.0 chain and the 0.5.0 orbit board flow (the orbit build
 /// is morphed into the Setup screen); Train / Accelerate / Inherit depend on
 /// libraries (celestial-peace-nf-core, jade-clock, phoenix-scroll) still in
 /// development.

@@ -1,0 +1,59 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+# The submodules are fetched explicitly at their pinned commits rather than
+# with `submodules: true`: .gitmodules uses SSH host aliases a runner does not
+# have. Override the repositories with the GREAT_WALL_CORE_REPO /
+# GREAT_WALL_UX_REPO variables, and give SUBMODULES_TOKEN read access if
+# they are private.
+env:
+  CORE_REPO: ${{ vars.GREAT_WALL_CORE_REPO || 'Yuri-SVB/great-wall-core' }}
+  UX_REPO: ${{ vars.GREAT_WALL_UX_REPO || 'yuri-svb/great-wall-ux' }}
+
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the pinned submodule commits
+        id: pins
+        run: |
+          echo "core=$(git rev-parse HEAD:great-wall-core)" >> "$GITHUB_OUTPUT"
+          echo "ux=$(git rev-parse HEAD:great-wall-ux)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPO }}
+          ref: ${{ steps.pins.outputs.core }}
+          path: great-wall-core
+          token: ${{ secrets.SUBMODULES_TOKEN || github.token }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UX_REPO }}
+          ref: ${{ steps.pins.outputs.ux }}
+          path: great-wall-ux
+          token: ${{ secrets.SUBMODULES_TOKEN || github.token }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The FFI tests open great-wall-core/.../target/release; without it they
+      # skip instead of failing, which is how a 0.4.0/0.5.0 width mismatch
+      # reached master unnoticed.
+      - name: Build engine
+        working-directory: great-wall-core/burning_ship/rust_engine
+        run: cargo build --release
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Test
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter test

@@ -9,7 +9,7 @@ import 'package:great_wallet_app/src/core/orbit_protocol.dart';
 import 'package:great_wallet_app/src/ffi/core_bindings.dart';
 import 'package:great_wallet_app/src/ffi/library_loader.dart';
 
-/// Orchestration test for the 0.4.0 orbit protocol through the Dart service
+/// Orchestration test for the 0.5.0 orbit protocol through the Dart service
 /// (OrbitProtocol) — the peer of great-wall-core's test_orbit_protocol.py and
 /// test_orbit_vectors.py.
 ///
@@ -20,12 +20,12 @@ import 'package:great_wallet_app/src/ffi/library_loader.dart';
 ///     memory-hard Argon2 advance — the real advance is covered at the Rust/FFI
 ///     level). Byte-identical config to test_orbit_protocol.py's FAST_PARAMS.
 ///  2. Frozen-vector cross-check: reproduces the cheap per-stage derivations
-///     (theta params, decoded chunks, Sh, K_i) from the FROZEN o_i in
-///     great-wall-core's test_vectors/orbit-v0.5.0/*.json — the same thing
+///     (theta params, decoded chunks, Sh, u_i, K_i, K_i^L) from the FROZEN o_i
+///     in great-wall-core's test_vectors/orbit-v0.5.0/*.json — the same thing
 ///     test_orbit_vectors.py checks, now from Dart. Skipped unless the
-///     great-wall-core submodule is checked out beside app/ AND its engine
-///     version matches the linked engine (a version drift is reported, never a
-///     false pass).
+///     great-wall-core submodule is checked out beside app/ AND the vector's
+///     engine and protocol versions match (a drift is reported, never a false
+///     pass).
 ///
 /// REQUIRES the engine to be built and the great-wall-core submodule pinned at
 /// the orbit commit (see orbit_ffi_test.dart). If the engine can't be opened,
@@ -62,10 +62,10 @@ void main() {
   });
 
   // The cheap deterministic advance — byte-identical to cheap_advance in
-  // test_orbit_protocol.py: SHA-256(o ‖ Sh ‖ "ORBIT-ADVANCE").
+  // test_orbit_protocol.py: SHA-512(o ‖ Sh ‖ "ORBIT-ADVANCE"), the orbit width.
   Future<Uint8List> cheapAdvance(Uint8List o, Uint8List shBytes) async {
     final Uint8List m = _concat(_concat(o, shBytes), _ascii('ORBIT-ADVANCE'));
-    return _sha256(m);
+    return _sha512(m);
   }
 
   group('orbit encode/decode round-trip across setup tiers', () {
@@ -187,10 +187,13 @@ void main() {
             jsonDecode(vf.readAsStringSync()) as Map<String, dynamic>;
 
         // STALE guard (mirrors test_orbit_vectors.py): a vector whose engine
-        // version differs from the linked engine is skipped, never a false pass.
-        if (vec['engine_version'] != c.engineVersion) {
+        // or protocol version differs is skipped, never a false pass.
+        if (vec['engine_version'] != c.engineVersion ||
+            vec['protocol_version'] != _kVectorProtocol) {
           markTestSkipped('STALE ${_basename(vf.path)} '
-              '(engine ${vec['engine_version']} != ${c.engineVersion})');
+              '(engine ${vec['engine_version']} / protocol '
+              '${vec['protocol_version']} != ${c.engineVersion} / '
+              '$_kVectorProtocol)');
           continue;
         }
 
@@ -246,15 +249,25 @@ void main() {
             xs.add(j + 1);
             ys.add(y);
           }
-          // Sh_i and K_i reproduce.
+          // Sh_i, u_i, K_i and every pinned K_i^L reproduce.
           final List<int> sh = c.shamirInterp(xs, ys);
           expect(sh.map(_hexU32).toList(), st['sh'],
               reason: '${_basename(vf.path)} stage ${st['index']}: Sh differs');
-          final Uint8List k =
-              c.masterSecret(oI, GreatWallCoreBindings.shToBytes(sh));
+          final Uint8List shBytes = GreatWallCoreBindings.shToBytes(sh);
+          expect(_hex(c.orbitCommitment(oI, shBytes)), st['u_hex'],
+              reason:
+                  '${_basename(vf.path)} stage ${st['index']}: u_i differs');
+          final Uint8List k = c.masterSecret(oI, shBytes);
           expect(_hex(k), st['k_hex'],
               reason:
                   '${_basename(vf.path)} stage ${st['index']}: K_i differs');
+          for (final dynamic exDyn in st['exports'] as List<dynamic>) {
+            final Map<String, dynamic> ex = exDyn as Map<String, dynamic>;
+            final String label = ex['label'] as String;
+            expect(_hex(c.exportKey(k, _ascii(label))), ex['key_hex'],
+                reason: '${_basename(vf.path)} stage ${st['index']}: '
+                    'K_i^L differs for label "$label"');
+          }
           lastK = st['k_hex'] as String;
         }
         expect(lastK, vec['terminal_k_hex'],
@@ -373,12 +386,16 @@ int _resistanceAbscissa(int k) => 0x80000000 | (k + 1);
 
 // --- vector location ---------------------------------------------------------
 
+/// The protocol version the frozen vectors pin — names their directory and is
+/// checked against each vector's `protocol_version`.
+const String _kVectorProtocol = '0.5.0';
+
 /// Locate great-wall-core's orbit vector dir relative to the test CWD. `flutter
 /// test` runs with CWD = the package root (app/), a sibling of the great-wall-
 /// core submodule inside great-wallet.
 Directory _locateVectorDir() {
   const String rel =
-      '../great-wall-core/burning_ship/test_vectors/orbit-v0.5.0';
+      '../great-wall-core/burning_ship/test_vectors/orbit-v$_kVectorProtocol';
   return Directory(rel);
 }
 
@@ -396,8 +413,8 @@ CoreDiscoveryParams _paramsFromVec(Map<String, dynamic> p) => CoreDiscoveryParam
       rngSeed: p['rng_seed'] as int,
     );
 
-Uint8List _sha256(Uint8List data) =>
-    Uint8List.fromList(crypto.sha256.convert(data).bytes);
+Uint8List _sha512(Uint8List data) =>
+    Uint8List.fromList(crypto.sha512.convert(data).bytes);
 
 Uint8List _ascii(String s) => Uint8List.fromList(s.codeUnits);
 

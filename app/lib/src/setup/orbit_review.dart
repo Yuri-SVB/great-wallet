@@ -1,4 +1,4 @@
-/// Spaced-repetition **score tracking** for the orbit deck — protocol 0.4.0,
+/// Spaced-repetition **score tracking** for the orbit deck — protocol 0.5.0,
 /// review mode 1 (no TLP).
 ///
 /// A card's front is θ_i_j (the board's fractal) and its back is p_i_j (the

@@ -6,11 +6,15 @@ import 'package:ffi/ffi.dart';
 import 'fixed.dart';
 import 'library_loader.dart';
 
-/// Length in bytes of an orbit point `o_i` (and of `theta`, `K_i`) — a SHA-256
-/// digest. Mirrors `ORBIT_POINT_LEN` in the engine (orbit.rs) and
-/// `ORBIT_POINT_BYTES` in the Python bridge (burning_ship_engine.py).
-/// Width of an orbit point / digest, in bytes (protocol 0.5.0: SHA-512).
+/// Length in bytes of an orbit point `o_i` (and of `theta`, `u_i`, `K_i`,
+/// `K_i^L`) — a SHA-512 digest (protocol 0.5.0). Mirrors `ORBIT_POINT_LEN` in
+/// the engine (orbit.rs) and `ORBIT_POINT_BYTES` in the Python bridge
+/// (burning_ship_engine.py).
 const int kOrbitPointLen = 64;
+
+/// `bs_orbit_advance` status: the step ran and both outputs were written
+/// (`ORBIT_ADVANCE_OK` in the engine's ffi.rs; anything else is a rejection).
+const int _kOrbitAdvanceOk = 1;
 
 /// Digest width of the deprecated 0.3.0 chain, in bytes (SHA-256 / Argon2-256).
 /// Deliberately separate from [kOrbitPointLen]: widening the orbit must not move
@@ -760,11 +764,11 @@ class GreatWallCoreBindings {
     }
   }
 
-  /// `theta_i_j = H(o_i ‖ j)` — the 32-byte fractal-parameter digest of board
-  /// `j` at orbit point [oI] (`bs_theta`). The `(o, p, q)` attribution over this
+  /// `theta_i_j = H(o_i ‖ j)` — the fractal-parameter digest of board `j` at
+  /// orbit point [oI] (`bs_theta`). The `(o, p, q)` attribution over this
   /// digest is applied downstream (see `_orbit_params` in protocol.py); this is
-  /// the same cheap `H` = SHA-256 the Python bridge exposes. [oI] must be 32
-  /// bytes.
+  /// the same cheap `H` = SHA-512 the Python bridge exposes. [oI] must be
+  /// [kOrbitPointLen] bytes.
   ///
   /// SECURITY: [oI] is coercion-relevant (an orbit point). Zeroed before free.
   Uint8List theta(Uint8List oI, int j) {
@@ -809,11 +813,12 @@ class GreatWallCoreBindings {
     }
   }
 
-  /// One orbit step: `K_i = H(o_i ‖ Sh_i)` and `o_{i+1} = H*(K_i)` over [steps]
-  /// (`D`) memory-hard Argon2d passes at [profile] (`bs_orbit_advance`). Returns
+  /// One orbit step: `K_i` and `o_{i+1} = H*(u_i)` over [steps] (`D`)
+  /// memory-hard Argon2d passes at [profile] (`bs_orbit_advance`). Returns
   /// `(k, next)`, each [kOrbitPointLen] bytes. `K_i` and `u_i` are
   /// domain-separated, so the returned key does not advance the orbit. The engine
-  /// zeroizes the raw `{o_i, Sh_i}` copies before the memory-hard step.
+  /// zeroizes the raw `{o_i, Sh_i}` copies before the memory-hard step. Throws
+  /// [ArgumentError] when the engine rejects [steps] (`D` must be >= 1).
   ///
   /// WARNING: this is the heavy, blocking memory-hard call (>= 1 GiB per pass) —
   /// callers run it off the UI isolate, exactly like [argon2idMaster].
@@ -832,7 +837,11 @@ class GreatWallCoreBindings {
     try {
       oPtr.asTypedList(kOrbitPointLen).setAll(0, oI);
       if (sh.isNotEmpty) shPtr.asTypedList(sh.length).setAll(0, sh);
-      _orbitAdvance(oPtr, shPtr, sh.length, steps, profile.value, outK, outNext);
+      final int status = _orbitAdvance(
+          oPtr, shPtr, sh.length, steps, profile.value, outK, outNext);
+      if (status != _kOrbitAdvanceOk) {
+        throw ArgumentError.value(steps, 'steps', 'D must be >= 1');
+      }
       return (
         k: Uint8List.fromList(outK.asTypedList(kOrbitPointLen)),
         next: Uint8List.fromList(outNext.asTypedList(kOrbitPointLen)),
@@ -1437,10 +1446,10 @@ typedef _MasterSecretC = Void Function(
 typedef _MasterSecretDart = void Function(
   Pointer<Uint8>, Pointer<Uint8>, int, Pointer<Uint8>);
 
-typedef _OrbitAdvanceC = Void Function(
+typedef _OrbitAdvanceC = Uint8 Function(
   Pointer<Uint8>, Pointer<Uint8>, Uint32, Uint32, Uint8,
   Pointer<Uint8>, Pointer<Uint8>);
-typedef _OrbitAdvanceDart = void Function(
+typedef _OrbitAdvanceDart = int Function(
   Pointer<Uint8>, Pointer<Uint8>, int, int, int,
   Pointer<Uint8>, Pointer<Uint8>);
 

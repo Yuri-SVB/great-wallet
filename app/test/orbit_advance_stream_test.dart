@@ -13,15 +13,16 @@ import 'package:great_wallet_app/src/ffi/library_loader.dart';
 /// one uninterruptible FFI call. The streamed form decomposes it into the engine
 /// primitives it is built from —
 ///
-///     K_i = bs_master_secret(o_i, Sh_i);  d = K_i
-///     repeat D times: d = bs_argon2_single(d, profile)   // emit (pass, d)
+///     K_i = bs_master_secret(o_i, Sh_i)        // returned, never advanced
+///     d   = bs_orbit_commitment(o_i, Sh_i)     // u_i
+///     repeat D times: d = bs_orbit_argon2_single(d, profile)   // emit (pass, d)
 ///     o_{i+1} = d
 ///
 /// — which buys a progress bar, a per-pass checkpoint and a cancel. That is only
 /// legitimate if it is **byte-identical** to the one-shot call, so the frozen
 /// vectors below pin it. They were produced by driving the built engine's C ABI
-/// directly (`bs_orbit_advance` vs `bs_master_secret` + `bs_argon2_single`) and
-/// agreeing at `D = 1` and `D = 2`.
+/// directly (`bs_orbit_advance` vs `bs_orbit_commitment` +
+/// `bs_orbit_argon2_single`) and agreeing at `D = 1` and `D = 2`.
 ///
 /// The vector tests run **real Argon2d at the Basic profile — 1 GiB and roughly
 /// 35 s per pass**, so they are opt-in: set `GW_SLOW_TESTS=1`. Everything else
@@ -45,17 +46,24 @@ void main() {
   final bool slow = Platform.environment['GW_SLOW_TESTS'] == '1';
 
   // The pinned inputs.
-  final Uint8List oI = Uint8List.fromList(List<int>.generate(32, (int i) => i));
+  final Uint8List oI =
+      Uint8List.fromList(List<int>.generate(kOrbitPointLen, (int i) => i));
   final Uint8List sh =
       Uint8List.fromList(List<int>.generate(16, (int i) => (i * 7 + 3) & 0xFF));
 
   // The pinned outputs, Basic profile.
-  const String kHex =
-      'e1615c9eee2bf22e50388c9b9966ef2e03ac3077ca5ccca9feab0ede2fba39db';
-  const String pass1Hex =
-      'ef3c7fdd8e7c45d3a06cd99dabf51194156162a6bea386597f72d89faa48d542';
-  const String pass2Hex =
-      '0552a2ec9922f56e5fc2133fd622970c199cf66d3d30ac4d14ed536335d50a14';
+  const String kHex = '5b822ccefd90af176ecff6073396ea22'
+      'ddbc6e5325e6f9f310cbbd7b1a638fd7006c1c44f6f077a64633ee591b458013'
+      '0baa4f084b7d062ac662338bbed3c74b';
+  const String uHex = '4c9d1a86e220e5555f4d044e5b00317e'
+      '0226bd041718a68dcadb1b7b19c63ffefe3a8a9582eab12caecc97573f39498f'
+      '0d087032553076f6332a7fa383e43c55';
+  const String pass1Hex = 'd0d81e5365371f1c3e479e5f611b86ab'
+      'c28eebcd224fe02191a1ce87d61362a589be101537f0fe16b7aefdd68295ad62'
+      '95303d565099890fc96eb0c9a17d1d36';
+  const String pass2Hex = '77fc7ceb49c9153d119182c964534dba'
+      '7804dc3ce9a31e3df55a34573c457923c672df058c866a216c5872448f1aabf8'
+      'cee309408be3e8695c98dc67fd32e1b8';
 
   String hex(Uint8List b) =>
       b.map((int x) => x.toRadixString(16).padLeft(2, '0')).join();
@@ -66,7 +74,7 @@ void main() {
       ]);
 
   group('pass-through (D == 0)', () {
-    test('yields o_next == K_i and reports one completed step', () async {
+    test('yields o_next == u_i and reports one completed step', () async {
       final GreatWallCore? c = core;
       if (c == null) {
         markTestSkipped('engine unavailable — $openError');
@@ -83,11 +91,13 @@ void main() {
             checkpoints.add((done, hex(d))),
       );
       final ({Uint8List k, Uint8List next}) r = await job.result;
-      expect(hex(r.k), hex(r.next),
-          reason: 'zero memory-hard passes means o_{i+1} == K_i');
+      expect(hex(r.next), uHex,
+          reason: 'zero memory-hard passes means o_{i+1} == u_i');
+      expect(hex(r.k), isNot(hex(r.next)),
+          reason: 'K_i is domain-separated from u_i, so it is not o_{i+1}');
       expect(progress, <(int, int)>[(1, 1)]);
       expect(checkpoints.single.$1, 1);
-      // The commitment is cheap H, so it is pinned even in the fast suite.
+      // K_i and u_i are cheap H, so they are pinned even in the fast suite.
       expect(hex(r.k), kHex);
     });
 
@@ -163,7 +173,7 @@ void main() {
       );
       final ({Uint8List k, Uint8List next}) r = await job.result;
 
-      expect(hex(r.k), kHex, reason: 'commitment matches bs_orbit_advance');
+      expect(hex(r.k), kHex, reason: 'K_i matches bs_orbit_advance');
       expect(hex(r.next), pass2Hex, reason: 'o_next matches bs_orbit_advance');
       // Every intermediate is observable — this is what makes a halt cheap.
       expect(checkpoints, <(int, String)>[(1, pass1Hex), (2, pass2Hex)]);

@@ -71,7 +71,7 @@ void main() {
           ),
           OrbitVaultStage(
             required: 2,
-            orbit: <int>[for (int i = 0; i < 32; i++) 0x40 + i],
+            orbit: <int>[for (int i = 0; i < kOrbitPointLen; i++) 0x40 + i],
             points: <OrbitVaultPoint>[
               OrbitVaultPoint(slot: 1, reRaw: 313131313, imRaw: 989898989),
               OrbitVaultPoint(slot: 3, reRaw: 565656565, imRaw: 434343434),
@@ -128,7 +128,7 @@ void main() {
       expect(back.profile, vault.profile);
       expect(back.stages.length, 2);
       expect(back.stages[0].orbit, isNull);
-      expect(back.stages[1].orbit, hasLength(32));
+      expect(back.stages[1].orbit, hasLength(kOrbitPointLen));
       expect(back.stages[1].points[1].slot, 3);
       expect(back.stages[1].points[1].reRaw, 565656565);
     }, timeout: slow);
@@ -202,7 +202,7 @@ void main() {
       int advances = 0;
       Uint8List advance(Uint8List o, Uint8List shBytes) {
         advances++;
-        return Uint8List.fromList(crypto.sha256
+        return Uint8List.fromList(crypto.sha512
             .convert(<int>[...o, ...shBytes, ...utf8.encode('ORBIT-ADVANCE')])
             .bytes);
       }

@@ -4,13 +4,15 @@ import '../ffi/core_bindings.dart';
 import 'encoding_constants.dart';
 import 'great_wall_core.dart';
 
-/// App-level orchestration of the 0.4.0 **orbit** protocol — the Dart peer of
+/// App-level orchestration of the 0.5.0 **orbit** protocol — the Dart peer of
 /// great-wall-core/burning_ship/protocol.py (`encode_orbit` / `decode_orbit`).
 ///
 /// The orbit replaces the 0.3.0 single-point chain with, per deep stage, `t_i`
 /// (= `r_i`) fractal boards whose 32-bit points are combined by Shamir into the
-/// stage's polynomial `Sh_i` and per-stage master secret `K_i = H(o_i ‖ Sh_i)`;
-/// the orbit then advances memory-hard, `o_{i+1} = H*(K_i)`. `t_i` comes from the
+/// stage's polynomial `Sh_i` and per-stage master secret
+/// `K_i = TH(master-secret, o_i ‖ Sh_i)`; the orbit then advances memory-hard
+/// from the domain-separated commitment, `o_{i+1} = H*(u_i)` with
+/// `u_i = H(o_i ‖ Sh_i)`. `t_i` comes from the
 /// engine's canonical tier table ([GreatWallCore.setupTierThresholds]); the deep
 /// stages enforce `r_i > 2`, with the substandard entry exception surfaced by
 /// [GreatWallCore.setupTierSubstandard].
@@ -228,7 +230,7 @@ class OrbitProtocol {
     return thresholds;
   }
 
-  /// Default advance: `o_{i+1} = H*(K_i)` via the memory-hard engine call, run
+  /// Default advance: `o_{i+1} = H*(u_i)` via the memory-hard engine call, run
   /// off the UI isolate ([GreatWallCore.advanceOrbit]). Only the next orbit point
   /// is needed here; `K_i` is already the stage's recorded master secret.
   Future<Uint8List> _defaultAdvance(Uint8List o, Uint8List shBytes) async {
@@ -261,7 +263,7 @@ class OrbitStage {
   /// Stage index (0 = stage 0, `1..N` = deep stages).
   final int index;
 
-  /// The 32-byte orbit point `o_i` for this stage.
+  /// The orbit point `o_i` for this stage ([kOrbitPointLen] bytes).
   final Uint8List oBytes;
 
   /// `t_i` (= `r_i`), the number of fractals/points this stage carries.

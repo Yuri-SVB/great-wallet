@@ -5,13 +5,14 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:great_wallet_app/src/ffi/core_bindings.dart';
 import 'package:great_wallet_app/src/ffi/library_loader.dart';
 
-/// Cross-language smoke test for the orbit-protocol (0.4.0) FFI through the Dart
+/// Cross-language smoke test for the orbit-protocol (0.5.0) FFI through the Dart
 /// bridge (core_bindings.dart) — the peer of great-wall-core's test_orbit_ffi.py.
 ///
 /// Verifies the built Rust engine's `bs_orbit_root` / `bs_theta` /
-/// `bs_master_secret` / `bs_shamir_interp` / `bs_setup_tier_*` as seen through
-/// Dart, cross-checked with `package:crypto` (for H = SHA-256) and a tiny
-/// independent GF(2^32) reference (for Shamir). This is what lets you
+/// `bs_orbit_commitment` / `bs_master_secret` / `bs_export_key` /
+/// `bs_shamir_interp` / `bs_setup_tier_*` as seen through Dart, cross-checked
+/// with `package:crypto` (for H = SHA-512 and its BIP-340-style tagged hash TH)
+/// and a tiny independent GF(2^32) reference (for Shamir). This is what lets you
 /// `flutter test` the latest engine commits end-to-end via Dart.
 ///
 /// REQUIRES the engine `.so`/`.dylib`/`.dll` to be built (`native/build_core.sh`,
@@ -24,9 +25,9 @@ import 'package:great_wallet_app/src/ffi/library_loader.dart';
 /// including the missing symbol for an old pin). Rebuild + repin to run them.
 ///
 /// `orbitAdvance` is intentionally not exercised here (it runs real Argon2d at
-/// >= 1 GiB, minutes per run); the Rust `orbit_step_with` test covers its
-/// orchestration, and its `K_i` out-param equals `masterSecret(o, sh)` — the
-/// cheap commitment this file does verify.
+/// >= 1 GiB, minutes per run); the Rust `orbit_step_with` tests cover its
+/// orchestration, and its `K_i` out-param equals `masterSecret(o, sh)`, which
+/// this file does verify.
 void main() {
   GreatWallCoreBindings? bindings;
   String? openError;
@@ -43,8 +44,8 @@ void main() {
     }
   });
 
-  group('orbit_root (o_0 = H(sigma) = SHA-256)', () {
-    test("matches package:crypto SHA-256 for b'abc'", () {
+  group('orbit_root (o_0 = H(sigma) = SHA-512)', () {
+    test("matches package:crypto SHA-512 for b'abc'", () {
       final GreatWallCoreBindings? b = bindings;
       if (b == null) {
         markTestSkipped('engine unavailable — $openError');
@@ -53,8 +54,8 @@ void main() {
       final Uint8List msg = _ascii('abc');
       expect(
         b.orbitRoot(msg),
-        _sha256(msg),
-        reason: "orbit_root(b'abc') must equal SHA-256(b'abc')",
+        _sha512(msg),
+        reason: "orbit_root(b'abc') must equal SHA-512(b'abc')",
       );
     });
 
@@ -66,7 +67,7 @@ void main() {
       }
       final Uint8List sigma =
           Uint8List.fromList(List<int>.generate(128, (int i) => i));
-      expect(b.orbitRoot(sigma), _sha256(sigma));
+      expect(b.orbitRoot(sigma), _sha512(sigma));
       // Deterministic, and sensitive to the last byte.
       expect(b.orbitRoot(sigma), b.orbitRoot(sigma));
       final Uint8List perturbed = Uint8List.fromList(sigma)..[127] = 0;
@@ -81,31 +82,57 @@ void main() {
         markTestSkipped('engine unavailable — $openError');
         return;
       }
-      final Uint8List o = _fill(32, 7);
+      final Uint8List o = _fill(kOrbitPointLen, 7);
       // j is a big-endian u32 appended to o_i.
-      final Uint8List expected0 = _sha256(_concat(o, _u32be(0)));
+      final Uint8List expected0 = _sha512(_concat(o, _u32be(0)));
       expect(b.theta(o, 0), expected0);
       expect(b.theta(o, 3), isNot(b.theta(o, 4)),
           reason: 'distinct board index -> distinct fractal');
-      expect(b.theta(o, 0), isNot(b.theta(_fill(32, 8), 0)),
+      expect(b.theta(o, 0), isNot(b.theta(_fill(kOrbitPointLen, 8), 0)),
           reason: 'distinct orbit point -> distinct fractal');
     });
   });
 
-  group('master_secret (K_i = H(o_i || Sh_i))', () {
-    test('matches H(o || sh) and separates by Sh', () {
+  group('u_i / K_i (domain-separated)', () {
+    test('u_i = H(o || sh), K_i = TH(master-secret, o || sh), u_i != K_i', () {
       final GreatWallCoreBindings? b = bindings;
       if (b == null) {
         markTestSkipped('engine unavailable — $openError');
         return;
       }
-      final Uint8List o = _fill(32, 1);
+      final Uint8List o = _fill(kOrbitPointLen, 1);
       final Uint8List sh = Uint8List.fromList(
           <int>[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
-      expect(b.masterSecret(o, sh), _sha256(_concat(o, sh)));
+      final Uint8List u = b.orbitCommitment(o, sh);
+      final Uint8List k = b.masterSecret(o, sh);
+      expect(u, _sha512(_concat(o, sh)));
+      expect(k, _taggedHash(_kTagMasterSecret, _concat(o, sh)));
+      expect(u, isNot(k),
+          reason: 'a leaked K_i must not advance the orbit (u_i != K_i)');
       final Uint8List sh2 = Uint8List.fromList(sh)..[sh.length - 1] = 0x89;
       expect(b.masterSecret(o, sh), isNot(b.masterSecret(o, sh2)),
           reason: 'distinct Sh -> distinct K_i');
+    });
+  });
+
+  group('export_key (K_i^L = TH(export-label, K_i || L))', () {
+    test('matches the reference for the empty and a sample label', () {
+      final GreatWallCoreBindings? b = bindings;
+      if (b == null) {
+        markTestSkipped('engine unavailable — $openError');
+        return;
+      }
+      final Uint8List k = b.masterSecret(_fill(kOrbitPointLen, 2),
+          Uint8List.fromList(List<int>.filled(12, 0x42)));
+      for (final String label in <String>['', 'EXAMPLE-1']) {
+        final Uint8List l = _ascii(label);
+        expect(b.exportKey(k, l), _taggedHash(_kTagExportLabel, _concat(k, l)),
+            reason: 'export_key(K_i, "$label")');
+      }
+      expect(b.exportKey(k, Uint8List(0)), isNot(k),
+          reason: 'the empty label is derived too — K_i never leaves');
+      expect(b.exportKey(k, _ascii('A')), isNot(b.exportKey(k, _ascii('B'))),
+          reason: 'distinct label -> distinct exported key');
     });
   });
 
@@ -191,8 +218,19 @@ void main() {
 
 // --- helpers -----------------------------------------------------------------
 
-Uint8List _sha256(Uint8List data) =>
-    Uint8List.fromList(crypto.sha256.convert(data).bytes);
+Uint8List _sha512(Uint8List data) =>
+    Uint8List.fromList(crypto.sha512.convert(data).bytes);
+
+// Domain tags of the 0.5.0 spec (great-wall-core src/orbit.rs) — restated here
+// so the engine is checked against the spec, not against itself.
+const String _kTagMasterSecret = 'GreatWall/TGPO/master-secret/v1';
+const String _kTagExportLabel = 'GreatWall/TGPO/export-label/v1';
+
+/// BIP-340-style tagged hash over SHA-512: H(H(tag) ‖ H(tag) ‖ msg).
+Uint8List _taggedHash(String tag, Uint8List msg) {
+  final Uint8List t = _sha512(_ascii(tag));
+  return _sha512(_concat(_concat(t, t), msg));
+}
 
 Uint8List _ascii(String s) => Uint8List.fromList(s.codeUnits);
 

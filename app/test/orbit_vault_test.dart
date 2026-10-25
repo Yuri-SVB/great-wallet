@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:great_wallet_app/src/ffi/core_bindings.dart' show Argon2Profile;
+import 'package:great_wallet_app/src/ffi/core_bindings.dart'
+    show Argon2Profile, kOrbitPointLen;
 import 'package:great_wallet_app/src/setup/orbit_vault.dart';
 
 /// Pure-Dart serialization tests for [OrbitVault] — no FFI/engine needed.
@@ -21,7 +22,7 @@ void main() {
           // A deep stage: carries its memory-hard o_i so restore skips Argon2.
           OrbitVaultStage(
             required: 3,
-            orbit: <int>[for (int i = 0; i < 64; i++) i],
+            orbit: <int>[for (int i = 0; i < kOrbitPointLen; i++) i],
             points: <OrbitVaultPoint>[point(1, 30), point(3, 40), point(5, 50)],
           ),
         ],
@@ -42,7 +43,7 @@ void main() {
       expect(back.stages[0].orbit, isNull);
       expect(back.stages[0].points.length, 2);
       expect(back.stages[1].required, 3);
-      expect(back.stages[1].orbit, hasLength(64));
+      expect(back.stages[1].orbit, hasLength(kOrbitPointLen));
       expect(back.stages[1].points[1].slot, 3);
       expect(back.stages[1].points[2].imRaw, 51);
     });
@@ -82,7 +83,9 @@ void main() {
           resume: OrbitVaultResume(
             stage: 1,
             pass: 3,
-            digest: <int>[for (int i = 0; i < 64; i++) (0x80 + i) & 0xFF],
+            digest: <int>[
+              for (int i = 0; i < kOrbitPointLen; i++) (0x80 + i) & 0xFF,
+            ],
           ),
         );
 
@@ -93,7 +96,7 @@ void main() {
       expect(back.resume, isNotNull);
       expect(back.resume!.stage, 1);
       expect(back.resume!.pass, 3);
-      expect(back.resume!.digest, hasLength(64));
+      expect(back.resume!.digest, hasLength(kOrbitPointLen));
     });
 
     test('a settled setup omits the section entirely', () {
@@ -128,6 +131,28 @@ void main() {
         final Map<String, dynamic> json = sample().toJson()..['resume'] = bad;
         expect(() => OrbitVault.fromJson(json), throwsFormatException,
             reason: 'resume = $bad');
+      }
+    });
+
+    test('an o_i or checkpoint digest of the wrong width is refused', () {
+      // A short o_i would be zero-padded by the FFI marshalling and derive a
+      // different orbit in silence, so the parser rejects it outright.
+      final List<List<int>> bad = <List<int>>[
+        <int>[for (int i = 0; i < 32; i++) i], // a 0.4.0-width o_i
+        <int>[for (int i = 0; i < kOrbitPointLen - 1; i++) i],
+        <int>[for (int i = 0; i < kOrbitPointLen + 1; i++) i],
+        <int>[for (int i = 0; i < kOrbitPointLen; i++) i == 0 ? 0x100 : i],
+      ];
+      for (final List<int> b in bad) {
+        final Map<String, dynamic> withOrbit = sample().toJson();
+        (withOrbit['stages'] as List<Map<String, dynamic>>)[1]['o'] = b;
+        expect(() => OrbitVault.fromJson(withOrbit), throwsFormatException,
+            reason: 'o_i of ${b.length} bytes');
+
+        final Map<String, dynamic> withDigest = halted().toJson();
+        (withDigest['resume'] as Map<String, dynamic>)['digest'] = b;
+        expect(() => OrbitVault.fromJson(withDigest), throwsFormatException,
+            reason: 'checkpoint digest of ${b.length} bytes');
       }
     });
 

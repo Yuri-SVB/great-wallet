@@ -1,4 +1,4 @@
-import '../ffi/core_bindings.dart' show Argon2Profile;
+import '../ffi/core_bindings.dart' show Argon2Profile, kOrbitPointLen;
 
 /// The serializable **orbit provisional key** — everything needed to restore a
 /// *settled* orbit setup **without re-running the memory-hard advance**: the
@@ -8,7 +8,7 @@ import '../ffi/core_bindings.dart' show Argon2Profile;
 /// **placed** fractal point. On load the engine's cheap decode turns each
 /// `(reRaw, imRaw)` back into the slot's 32-bit chunk (under `(o, p, q)`
 /// recomputed from `o_i`), then `Sh_i` and `K_i` are recomputed on the screen;
-/// the expensive Argon2 advance `o_i = H*(K_{i-1})` is skipped entirely.
+/// the expensive Argon2 advance `o_i = H*(u_{i-1})` is skipped entirely.
 ///
 /// This is the orbit peer of the legacy chain [SetupVault]. It captures the
 /// **screen-owned** orbit state (`σ` / `_orbitO` / `_boardPoints`), not a
@@ -159,7 +159,7 @@ class OrbitVault {
 /// from the stage's placed points (the same tagged derivation the setup already
 /// does), so the file carries no key it does not have to.
 ///
-/// SECURITY — [digest] is an intermediary of `H*(K_{stage-1})`. Continuing the
+/// SECURITY — [digest] is an intermediary of `H*(u_{stage-1})`. Continuing the
 /// remaining passes from it yields `o_stage`, so it is exactly as
 /// coercion-relevant as a stored `o_i`, and lives under the same encryption.
 class OrbitVaultResume {
@@ -186,8 +186,7 @@ class OrbitVaultResume {
       };
 
   factory OrbitVaultResume.fromJson(Map<String, dynamic> json) {
-    final List<int> digest = _intList(json, 'digest');
-    if (digest.isEmpty) throw const FormatException('bad vault');
+    final List<int> digest = _orbitPoint(json, 'digest');
     return OrbitVaultResume(
       stage: _int(json, 'stage'),
       pass: _int(json, 'pass'),
@@ -241,7 +240,7 @@ class OrbitVaultStage {
     if (rawPoints is! List) throw const FormatException('bad vault');
     return OrbitVaultStage(
       required: _int(json, 'r'),
-      orbit: json.containsKey('o') ? _intList(json, 'o') : null,
+      orbit: json.containsKey('o') ? _orbitPoint(json, 'o') : null,
       points: <OrbitVaultPoint>[
         for (final Object? p in rawPoints)
           OrbitVaultPoint.fromJson(p is Map<String, dynamic>
@@ -317,4 +316,15 @@ List<int> _intList(Map<String, dynamic> json, String key) {
   return <int>[
     for (final Object? e in v) e is int ? e : throw const FormatException('bad vault'),
   ];
+}
+
+/// An orbit-width byte string (`o_i` or an `H*` intermediary): exactly
+/// [kOrbitPointLen] bytes, each `0..255`. A v3 file holding anything else is
+/// malformed, and is rejected here rather than at the engine boundary.
+List<int> _orbitPoint(Map<String, dynamic> json, String key) {
+  final List<int> v = _intList(json, key);
+  if (v.length != kOrbitPointLen || v.any((int b) => b < 0 || b > 0xFF)) {
+    throw const FormatException('bad vault');
+  }
+  return v;
 }

@@ -299,11 +299,11 @@ class GreatWallCore {
   }
 
   // ---------------------------------------------------------------------------
-  // Orbit protocol (0.4.0) — coercion-resistant per-stage derivation.
+  // Orbit protocol (0.5.0) — coercion-resistant per-stage derivation.
   //
   // These wrap the engine's orbit primitives (core_bindings.dart `orbit*` /
   // `shamir*` / `setupTier*`), the Dart peers of protocol.py. The cheap ones
-  // (H = SHA-256, GF(2^32) interpolation, tier lookup) run inline; the single
+  // (H = SHA-512, GF(2^32) interpolation, tier lookup) run inline; the single
   // memory-hard step (`advanceOrbit`, H* = Argon2d) runs in a worker isolate so
   // it never stalls the UI isolate — exactly like [argon2idMaster].
   // ---------------------------------------------------------------------------
@@ -353,14 +353,15 @@ class GreatWallCore {
   /// stage). The UX MUST surface this loudly wherever Setup 1 is offered.
   bool setupTierSubstandard(int level) => bindings.setupTierSubstandard(level);
 
-  /// One orbit step — `K_i = H(o_i ‖ Sh_i)` then `o_{i+1} = H*(K_i)` over [steps]
-  /// (`D`) memory-hard Argon2d passes at [profile] — run in a short-lived worker
-  /// isolate so the >= 1 GiB/pass blocking call never stalls the UI isolate.
-  /// Returns `(k, next)`, each 32 bytes. Not cancellable (a single pass cannot be
-  /// preempted mid-call), matching [argon2idMaster].
+  /// One orbit step — `K_i` and `u_i` from `(o_i, Sh_i)`, then
+  /// `o_{i+1} = H*(u_i)` over [steps] (`D`) memory-hard Argon2d passes at
+  /// [profile] — run in a short-lived worker isolate so the >= 1 GiB/pass
+  /// blocking call never stalls the UI isolate. Returns `(k, next)`, each
+  /// [kOrbitPointLen] bytes. Not cancellable (a single pass cannot be preempted
+  /// mid-call), matching [argon2idMaster].
   ///
   /// [steps] `== 0` is the **pass-through** case — zero memory-hard applications,
-  /// so `o_{i+1} = advance_with(K_i, 0) = K_i`. It is computed inline with the
+  /// so `o_{i+1} = u_i`. It is computed inline with the
   /// cheap `H` (no isolate, instant), mirroring [startStageDerivation]'s
   /// `iterations == 0` identity. Both this build path and recovery go through the
   /// facade, so a `D == 0` orbit is self-consistent — but it is **not
@@ -445,13 +446,14 @@ class GreatWallCore {
   /// One orbit step, **streamed pass by pass** — the checkpointable peer of
   /// [advanceOrbit], and the orbit peer of [startStageDerivation].
   ///
-  /// `bs_orbit_advance` runs `K_i = H(o_i ‖ Sh_i)` and all `D` memory-hard
-  /// passes inside a single uninterruptible FFI call, so a deep orbit advance is
-  /// a multi-minute black box: no progress, no checkpoint, and a halt loses the
+  /// `bs_orbit_advance` runs the commitments and all `D` memory-hard passes
+  /// inside a single uninterruptible FFI call, so a deep orbit advance is a
+  /// multi-minute black box: no progress, no checkpoint, and a halt loses the
   /// whole stage. This decomposes it into the engine primitives it is built
-  /// from — `bs_master_secret` then `D` × `bs_argon2_single` — which is
-  /// byte-identical to the one-shot call (verified against the engine at
-  /// `D = 1, 2`) while making every pass observable:
+  /// from — `bs_master_secret` and `bs_orbit_commitment`, then `D` ×
+  /// `bs_orbit_argon2_single` from `u_i` — which is byte-identical to the
+  /// one-shot call (verified against the engine at `D = 1, 2`) while making
+  /// every pass observable:
   ///
   /// - [onProgress] `(completed, total)` after each pass, for a determinate bar;
   /// - [onCheckpoint] `(completed, digest)` with that pass's intermediary
@@ -466,7 +468,7 @@ class GreatWallCore {
   /// for the whole long window. In the one-shot call Rust ownership enforces
   /// that; here it is explicit in [_orbitAdvanceStreamIsolateEntry].
   ///
-  /// [steps] `== 0` is the pass-through case (`o_{i+1} = K_i`), computed inline
+  /// [steps] `== 0` is the pass-through case (`o_{i+1} = u_i`), computed inline
   /// exactly as [advanceOrbit] does.
   Future<OrbitAdvanceJob> startOrbitAdvance(
     Uint8List oI,
@@ -792,9 +794,9 @@ void _encodeSharesIsolateEntry(
 }
 
 /// Worker-isolate entry: open the engine and run one orbit step **streamed**,
-/// sending `(0, K_i)` for the commitment and then `(pass, digest)` after each of
-/// the `steps` memory-hard passes. Mirrors `orbit.rs`'s `orbit_step_with`:
-/// commit, wipe the raw `{o_i, Sh_i}`, then run `H*` on `K_i` alone — so the
+/// sending `(0, K_i)` and then `(pass, digest)` after each of the `steps`
+/// memory-hard passes. Mirrors `orbit.rs`'s `orbit_step_with`: take `K_i` and
+/// `u_i`, wipe the raw `{o_i, Sh_i}`, then run `H*` on `u_i` alone — so the
 /// inputs are gone before the long window rather than living through it.
 /// See [GreatWallCore.startOrbitAdvance].
 void _orbitAdvanceStreamIsolateEntry(
