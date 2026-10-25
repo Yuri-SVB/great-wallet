@@ -319,6 +319,17 @@ class GreatWallCore {
   Uint8List masterSecret(Uint8List oI, Uint8List sh) =>
       bindings.masterSecret(oI, sh);
 
+  /// `u_i = H(o_i ‖ Sh_i)` — the orbit-advance commitment. **Not** the master
+  /// secret: as of 0.5.0 the two are domain-separated, so `H*` must consume this
+  /// and never `K_i`.
+  Uint8List orbitCommitment(Uint8List oI, Uint8List sh) =>
+      bindings.orbitCommitment(oI, sh);
+
+  /// `K_i^L = TH(export-label, K_i ‖ L)` — the exported key for canonicalised
+  /// label [label], applied for every label including the empty one.
+  Uint8List exportKey(Uint8List kI, Uint8List label) =>
+      bindings.exportKey(kI, label);
+
   /// Interpolate the full Shamir polynomial `Sh` (subset-invariant) over
   /// GF(2^32) from the `t` fractal points `(xs, ys)`; returns its coefficients.
   List<int> shamirInterp(List<int> xs, List<int> ys) =>
@@ -361,8 +372,9 @@ class GreatWallCore {
     Argon2Profile profile = Argon2Profile.basic,
   }) async {
     if (steps <= 0) {
-      final Uint8List k = masterSecret(oI, sh); // K_i = H(o_i ‖ Sh_i)
-      return (k: k, next: Uint8List.fromList(k)); // o_{i+1} = K_i (0 passes)
+      // Zero memory-hard applications, so o_{i+1} = u_i — the commitment, NOT
+      // K_i. They are different values as of 0.5.0.
+      return (k: masterSecret(oI, sh), next: orbitCommitment(oI, sh));
     }
     final ReceivePort port = ReceivePort();
     final Completer<({Uint8List k, Uint8List next})> completer =
@@ -465,16 +477,17 @@ class GreatWallCore {
     void Function(int completed, Uint8List digest)? onCheckpoint,
   }) async {
     if (steps <= 0) {
+      // o_{i+1} = u_i with zero passes; K_i is a different value.
       final Uint8List k = masterSecret(oI, sh);
+      final Uint8List next = orbitCommitment(oI, sh);
       onProgress?.call(1, 1);
       // Same contract as the streamed path: the callback copies what it keeps,
-      // and this hand-off copy is wiped straight after — never the `k` returned.
-      final Uint8List cp = Uint8List.fromList(k);
+      // and this hand-off copy is wiped straight after.
+      final Uint8List cp = Uint8List.fromList(next);
       onCheckpoint?.call(1, cp);
       cp.fillRange(0, cp.length, 0);
       return OrbitAdvanceJob(
-        Future<({Uint8List k, Uint8List next})>.value(
-            (k: k, next: Uint8List.fromList(k))),
+        Future<({Uint8List k, Uint8List next})>.value((k: k, next: next)),
         () {},
       );
     }
@@ -790,16 +803,22 @@ void _orbitAdvanceStreamIsolateEntry(
       args;
   final Argon2Profile profile = Argon2Profile.values[profileValue];
   final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
-  final Uint8List k = bindings.masterSecret(oI, sh); // K_i = H(o_i ‖ Sh_i)
+  // Both cheap hashes first, then the wipe, then the long H* — mirroring
+  // orbit.rs's orbit_step_with. K_i is what the caller gets; u_i is what H*
+  // consumes. They are domain-separated, so seeding the loop from K_i would
+  // silently derive a different orbit.
+  final Uint8List k = bindings.masterSecret(oI, sh);
+  final Uint8List u = bindings.orbitCommitment(oI, sh);
   oI.fillRange(0, oI.length, 0); // this isolate's copies — zeroed before H*
   sh.fillRange(0, sh.length, 0);
   send.send((0, k));
-  Uint8List digest = k;
+  Uint8List digest = u;
   for (int i = 0; i < steps; i++) {
-    digest = bindings.argon2Single(digest, profile);
+    digest = bindings.orbitArgon2Single(digest, profile);
     send.send((i + 1, digest));
   }
   k.fillRange(0, k.length, 0);
+  u.fillRange(0, u.length, 0);
 }
 
 /// Worker-isolate entry for a resumed orbit advance: continue from [fromDigest]
@@ -815,7 +834,7 @@ void _orbitAdvanceResumeIsolateEntry(
   final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
   Uint8List digest = fromDigest;
   for (int i = fromPass; i < steps; i++) {
-    digest = bindings.argon2Single(digest, profile);
+    digest = bindings.orbitArgon2Single(digest, profile);
     send.send((i + 1, digest));
   }
 }

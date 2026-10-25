@@ -9,7 +9,13 @@ import 'library_loader.dart';
 /// Length in bytes of an orbit point `o_i` (and of `theta`, `K_i`) — a SHA-256
 /// digest. Mirrors `ORBIT_POINT_LEN` in the engine (orbit.rs) and
 /// `ORBIT_POINT_BYTES` in the Python bridge (burning_ship_engine.py).
-const int kOrbitPointLen = 32;
+/// Width of an orbit point / digest, in bytes (protocol 0.5.0: SHA-512).
+const int kOrbitPointLen = 64;
+
+/// Digest width of the deprecated 0.3.0 chain, in bytes (SHA-256 / Argon2-256).
+/// Deliberately separate from [kOrbitPointLen]: widening the orbit must not move
+/// the chain, which still derives its stage reservoirs from a 32-byte digest.
+const int kChainDigestLen = 32;
 
 /// Raw `dart:ffi` binding to great-wall-core's C ABI
 /// (great-wall-core/burning_ship/rust_engine/src/ffi.rs).
@@ -102,6 +108,8 @@ class GreatWallCoreBindings {
         _lib.lookupFunction<_CanonicalIslandFreeC, _CanonicalIslandFreeDart>(
       'bs_canonical_island_free',
     );
+    _orbitArgon2Single = _lib.lookupFunction<_Argon2SingleC, _Argon2SingleDart>(
+        'bs_orbit_argon2_single');
     _argon2Single =
         _lib.lookupFunction<_Argon2SingleC, _Argon2SingleDart>('bs_argon2_single');
     _argon2idMaster =
@@ -118,6 +126,10 @@ class GreatWallCoreBindings {
     _theta = _lib.lookupFunction<_ThetaC, _ThetaDart>('bs_theta');
     _masterSecret =
         _lib.lookupFunction<_MasterSecretC, _MasterSecretDart>('bs_master_secret');
+    _orbitCommitment = _lib
+        .lookupFunction<_MasterSecretC, _MasterSecretDart>('bs_orbit_commitment');
+    _exportKey =
+        _lib.lookupFunction<_MasterSecretC, _MasterSecretDart>('bs_export_key');
     _orbitAdvance =
         _lib.lookupFunction<_OrbitAdvanceC, _OrbitAdvanceDart>('bs_orbit_advance');
     _shamirInterp =
@@ -188,12 +200,15 @@ class GreatWallCoreBindings {
   late final _CanonicalIslandPointsDart _canonicalIslandPoints;
   late final _CanonicalIslandFreeDart _canonicalIslandFree;
   late final _Argon2SingleDart _argon2Single;
+  late final _Argon2SingleDart _orbitArgon2Single;
   late final _Argon2idMasterDart _argon2idMaster;
   late final _SaltPepperCanonicalizeDart _saltPepperCanonicalize;
   late final _ChainInputDart _chainInput;
   late final _OrbitRootDart _orbitRoot;
   late final _ThetaDart _theta;
   late final _MasterSecretDart _masterSecret;
+  late final _MasterSecretDart _orbitCommitment;
+  late final _MasterSecretDart _exportKey;
   late final _OrbitAdvanceDart _orbitAdvance;
   late final _ShamirInterpDart _shamirInterp;
   late final _ShamirEvalDart _shamirEval;
@@ -682,44 +697,66 @@ class GreatWallCoreBindings {
   // Argon2 (stage-1 bits -> 256-bit digest)
   // -------------------------------------------------------------------------
 
-  /// Run a single Argon2d pass on [input] under [profile]. Returns the 32-byte
-  /// digest. Iteration (feeding the digest back in for `gui_iterations` cycles)
-  /// is driven from Dart so progress can be reported and the run cancelled
-  /// between passes — matching `run_argon2_iterative` in argon2_pipeline.py.
+  /// Run a single Argon2d pass on [input] under [profile]. Returns the
+  /// [kChainDigestLen]-byte digest. Iteration (feeding the digest back in for
+  /// `gui_iterations` cycles) is driven from Dart so progress can be reported
+  /// and the run cancelled between passes — matching `run_argon2_iterative` in
+  /// argon2_pipeline.py.
+  ///
+  /// **Legacy 0.3.0 chain width.** The orbit's `H*` is [orbitArgon2Single], at
+  /// [kOrbitPointLen]. The two are not prefixes of one another: Argon2's output
+  /// length feeds its final hash, so the same input at 32 and 64 bytes differs
+  /// throughout.
   Uint8List argon2Single(Uint8List input, Argon2Profile profile) {
     final Pointer<Uint8> inPtr = calloc<Uint8>(input.length);
-    final Pointer<Uint8> outPtr = calloc<Uint8>(32);
+    final Pointer<Uint8> outPtr = calloc<Uint8>(kChainDigestLen);
     try {
       inPtr.asTypedList(input.length).setAll(0, input);
       _argon2Single(inPtr, input.length, profile.value, outPtr);
-      return Uint8List.fromList(outPtr.asTypedList(32));
+      return Uint8List.fromList(outPtr.asTypedList(kChainDigestLen));
     } finally {
       _zeroAndFree(inPtr, input.length);
-      _zeroAndFree(outPtr, 32);
+      _zeroAndFree(outPtr, kChainDigestLen);
     }
   }
 
-  /// Derive the orbit root `o_0 = H(sigma)` (SHA-256) from the Namtso salt
+  /// `H*` for the orbit — one Argon2d pass returning [kOrbitPointLen] bytes
+  /// (`bs_orbit_argon2_single`). The memory-hard step of the 0.5.0 advance,
+  /// driven in a loop from Dart so each pass can be reported and checkpointed.
+  Uint8List orbitArgon2Single(Uint8List input, Argon2Profile profile) {
+    final Pointer<Uint8> inPtr = calloc<Uint8>(input.length);
+    final Pointer<Uint8> outPtr = calloc<Uint8>(kOrbitPointLen);
+    try {
+      inPtr.asTypedList(input.length).setAll(0, input);
+      _orbitArgon2Single(inPtr, input.length, profile.value, outPtr);
+      return Uint8List.fromList(outPtr.asTypedList(kOrbitPointLen));
+    } finally {
+      _zeroAndFree(inPtr, input.length);
+      _zeroAndFree(outPtr, kOrbitPointLen);
+    }
+  }
+
+  /// Derive the orbit root `o_0 = H(sigma)` (SHA-512) from the Namtso salt
   /// [sigma] (`bs_orbit_root`). This is the sole seam between Namtso and the
   /// orbit protocol: the app harvests [sigma] from Namtso (the flat submodule
   /// `namtso-the-sacred-salt`, via its CLI) and the engine consumes it here —
   /// great-wall-core never depends on Namtso itself (ARCHITECTURE.md
   /// §"Submodule Rules": no nested submodules; the core takes a pre-harvested
-  /// sigma). Returns the 32-byte root.
+  /// sigma). Returns the [kOrbitPointLen]-byte root.
   ///
   /// SECURITY: [sigma] is public (a precomputation-ruling-out salt), but the
   /// returned root seeds the coercion-relevant orbit, so callers zero it after
   /// use. The input/output buffers here are zeroed and freed on every path.
   Uint8List orbitRoot(Uint8List sigma) {
     final Pointer<Uint8> inPtr = calloc<Uint8>(sigma.length);
-    final Pointer<Uint8> outPtr = calloc<Uint8>(32);
+    final Pointer<Uint8> outPtr = calloc<Uint8>(kOrbitPointLen);
     try {
       inPtr.asTypedList(sigma.length).setAll(0, sigma);
       _orbitRoot(inPtr, sigma.length, outPtr);
-      return Uint8List.fromList(outPtr.asTypedList(32));
+      return Uint8List.fromList(outPtr.asTypedList(kOrbitPointLen));
     } finally {
       _zeroAndFree(inPtr, sigma.length);
-      _zeroAndFree(outPtr, 32);
+      _zeroAndFree(outPtr, kOrbitPointLen);
     }
   }
 
@@ -731,47 +768,52 @@ class GreatWallCoreBindings {
   ///
   /// SECURITY: [oI] is coercion-relevant (an orbit point). Zeroed before free.
   Uint8List theta(Uint8List oI, int j) {
-    assert(oI.length == kOrbitPointLen, 'o_i must be 32 bytes');
+    assert(oI.length == kOrbitPointLen, 'o_i must be $kOrbitPointLen bytes');
     final Pointer<Uint8> oPtr = calloc<Uint8>(kOrbitPointLen);
-    final Pointer<Uint8> outPtr = calloc<Uint8>(32);
+    final Pointer<Uint8> outPtr = calloc<Uint8>(kOrbitPointLen);
     try {
       oPtr.asTypedList(kOrbitPointLen).setAll(0, oI);
       _theta(oPtr, j, outPtr);
-      return Uint8List.fromList(outPtr.asTypedList(32));
+      return Uint8List.fromList(outPtr.asTypedList(kOrbitPointLen));
     } finally {
       _zeroAndFree(oPtr, kOrbitPointLen);
-      _zeroAndFree(outPtr, 32);
+      _zeroAndFree(outPtr, kOrbitPointLen);
     }
   }
 
-  /// `K_i = H(o_i ‖ Sh_i)` — the per-stage master secret (`i > 0`), the cheap-`H`
-  /// commitment (`bs_master_secret`). [oI] is the 32-byte orbit point; [sh] is
-  /// the serialized Shamir polynomial ([shToBytes]). Returns 32 bytes.
+  /// `K_i = TH(master-secret, o_i ‖ Sh_i)` — the per-stage master secret
+  /// (`bs_master_secret`). **Domain-separated from `u_i`**, so it does not
+  /// advance the orbit; use [orbitCommitment] for that. [oI] is the
+  /// [kOrbitPointLen]-byte orbit point; [sh] is the serialized Shamir polynomial
+  /// ([shToBytes]).
+  ///
+  /// Internal — a holder receives [exportKey] of this, never this.
   ///
   /// SECURITY: both inputs and the output are coercion-relevant; every buffer is
   /// zeroed before free.
   Uint8List masterSecret(Uint8List oI, Uint8List sh) {
-    assert(oI.length == kOrbitPointLen, 'o_i must be 32 bytes');
+    assert(oI.length == kOrbitPointLen, 'o_i must be $kOrbitPointLen bytes');
     final Pointer<Uint8> oPtr = calloc<Uint8>(kOrbitPointLen);
     final int m = sh.isEmpty ? 1 : sh.length;
     final Pointer<Uint8> shPtr = calloc<Uint8>(m);
-    final Pointer<Uint8> outPtr = calloc<Uint8>(32);
+    final Pointer<Uint8> outPtr = calloc<Uint8>(kOrbitPointLen);
     try {
       oPtr.asTypedList(kOrbitPointLen).setAll(0, oI);
       if (sh.isNotEmpty) shPtr.asTypedList(sh.length).setAll(0, sh);
       _masterSecret(oPtr, shPtr, sh.length, outPtr);
-      return Uint8List.fromList(outPtr.asTypedList(32));
+      return Uint8List.fromList(outPtr.asTypedList(kOrbitPointLen));
     } finally {
       _zeroAndFree(oPtr, kOrbitPointLen);
       _zeroAndFree(shPtr, m);
-      _zeroAndFree(outPtr, 32);
+      _zeroAndFree(outPtr, kOrbitPointLen);
     }
   }
 
   /// One orbit step: `K_i = H(o_i ‖ Sh_i)` and `o_{i+1} = H*(K_i)` over [steps]
   /// (`D`) memory-hard Argon2d passes at [profile] (`bs_orbit_advance`). Returns
-  /// `(k, next)`, each 32 bytes. The engine zeroizes the raw `{o_i, Sh_i}` copies
-  /// before the memory-hard step.
+  /// `(k, next)`, each [kOrbitPointLen] bytes. `K_i` and `u_i` are
+  /// domain-separated, so the returned key does not advance the orbit. The engine
+  /// zeroizes the raw `{o_i, Sh_i}` copies before the memory-hard step.
   ///
   /// WARNING: this is the heavy, blocking memory-hard call (>= 1 GiB per pass) —
   /// callers run it off the UI isolate, exactly like [argon2idMaster].
@@ -781,25 +823,69 @@ class GreatWallCoreBindings {
     int steps,
     Argon2Profile profile,
   ) {
-    assert(oI.length == kOrbitPointLen, 'o_i must be 32 bytes');
+    assert(oI.length == kOrbitPointLen, 'o_i must be $kOrbitPointLen bytes');
     final Pointer<Uint8> oPtr = calloc<Uint8>(kOrbitPointLen);
     final int m = sh.isEmpty ? 1 : sh.length;
     final Pointer<Uint8> shPtr = calloc<Uint8>(m);
-    final Pointer<Uint8> outK = calloc<Uint8>(32);
-    final Pointer<Uint8> outNext = calloc<Uint8>(32);
+    final Pointer<Uint8> outK = calloc<Uint8>(kOrbitPointLen);
+    final Pointer<Uint8> outNext = calloc<Uint8>(kOrbitPointLen);
     try {
       oPtr.asTypedList(kOrbitPointLen).setAll(0, oI);
       if (sh.isNotEmpty) shPtr.asTypedList(sh.length).setAll(0, sh);
       _orbitAdvance(oPtr, shPtr, sh.length, steps, profile.value, outK, outNext);
       return (
-        k: Uint8List.fromList(outK.asTypedList(32)),
-        next: Uint8List.fromList(outNext.asTypedList(32)),
+        k: Uint8List.fromList(outK.asTypedList(kOrbitPointLen)),
+        next: Uint8List.fromList(outNext.asTypedList(kOrbitPointLen)),
       );
     } finally {
       _zeroAndFree(oPtr, kOrbitPointLen);
       _zeroAndFree(shPtr, m);
-      _zeroAndFree(outK, 32);
-      _zeroAndFree(outNext, 32);
+      _zeroAndFree(outK, kOrbitPointLen);
+      _zeroAndFree(outNext, kOrbitPointLen);
+    }
+  }
+
+  /// `u_i = H(o_i ‖ Sh_i)` — the orbit-advance commitment
+  /// (`bs_orbit_commitment`), the value `H*` consumes.
+  ///
+  /// **Not** [masterSecret]: as of 0.5.0 the two are domain-separated. A caller
+  /// streaming the advance pass by pass MUST seed from this, not from `K_i`.
+  Uint8List orbitCommitment(Uint8List oI, Uint8List sh) {
+    assert(oI.length == kOrbitPointLen, 'o_i must be $kOrbitPointLen bytes');
+    final Pointer<Uint8> oPtr = calloc<Uint8>(kOrbitPointLen);
+    final int m = sh.isEmpty ? 1 : sh.length;
+    final Pointer<Uint8> shPtr = calloc<Uint8>(m);
+    final Pointer<Uint8> outPtr = calloc<Uint8>(kOrbitPointLen);
+    try {
+      oPtr.asTypedList(kOrbitPointLen).setAll(0, oI);
+      if (sh.isNotEmpty) shPtr.asTypedList(sh.length).setAll(0, sh);
+      _orbitCommitment(oPtr, shPtr, sh.length, outPtr);
+      return Uint8List.fromList(outPtr.asTypedList(kOrbitPointLen));
+    } finally {
+      _zeroAndFree(oPtr, kOrbitPointLen);
+      _zeroAndFree(shPtr, m);
+      _zeroAndFree(outPtr, kOrbitPointLen);
+    }
+  }
+
+  /// `K_i^L = TH(export-label, K_i ‖ L)` — the exported key for the canonicalised
+  /// label [label] (`bs_export_key`). Applied for **every** label including the
+  /// empty one, so `K_i` itself is never handed out.
+  Uint8List exportKey(Uint8List kI, Uint8List label) {
+    assert(kI.length == kOrbitPointLen, 'K_i must be $kOrbitPointLen bytes');
+    final Pointer<Uint8> kPtr = calloc<Uint8>(kOrbitPointLen);
+    final int m = label.isEmpty ? 1 : label.length;
+    final Pointer<Uint8> lPtr = calloc<Uint8>(m);
+    final Pointer<Uint8> outPtr = calloc<Uint8>(kOrbitPointLen);
+    try {
+      kPtr.asTypedList(kOrbitPointLen).setAll(0, kI);
+      if (label.isNotEmpty) lPtr.asTypedList(label.length).setAll(0, label);
+      _exportKey(kPtr, lPtr, label.length, outPtr);
+      return Uint8List.fromList(outPtr.asTypedList(kOrbitPointLen));
+    } finally {
+      _zeroAndFree(kPtr, kOrbitPointLen);
+      _zeroAndFree(lPtr, m);
+      _zeroAndFree(outPtr, kOrbitPointLen);
     }
   }
 

@@ -5357,13 +5357,14 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     final String label = widget.core.canonicalizeSaltPepper(_exportLabel.text);
     // Canonical `[A-Z0-9-]` is pure ASCII, so the code units are the bytes.
-    final Uint8List key = label.isEmpty
-        ? ki
-        : widget.core.masterSecret(ki, Uint8List.fromList(label.codeUnits));
+    // The export derivation is applied for EVERY label including the empty one,
+    // so K_i itself is never handed out — `K_i^L = TH(export-label, K_i ‖ L)`.
+    final Uint8List key =
+        widget.core.exportKey(ki, Uint8List.fromList(label.codeUnits));
     final String secret =
         full ? MasterSecret.fullHex(key) : MasterSecret.displayHex(key);
-    // Wipe the transient salted derivation (but never K_i, which is state).
-    if (!identical(key, ki)) Entropy.wipe(key);
+    // Wipe the derived key (never K_i, which is state).
+    Entropy.wipe(key);
     final int chars = secret.length;
     await Clipboard.setData(ClipboardData(text: secret));
     if (!mounted) return;
