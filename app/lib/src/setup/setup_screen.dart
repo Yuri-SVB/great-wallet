@@ -22,8 +22,10 @@ import '../core/stage_params.dart';
 import '../ffi/core_bindings.dart';
 import '../ffi/fixed.dart';
 import 'desktop_qr_scanner.dart';
+import 'orbit_vault.dart';
 import 'setup_controller.dart';
 import 'setup_crypto.dart';
+import 'setup_vault.dart';
 
 /// Setup mode screen: encode a fresh seed onto the chained fractals (one
 /// 32-bit point per stage) and let the user memorise the points.
@@ -216,6 +218,56 @@ class _SetupScreenState extends State<SetupScreen> {
   /// worker isolate (a forward stage navigation). Folds into [_busy] so the
   /// progress scrim shows and other hotkeys/navigation are blocked meanwhile.
   bool _advancing = false;
+
+  /// The stage the advance in flight is deriving *into*, or null. Screen-owned,
+  /// because the orbit never goes through [SetupController] — which is exactly
+  /// why the stage bar could not show this before: it reads the controller's
+  /// `derivingStageIndex` / `stageProgress`, and an orbit advance sets neither.
+  int? _advanceTarget;
+
+  /// Completed / total memory-hard passes of the advance in flight, streamed
+  /// per pass out of [GreatWallCore.startOrbitAdvance].
+  int _advanceDone = 0;
+  int _advanceTotal = 0;
+
+  /// The advance in flight, so Halt can cancel it — killing the worker isolate
+  /// costs at most the single pass currently running.
+  OrbitAdvanceJob? _advanceJob;
+
+  /// Fraction of the advance completed, for the stage tab's determinate bar.
+  double get _advanceProgress => _advanceTotal <= 0
+      ? 0
+      : (_advanceDone / _advanceTotal).clamp(0.0, 1.0);
+
+  /// A **halted** advance's preserved work: the stage it was deriving into, the
+  /// passes completed, and the intermediary digest after them. Kept so Halt
+  /// costs one pass rather than the whole stage, saved into the vault, and
+  /// restored from it — the orbit peer of `SetupController`'s `_halted`.
+  ///
+  /// Dropped whenever it could no longer apply: a successful advance, a
+  /// re-rooted prefix ([_invalidateDeeperThan] / [_clearOrbitPlacements]), or a
+  /// change to `D` (the pass count it is relative to).
+  ({int stage, int pass, Uint8List digest})? _advanceCheckpoint;
+
+  /// Whether a halted advance can be resumed right now: its checkpoint is for
+  /// the next stage to derive, its prefix is still settled, and `D` still agrees
+  /// with the pass it stopped at.
+  bool get _canResumeAdvance {
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
+    if (cp == null || _advancing) return false;
+    return cp.stage == _orbitReachableCeiling + 1 &&
+        cp.pass >= 1 &&
+        cp.pass < _iterations &&
+        _orbitK[cp.stage - 1] != null;
+  }
+
+  /// Drop a preserved checkpoint, wiping the digest. Must run inside a
+  /// [setState] when it changes what is on screen.
+  void _clearAdvanceCheckpoint() {
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
+    if (cp != null) Entropy.wipe(cp.digest);
+    _advanceCheckpoint = null;
+  }
 
   // --- Bottom console ---------------------------------------------------------
   // The console at the foot of the screen is the app's single message surface:
@@ -1153,8 +1205,12 @@ class _SetupScreenState extends State<SetupScreen> {
     // advance into it.
     final int ceiling = session ? 0 : _orbitReachableCeiling;
     final int current = session ? _setup.displayStageIndex : _orbitStage;
-    final int? deriving = _setup.derivingStageIndex;
-    final double progress = _setup.stageProgress;
+    // A legacy chain session reads its derivation state off the controller; an
+    // orbit advance is screen-owned, so the stage bar takes it from
+    // [_advanceTarget] / [_advanceProgress]. Only one can be live at a time.
+    final int? deriving = _advanceTarget ?? _setup.derivingStageIndex;
+    final double progress =
+        _advanceTarget != null ? _advanceProgress : _setup.stageProgress;
     // Transparent so the tabs hover over the fractal (no opaque bar).
     return Material(
       type: MaterialType.transparency,
@@ -1629,9 +1685,11 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Advance the orbit forward into stage [target]: run the memory-hard step
-  /// `o_target = H*(K_{target-1})` (via [GreatWallCore.advanceOrbit] in a worker
-  /// isolate, at the current `P`/`D` profile + derivation steps) and, on success,
-  /// store `o_target` and land on it. The preceding stage must be complete
+  /// `o_target = H*(K_{target-1})` (via [GreatWallCore.startOrbitAdvance] in a
+  /// worker isolate, at the current `P`/`D` profile + derivation steps),
+  /// streaming each completed pass to the stage bar and letting Halt cancel it;
+  /// on success, store `o_target` and land on it. The preceding stage must be
+  /// complete
   /// (`K_{target-1}` derived); otherwise this reports what is missing. Re-placing
   /// a point in an earlier stage cascade-invalidates the deeper `o_i`/`K_i` (see
   /// [_setPrimary]), so a forward advance always rebuilds from a settled prefix.
@@ -1656,23 +1714,77 @@ class _SetupScreenState extends State<SetupScreen> {
     // convenience, so it skips the "advancing" scrim; D >= 1 shows it.
     final int steps = _iterations;
     final bool memoryHard = steps >= 1;
-    if (memoryHard) setState(() => _advancing = true);
+    if (memoryHard) {
+      setState(() {
+        _advancing = true;
+        _advanceTarget = target;
+        _advanceDone = 0;
+        _advanceTotal = steps;
+      });
+    }
     _sounds.play(UiSound.focus);
     ({Uint8List k, Uint8List next})? adv;
+    bool cancelled = false;
     try {
-      adv = await widget.core.advanceOrbit(
+      // Streamed rather than one opaque call, so each completed pass moves the
+      // stage bar and Halt can stop it. `oFrom` is NOT wiped here — for stage 0
+      // it is a fresh derivation from σ, but for a deep stage it *is*
+      // `_orbitO[from]`, which the setup still needs.
+      final OrbitAdvanceJob job = await widget.core.startOrbitAdvance(
         oFrom,
         shBytes,
         steps: steps,
         profile: _profile,
+        onProgress: (int done, int total) {
+          if (!mounted) return;
+          setState(() {
+            _advanceDone = done;
+            _advanceTotal = total;
+          });
+        },
+        onCheckpoint: (int done, Uint8List digest) {
+          // Keep the latest intermediary so a halt costs at most this pass. The
+          // callback's buffer is wiped by the facade once it returns, so copy.
+          final ({int stage, int pass, Uint8List digest})? old =
+              _advanceCheckpoint;
+          if (old != null) Entropy.wipe(old.digest);
+          _advanceCheckpoint = (
+            stage: target,
+            pass: done,
+            digest: Uint8List.fromList(digest),
+          );
+        },
       );
+      _advanceJob = job;
+      adv = await job.result;
+    } on Argon2Cancelled {
+      cancelled = true;
     } catch (_) {
       adv = null;
     } finally {
       Entropy.wipe(shBytes);
-      if (memoryHard && mounted) setState(() => _advancing = false);
+      _advanceJob = null;
+      if (memoryHard && mounted) {
+        setState(() {
+          _advancing = false;
+          _advanceTarget = null;
+          _advanceDone = 0;
+          _advanceTotal = 0;
+        });
+      }
     }
     if (!mounted) return;
+    if (cancelled) {
+      // The checkpoint survives the halt — that is the whole point of it.
+      final int done = _advanceCheckpoint?.pass ?? 0;
+      _sounds.play(UiSound.navStage);
+      setState(() {});
+      _toast(done > 0
+          ? 'Advance halted after $done/$steps passes — kept. Save to keep it '
+              'across sessions, or Resume to continue.'
+          : 'Advance halted before the first pass finished — nothing to keep.');
+      return;
+    }
     if (adv == null) {
       _sounds.play(UiSound.warn);
       _toast('Orbit advance failed — try again.');
@@ -1684,6 +1796,103 @@ class _SetupScreenState extends State<SetupScreen> {
     final Uint8List? oldNext = _orbitO[target];
     if (oldNext != null) Entropy.wipe(oldNext);
     _orbitO[target] = adv.next;
+    _clearAdvanceCheckpoint(); // the advance landed; the checkpoint is spent
+    _setOrbitStage(target);
+    _sounds.play(UiSound.stageReady);
+    _toast('Advanced to stage $target — place its points.');
+  }
+
+  /// Continue a halted advance from its preserved checkpoint, running only the
+  /// passes that remain. The orbit peer of [_resumeDerivation].
+  ///
+  /// `K_{stage-1}` is not stored anywhere — it is read back from [_orbitK],
+  /// which the setup recomputes from the stage's placed points on restore. So a
+  /// resume after reopening a file needs nothing from the file but the digest
+  /// and the pass count.
+  Future<void> _resumeOrbitAdvance() async {
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
+    if (cp == null || !_canResumeAdvance) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Nothing to resume.');
+      return;
+    }
+    final int target = cp.stage;
+    final Uint8List? k = _orbitK[target - 1];
+    if (k == null) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Place stage ${target - 1}’s points first.');
+      return;
+    }
+    final int steps = _iterations;
+    setState(() {
+      _advancing = true;
+      _advanceTarget = target;
+      _advanceDone = cp.pass;
+      _advanceTotal = steps;
+    });
+    _sounds.play(UiSound.focus);
+    ({Uint8List k, Uint8List next})? adv;
+    bool cancelled = false;
+    try {
+      final OrbitAdvanceJob job = await widget.core.resumeOrbitAdvance(
+        k,
+        cp.digest,
+        fromPass: cp.pass,
+        steps: steps,
+        profile: _profile,
+        onProgress: (int done, int total) {
+          if (!mounted) return;
+          setState(() {
+            _advanceDone = done;
+            _advanceTotal = total;
+          });
+        },
+        onCheckpoint: (int done, Uint8List digest) {
+          final ({int stage, int pass, Uint8List digest})? old =
+              _advanceCheckpoint;
+          if (old != null) Entropy.wipe(old.digest);
+          _advanceCheckpoint = (
+            stage: target,
+            pass: done,
+            digest: Uint8List.fromList(digest),
+          );
+        },
+      );
+      _advanceJob = job;
+      adv = await job.result;
+    } on Argon2Cancelled {
+      cancelled = true;
+    } catch (_) {
+      adv = null;
+    } finally {
+      _advanceJob = null;
+      if (mounted) {
+        setState(() {
+          _advancing = false;
+          _advanceTarget = null;
+          _advanceDone = 0;
+          _advanceTotal = 0;
+        });
+      }
+    }
+    if (!mounted) return;
+    if (cancelled) {
+      final int done = _advanceCheckpoint?.pass ?? 0;
+      _sounds.play(UiSound.navStage);
+      setState(() {});
+      _toast('Advance halted again after $done/$steps passes — kept.');
+      return;
+    }
+    if (adv == null) {
+      _sounds.play(UiSound.warn);
+      _toast('Orbit advance failed — try again.');
+      return;
+    }
+    Entropy.wipe(adv.k);
+    final Uint8List? oldNext = _orbitO[target];
+    if (oldNext != null) Entropy.wipe(oldNext);
+    _orbitO[target] = adv.next;
+    _clearAdvanceCheckpoint();
     _setOrbitStage(target);
     _sounds.play(UiSound.stageReady);
     _toast('Advanced to stage $target — place its points.');
@@ -1908,7 +2117,13 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     return _BoardDeco(
       cells: CanvasIsland(
-          cellSize: fixedToDouble(isl.pixelDeltaRaw), pointsReIm: pts),
+        cellSize: fixedToDouble(isl.pixelDeltaRaw),
+        pointsReIm: pts,
+        // The level set the canvas re-floods to draw this island at whatever
+        // resolution is on screen; the points are its seeds, the cells only a
+        // fallback. See great-wall-ux `island_fill.dart`.
+        escapeCount: isl.escapeCount,
+      ),
       reMin: fixedToDouble(isl.bbox.reMin),
       reMax: fixedToDouble(isl.bbox.reMax),
       imMin: fixedToDouble(isl.bbox.imMin),
@@ -2241,6 +2456,10 @@ class _SetupScreenState extends State<SetupScreen> {
   /// prefix invalidates the whole memory-hard advance chain below it. Must run
   /// inside a [setState].
   void _invalidateDeeperThan(int stage) {
+    // A halted advance into any deeper stage was derived from the prefix that
+    // just changed, so its checkpoint no longer leads anywhere.
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
+    if (cp != null && cp.stage > stage) _clearAdvanceCheckpoint();
     for (int st = stage + 1; st <= _maxStage; st++) {
       _shareEncodeGen[st]++; // discard any in-flight share-marker encode for st
       for (int s = 1; s <= _maxSlot; s++) {
@@ -2399,6 +2618,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// `K_i`) — called when σ changes, since a new σ re-roots the whole orbit and
   /// old points no longer decode, and on dispose.
   void _clearOrbitPlacements() {
+    _clearAdvanceCheckpoint(); // a re-rooted orbit invalidates a halted advance
     for (int st = 0; st <= _maxStage; st++) {
       _shareEncodeGen[st]++; // discard any in-flight share-marker encode
       for (int s = 1; s <= _maxSlot; s++) {
@@ -2807,14 +3027,39 @@ class _SetupScreenState extends State<SetupScreen> {
                 onPressed: _setup.halt,
                 child: const Text('Halt'),
               )
-            : Text(
-                _advancing
-                    ? 'Advancing the orbit (memory-hard)…'
-                    : _setup.phase == SetupPhase.encoding
+            : _advancing
+                // The orbit advance now streams pass by pass, so it gets the
+                // same Halt the chain derivation has: cancelling kills the
+                // worker isolate, costing at most the pass in flight. The stage
+                // tab above carries the bar; this states the cost in passes.
+                ? Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Text(
+                        _advanceTotal > 0
+                            ? 'Advancing the orbit (memory-hard) — pass '
+                                '$_advanceDone/$_advanceTotal…'
+                            : 'Advancing the orbit (memory-hard)…',
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                      const SizedBox(height: 8),
+                      TextButton(
+                        onPressed: _advanceJob == null
+                            ? null
+                            : () {
+                                _sounds.play(UiSound.select);
+                                _advanceJob?.cancel();
+                              },
+                        child: const Text('Halt'),
+                      ),
+                    ],
+                  )
+                : Text(
+                    _setup.phase == SetupPhase.encoding
                         ? 'Encoding…'
                         : 'Working…',
-                style: const TextStyle(color: Colors.white),
-              ),
+                    style: const TextStyle(color: Colors.white),
+                  ),
       ),
     );
   }
@@ -2836,7 +3081,6 @@ class _SetupScreenState extends State<SetupScreen> {
     'Click/press a ghost slot past the last stage to grow the setup (N/I/R)',
     'S salt / export salt · P profile · D derivation steps · C colour',
     'Alt+D  calibrate derivation time (dialog: target time → steps N)',
-    'Enter  start (Generate / Encode / Begin recall) from a field',
     'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
     'X  exclude this stage & above (shorten the setup)',
     'E  highlight canonical islands in view (white) · zoom in if too many',
@@ -3163,6 +3407,12 @@ class _SetupScreenState extends State<SetupScreen> {
             _haltedNotice(),
           ],
 
+          // A halted orbit advance: same deal, screen-owned.
+          if (_canResumeAdvance) ...<Widget>[
+            const Divider(height: 32),
+            _haltedAdvanceNotice(),
+          ],
+
           // Inline editor for importing a stage-0 orbit board's point.
           if (_boardImportSlot != null) ...<Widget>[
             const Divider(height: 32),
@@ -3240,12 +3490,10 @@ class _SetupScreenState extends State<SetupScreen> {
           ],
 
           // Provisional-key save / load: an encrypted on-disk copy of the setup
-          // for the consolidation window. Save needs a settled setup, or a
-          // halted one (saved as resumable); Load is offered on the config
-          // screen too (to restore one).
-          if (_setup.phase == SetupPhase.idle ||
-              _setup.canExportVault ||
-              _setup.canExportResumable) ...<Widget>[
+          // for the consolidation window. Save needs a settled setup — an orbit
+          // one, or a legacy chain one (halted chains save as resumable); Load
+          // is offered on the config screen too (to restore one).
+          if (_vaultPanelShown) ...<Widget>[
             const Divider(height: 32),
             _vaultControls(),
           ],
@@ -3400,7 +3648,11 @@ class _SetupScreenState extends State<SetupScreen> {
           onChanged: (_) {
             _sounds.play(UiSound.tickSoft);
             final int? v = int.tryParse(_iterationsField.text.trim());
-            if (v != null && v >= 0) _iterations = v;
+            if (v != null && v >= 0 && v != _iterations) {
+              _iterations = v;
+              // The checkpoint's `pass` is relative to D; a new D orphans it.
+              _clearAdvanceCheckpoint();
+            }
             setState(() {});
           },        ),
       ),
@@ -3617,10 +3869,302 @@ class _SetupScreenState extends State<SetupScreen> {
     _setup.resumeDerivation();
   }
 
+  /// The orbit peer of [_haltedNotice]: a halted advance's preserved passes, and
+  /// the button that continues from them.
+  Widget _haltedAdvanceNotice() {
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
+    if (cp == null) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          'Advance into Stage ${cp.stage} halted — pass ${cp.pass}/$_iterations '
+          'kept. Resume continues from there; Write (W) saves it so a later '
+          'session can (the file then holds the partial derivation — guard it). '
+          'Changing D, or re-placing a point below Stage ${cp.stage}, discards it.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 8),
+        FilledButton.icon(
+          onPressed: () {
+            _sounds.play(UiSound.select);
+            unawaited(_resumeOrbitAdvance());
+          },
+          icon: const Icon(Icons.play_arrow),
+          label: Text('Resume Stage ${cp.stage}'),
+        ),
+      ],
+    );
+  }
+
+  // --- Orbit provisional key: capture / write / restore ----------------------
+  // The orbit peer of SetupController's chain vault. It lives on the screen
+  // because the orbit state does: σ, D, P, r_i, o_i and the placed points are
+  // all screen-owned fields (none of them go through the controller), so an
+  // orbit save/load that routed through SetupController would have to mirror
+  // them first. See next-steps/orbit-save-load-and-cpnf-rederivation-plan.md §3.
+
+  /// The single failure message every vault open reports. A wrong key, a corrupt
+  /// file, a chain/orbit mix-up and a doctored payload MUST be indistinguishable
+  /// — otherwise someone holding the file learns from probing it whether a
+  /// candidate key was right. (GCM authentication already makes the first two
+  /// identical; this keeps the parse failures from breaking that.)
+  static const String _vaultOpaqueError =
+      'Could not open — wrong key, or not a setup file.';
+
+  /// The deepest orbit stage the forward advance has actually reached: stage 0
+  /// (always rooted by σ) until an advance produces `o_1`, then the highest
+  /// contiguous `o_i`. This is the last stage a save has to carry.
+  int get _orbitDeepestStage => _orbitReachableCeiling;
+
+  /// Whether the screen-owned orbit setup is **settled**, and so can be written
+  /// as an [OrbitVault]: σ parses, and the deepest reached stage has its `r_i`
+  /// fractals placed (`K_i` derived — which, since re-placing a point
+  /// cascade-invalidates the deeper `o_i`, implies every shallower stage is
+  /// settled too). Deliberately cheap: it parses σ but never runs `orbitRoot`,
+  /// so it is safe in `build` and in the hotkey gate.
+  ///
+  /// Settled-only by design. A halted, mid-advance orbit needs a checkpointable
+  /// engine advance and is deferred (Role 1 of
+  /// `next-steps/orbit-persistence-and-provisional-key-roles.md`).
+  bool get _orbitSettled {
+    final Uint8List? sigma = _parseHex(_sigmaCtrl.text.trim());
+    if (sigma == null || sigma.isEmpty) return false;
+    return _orbitK[_orbitDeepestStage] != null;
+  }
+
+  /// Capture the settled orbit setup as an [OrbitVault] — pure, synchronous and
+  /// read straight off the screen-owned state, with no [SetupController] call.
+  ///
+  /// Stage 0's `o₀` is omitted (it re-derives from σ) and the derived slots are
+  /// omitted (they re-derive from the placed ones), so the file carries only
+  /// what a restore cannot recompute cheaply: the `o_i` that would otherwise
+  /// cost a memory-hard advance each, and the points only the holder knows.
+  ///
+  /// The result **is the secret** — the caller MUST [OrbitVault.wipe] it.
+  OrbitVault _exportOrbitVault() {
+    final int deepest = _orbitDeepestStage;
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
+    return OrbitVault(
+      sigma: _sigmaCtrl.text.trim().replaceAll(RegExp(r'\s'), ''),
+      iterations: _iterations,
+      profile: _profile,
+      // A halted advance rides along, so reopening the file continues from the
+      // pass it reached instead of restarting the stage. Only carried while it
+      // still applies (see [_canResumeAdvance]).
+      resume: cp != null && _canResumeAdvance
+          ? OrbitVaultResume(
+              stage: cp.stage,
+              pass: cp.pass,
+              digest: List<int>.of(cp.digest),
+            )
+          : null,
+      stages: <OrbitVaultStage>[
+        for (int i = 0; i <= deepest; i++)
+          OrbitVaultStage(
+            required: _requiredFractals[i],
+            orbit: i == 0 ? null : List<int>.of(_orbitO[i]!),
+            points: <OrbitVaultPoint>[
+              for (int s = 1; s <= _maxSlot; s++)
+                if (_boardPoints[i][s] != null && !_boardDerived[i][s])
+                  OrbitVaultPoint(
+                    slot: s,
+                    reRaw: _boardPoints[i][s]!.reRaw,
+                    imRaw: _boardPoints[i][s]!.imRaw,
+                  ),
+            ],
+          ),
+      ],
+    );
+  }
+
+  /// Write the settled orbit setup to [path], encrypted under the provisional
+  /// key — the orbit peer of `SetupController.saveVaultToFile`, and the reason
+  /// the screen does its own file I/O: it is the screen that owns the state.
+  ///
+  /// The write is **atomic** (temp file + rename). Phase 2 re-writes this same
+  /// file on every graded card, and a half-written vault is an unopenable one.
+  /// Uses [providedKey] (the user's own entropy) if given, else a fresh
+  /// [genLenBytes]-byte key. The captured vault is wiped on every path.
+  Future<({String? error, Uint8List? key})> _saveOrbitVaultToFile(
+    String path, {
+    Uint8List? providedKey,
+    int genLenBytes = SetupCrypto.keyLenBytes,
+  }) async {
+    if (!_orbitSettled) {
+      return (error: 'This setup cannot be saved yet.', key: null);
+    }
+    final OrbitVault vault = _exportOrbitVault();
+    final File tmp = File('$path.tmp');
+    try {
+      final SealedVault sealed = await SetupCrypto.sealPayload(
+        vault.toJson(),
+        providedKey: providedKey,
+        genLenBytes: genLenBytes,
+      );
+      await tmp.writeAsBytes(sealed.fileBytes, flush: true);
+      await tmp.rename(path);
+      return (error: null, key: sealed.key);
+    } catch (e) {
+      // Best effort: never leave the partial temp behind. It is ciphertext, but
+      // a stale `.tmp` beside the vault is confusing at best.
+      try {
+        if (tmp.existsSync()) tmp.deleteSync();
+      } catch (_) {
+        // Nothing more to do — the save has already failed.
+      }
+      return (error: 'Could not save the file (${e.runtimeType}).', key: null);
+    } finally {
+      vault.wipe();
+    }
+  }
+
+  /// Restore a settled orbit setup from [vault] **into orbit mode** — never into
+  /// the legacy chain `memorise` session, so no [SetupController] state is
+  /// touched and the deprecated recall walk stays unreachable from a load.
+  ///
+  /// The mirror of [_exportOrbitVault]: each `o_i` comes straight out of the
+  /// file (stage 0's from σ), each stored point is cheap-decoded back to its
+  /// 32-bit chunk under `(o,p,q) = orbitParams(o_i, slot-1)`, and
+  /// [_recomputeExtraShares] then re-interpolates `Sh_i`, recomputes
+  /// `K_i = H(o_i ‖ Sh_i)` and re-derives the unplaced slots — exactly what a
+  /// live placement does, so a restored setup and a freshly built one are the
+  /// same state. **No Argon2 pass runs.**
+  ///
+  /// Integrity is the envelope's job, not re-derivation's: the AEAD tag
+  /// authenticates the whole payload, so a stored `o_i` cannot have been
+  /// tampered with independently of the points. There is deliberately **no**
+  /// cheap `o_i == H*(K_{i-1})` check — that check *is* the memory-hard advance
+  /// this file exists to skip. (Phase 2's re-derivation walk performs it as a
+  /// side effect; that is where it becomes an error locator.)
+  ///
+  /// Returns null on success, else a message. Nothing is applied unless every
+  /// stage validated and every stored point decoded, so a failed restore leaves
+  /// the current setup untouched. The caller owns and wipes [vault].
+  Future<String?> _restoreOrbitVault(OrbitVault vault) async {
+    final Uint8List? sigma = _parseHex(vault.sigma);
+    if (sigma == null || sigma.isEmpty) return _vaultOpaqueError;
+    final int deepest = vault.stages.length - 1;
+    if (deepest < 0 || deepest > _maxStage) return _vaultOpaqueError;
+
+    // Validate the whole file and resolve every stage's o_i and board
+    // reservoirs first — the decode below is the expensive part, and a partial
+    // restore of a bad file must never reach the screen state.
+    final List<Uint8List> orbits = <Uint8List>[];
+    final List<List<int>> pointsRaw = <List<int>>[];
+    final List<List<int>> reservoirs = <List<int>>[];
+    final List<({int stage, int slot})> targets = <({int stage, int slot})>[];
+    final OrbitProtocol protocol = OrbitProtocol(widget.core);
+    for (int i = 0; i <= deepest; i++) {
+      final OrbitVaultStage stage = vault.stages[i];
+      if (stage.required < 1 || stage.required > _maxSlot) {
+        return _vaultOpaqueError;
+      }
+      final List<int>? oI = stage.orbit;
+      if (i == 0) {
+        // σ is o₀'s only source; a file that also carries one disagrees with
+        // itself about the root and is rejected rather than silently preferred.
+        if (oI != null) return _vaultOpaqueError;
+        orbits.add(widget.core.orbitRoot(sigma));
+      } else {
+        // Width is load-bearing, not cosmetic: a short o_i would be zero-padded
+        // by the FFI marshalling and derive a different orbit in silence.
+        if (oI == null || oI.length != kOrbitPointLen) return _vaultOpaqueError;
+        orbits.add(Uint8List.fromList(oI));
+      }
+      // Under r_i placed points Sh_i is not fixed, so the stage would restore
+      // unsettled — and any deeper stage's o_i would then have no derivation.
+      if (stage.points.length < stage.required) return _vaultOpaqueError;
+      final Set<int> seenSlots = <int>{};
+      for (final OrbitVaultPoint point in stage.points) {
+        if (point.slot < 1 ||
+            point.slot > _maxSlot ||
+            !seenSlots.add(point.slot)) {
+          return _vaultOpaqueError;
+        }
+        final ({int o, int p, int q}) prm =
+            protocol.orbitParams(orbits[i], point.slot - 1);
+        pointsRaw.add(<int>[point.reRaw, point.imRaw]);
+        reservoirs.add(<int>[prm.o, prm.p, prm.q]);
+        targets.add((stage: i, slot: point.slot));
+      }
+    }
+
+    // One decodeFull per placed point, over every stage, is seconds of CPU — it
+    // runs in a worker isolate behind the _vaultBusy spinner, or opening a file
+    // freezes the app.
+    List<List<int>?> decoded;
+    try {
+      decoded = await widget.core.decodePoints(pointsRaw, reservoirs);
+    } catch (_) {
+      return _vaultOpaqueError;
+    }
+    // A point that does not decode under its own stage's reservoirs means the
+    // file and the engine disagree — a wrong-protocol or doctored file. Nothing
+    // is applied then, and the chunks decoded so far are wiped rather than left
+    // to the collector; the same holds if the screen went away mid-decode.
+    if (!mounted ||
+        decoded.length != targets.length ||
+        decoded.contains(null)) {
+      for (final List<int>? bits in decoded) {
+        if (bits != null) Entropy.wipe(bits);
+      }
+      return _vaultOpaqueError;
+    }
+
+    setState(() {
+      // Drop whatever is on the boards now: a restore replaces the orbit, and a
+      // leftover placement from another σ would neither decode nor be visible.
+      _clearOrbitPlacements();
+      _sigmaCtrl.text = vault.sigma;
+      _iterations = vault.iterations;
+      _iterationsField.text = '${vault.iterations}';
+      _profile = vault.profile;
+      for (int i = 0; i <= deepest; i++) {
+        _requiredFractals[i] = vault.stages[i].required;
+        // o₀ is never stored: [_stageOrbit] re-derives it from σ on demand.
+        if (i >= 1) _orbitO[i] = orbits[i];
+      }
+      for (int k = 0; k < targets.length; k++) {
+        final ({int stage, int slot}) t = targets[k];
+        _boardChunks[t.stage][t.slot] = decoded[k]!; // owns the bits
+        _boardPoints[t.stage][t.slot] =
+            (reRaw: pointsRaw[k][0], imRaw: pointsRaw[k][1]);
+        _boardDerived[t.stage][t.slot] = false;
+      }
+      // Every o_i is in place above, so each stage can now re-interpolate its
+      // own Sh_i, recompute K_i and kick off the derived slots' marker encode.
+      for (int i = 0; i <= deepest; i++) {
+        _recomputeExtraShares(i);
+      }
+      // A halted advance, if the file carried one. Accepted only when it still
+      // fits the restored setup: deriving into the next stage, stopped
+      // part-way through this file's own D. K_{stage-1} is not read from the
+      // file — [_recomputeExtraShares] above has just rebuilt it from the
+      // placed points, which is why the checkpoint need not carry a key.
+      final OrbitVaultResume? r = vault.resume;
+      if (r != null &&
+          r.stage == deepest + 1 &&
+          r.pass >= 1 &&
+          r.pass < vault.iterations &&
+          r.digest.length == kOrbitPointLen &&
+          _orbitK[deepest] != null) {
+        _advanceCheckpoint = (
+          stage: r.stage,
+          pass: r.pass,
+          digest: Uint8List.fromList(r.digest),
+        );
+      }
+    });
+    _setOrbitStage(deepest);
+    return null;
+  }
+
   /// Provisional-key save / load: an encrypted on-disk copy of the setup, kept
   /// only across the memorisation window and destroyed at graduation.
   Widget _vaultControls() {
-    final bool canSave = _setup.canExportVault || _setup.canExportResumable;
+    final bool canSave =
+        _orbitSettled || _setup.canExportVault || _setup.canExportResumable;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
@@ -3686,8 +4230,10 @@ class _SetupScreenState extends State<SetupScreen> {
   void _focusVaultPath() => _focusField(_vaultPathFocus, 'vault file path');
 
   /// Whether the provisional-key panel is on screen — the config screen (to open
-  /// a saved setup) or a settled setup (to write one). Gates the F/W/O/T keys.
+  /// a saved setup) or a settled setup, orbit or legacy chain (to write one).
+  /// Gates the F/W/O/T keys.
   bool get _vaultPanelShown =>
+      _orbitSettled ||
       _setup.phase == SetupPhase.idle ||
       _setup.canExportVault ||
       _setup.canExportResumable;
@@ -3695,8 +4241,14 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Write (save) the settled setup to the file path, encrypted under a fresh
   /// app-generated 128-bit key, then open the key dialog (W). The key can be
   /// overridden with the user's own entropy from inside that dialog.
+  ///
+  /// A settled **orbit** setup writes an [OrbitVault] off the screen state; the
+  /// legacy chain path stays on [SetupController] while it survives as the
+  /// porting reference. The orbit takes precedence — the two cannot both be
+  /// settled, since orbit placement never enters a chain session.
   Future<void> _writeSetup() async {
-    if (!_setup.canExportVault && !_setup.canExportResumable) {
+    final bool orbit = _orbitSettled;
+    if (!orbit && !_setup.canExportVault && !_setup.canExportResumable) {
       _sounds.play(UiSound.denyInput);
       _toast('Finish a setup first — there is nothing to write yet.');
       return;
@@ -3708,8 +4260,9 @@ class _SetupScreenState extends State<SetupScreen> {
       return;
     }
     setState(() => _vaultBusy = true);
-    final ({String? error, Uint8List? key}) result =
-        await _setup.saveVaultToFile(path);
+    final ({String? error, Uint8List? key}) result = orbit
+        ? await _saveOrbitVaultToFile(path)
+        : await _setup.saveVaultToFile(path);
     if (!mounted) return;
     setState(() => _vaultBusy = false);
     if (result.error != null || result.key == null) {
@@ -3718,7 +4271,7 @@ class _SetupScreenState extends State<SetupScreen> {
       return;
     }
     _sounds.play(UiSound.exportOk);
-    await _showKeyDialog(path, result.key!);
+    await _showKeyDialog(path, result.key!, orbit: orbit);
   }
 
   /// Open (load) a saved setup from the file path (O): scan the QR (Q) or type
@@ -3868,10 +4421,12 @@ class _SetupScreenState extends State<SetupScreen> {
     return keyBytes;
   }
 
-  /// Shared decrypt+restore from a file path and 16-byte key, wiping the key.
+  /// Shared decrypt+restore from a file path and 16- or 32-byte key, wiping the
+  /// key. The heavy part (the Argon2 key derivation, and an orbit restore's
+  /// per-point decode) runs behind the [_vaultBusy] spinner.
   Future<void> _loadWithBytes(String path, Uint8List keyBytes) async {
     setState(() => _vaultBusy = true);
-    final String? err = await _setup.loadVaultFromFile(path, keyBytes);
+    final String? err = await _openVaultFile(path, keyBytes);
     _wipeBytes(keyBytes);
     if (!mounted) return;
     setState(() => _vaultBusy = false);
@@ -3884,13 +4439,77 @@ class _SetupScreenState extends State<SetupScreen> {
     _toast('Setup loaded.');
   }
 
+  /// Decrypt the file at [path] with [keyBytes] and restore whichever setup it
+  /// holds, returning null on success or a message on failure.
+  ///
+  /// The payload's `kind` picks the branch: `'orbit'` restores the screen-owned
+  /// orbit setup ([_restoreOrbitVault]); an absent `kind` is a legacy 0.3.0
+  /// chain [SetupVault] and takes the unchanged [SetupController] path. Every
+  /// failure after the file is read reports the same [_vaultOpaqueError], so a
+  /// wrong key, a corrupt file and a chain/orbit mix-up are indistinguishable.
+  /// The caller owns and wipes [keyBytes].
+  Future<String?> _openVaultFile(String path, Uint8List keyBytes) async {
+    if (!SetupCrypto.isValidKeyLen(keyBytes.length)) return _vaultOpaqueError;
+    Uint8List bytes;
+    try {
+      bytes = await File(path).readAsBytes();
+    } catch (_) {
+      // Not a secret-bearing distinction: whether the path exists is knowable
+      // without the key, and saying so is the difference between a typo the user
+      // can fix and one they cannot.
+      return 'Could not read that file.';
+    }
+    Map<String, dynamic> payload;
+    try {
+      payload = await SetupCrypto.openPayload(bytes, keyBytes);
+    } catch (_) {
+      return _vaultOpaqueError;
+    }
+    if (payload[OrbitVault.kindKey] == OrbitVault.kind) {
+      OrbitVault vault;
+      try {
+        vault = OrbitVault.fromJson(payload);
+      } catch (_) {
+        return _vaultOpaqueError;
+      }
+      try {
+        return await _restoreOrbitVault(vault);
+      } finally {
+        vault.wipe();
+      }
+    }
+    SetupVault chain;
+    try {
+      chain = SetupVault.fromJson(payload);
+    } catch (_) {
+      return _vaultOpaqueError;
+    }
+    try {
+      if (chain.resume != null) {
+        _setup.restoreResumableVault(chain); // halted — restore + offer Resume
+      } else {
+        _setup.restoreVault(chain);
+      }
+      return null;
+    } catch (_) {
+      return _vaultOpaqueError;
+    } finally {
+      chain.wipe();
+    }
+  }
+
   /// After a write, present the provisional [keyBytes] for the file at [path]:
   /// reveal the byte-mode v1 QR to hand-copy (Q), copy the 32-hex key blind to
   /// the clipboard for a password manager (Alt+Q), or overwrite the key with the
   /// user's own 32-hex entropy (I focuses the field, Enter applies). Esc closes.
   /// The key is never shown as text — only as a QR or copied blind — and the
   /// in-memory copy is wiped when the dialog closes.
-  Future<void> _showKeyDialog(String path, Uint8List keyBytes) async {
+  ///
+  /// [orbit] says which writer the dialog's re-seals go back through, so the
+  /// 128↔256 toggle and the own-key/scanned-key paths rewrite the same kind of
+  /// vault the initial write produced.
+  Future<void> _showKeyDialog(String path, Uint8List keyBytes,
+      {required bool orbit}) async {
     Uint8List key = keyBytes;
     int keyLen = key.length; // 16 (128-bit) or 32 (256-bit)
     qr.QrImage matrix = _keyMatrix(key);
@@ -3916,8 +4535,11 @@ class _SetupScreenState extends State<SetupScreen> {
           // and redraw. Shared by the 128↔256 toggle and the own-key path.
           Future<bool> reseal({Uint8List? ownKey, required int newLen}) async {
             setLocal(() => busy = true);
-            final ({String? error, Uint8List? key}) r = await _setup
-                .saveVaultToFile(path, providedKey: ownKey, genLenBytes: newLen);
+            final ({String? error, Uint8List? key}) r = orbit
+                ? await _saveOrbitVaultToFile(path,
+                    providedKey: ownKey, genLenBytes: newLen)
+                : await _setup.saveVaultToFile(path,
+                    providedKey: ownKey, genLenBytes: newLen);
             if (ownKey != null) _wipeBytes(ownKey);
             if (!ctx.mounted) return false;
             if (r.error != null || r.key == null) {
@@ -4730,6 +5352,38 @@ class _SetupScreenState extends State<SetupScreen> {
   /// `H(K_i ‖ label)` (the demoted `[A-Z0-9-]` pepper — one setup, many keys).
   /// `K` copies the conventional first-32-hex view; `Alt+K` ([full]) the whole
   /// digest. Cheap `H` throughout — no Argon2id pass, so no deriving spinner.
+  /// Entropy actually behind the exported key at [stage]: the placed points,
+  /// `Σ r_j × 32` bits over stages `0..stage`. This is what an attacker must
+  /// guess; the 512-bit state and the copied view can each *cap* what is
+  /// carried, never raise it.
+  int _placedEntropyBits(int stage) {
+    int bits = 0;
+    for (int i = 0; i <= stage && i <= _maxStage; i++) {
+      bits += _requiredFractals[i] * EncodingConstants.bitsPerPoint;
+    }
+    return bits;
+  }
+
+  /// One-line entropy readout for the export surfaces: how much is usable, and
+  /// which of the three limits is binding. [viewBits] is what the copied form
+  /// actually carries (4 bits per hex digit).
+  ///
+  /// Stated because the conventional 32-digit view is a *display* convention
+  /// inherited from the 1024-byte Argon2id export, not a statement about the
+  /// key — so the figure a holder is relying on is not otherwise visible.
+  String _exportEntropyNote(int stage, int viewBits) {
+    final int placed = _placedEntropyBits(stage);
+    const int stateBits = kOrbitPointLen * 8;
+    final int usable = math.min(placed, math.min(viewBits, stateBits));
+    final String limit = usable == placed
+        ? 'your placed points'
+        : usable == viewBits
+            ? 'this view — Alt+K copies all $stateBits bits'
+            : 'the orbit state';
+    return '$usable bits usable at stage $stage '
+        '($placed placed, $viewBits in this view; limited by $limit)';
+  }
+
   Future<void> _copyOrbitMaster({bool full = false}) async {
     final Uint8List? ki = _activeK;
     if (ki == null) {
@@ -4738,21 +5392,24 @@ class _SetupScreenState extends State<SetupScreen> {
     }
     final String label = widget.core.canonicalizeSaltPepper(_exportLabel.text);
     // Canonical `[A-Z0-9-]` is pure ASCII, so the code units are the bytes.
-    final Uint8List key = label.isEmpty
-        ? ki
-        : widget.core.masterSecret(ki, Uint8List.fromList(label.codeUnits));
+    // The export derivation is applied for EVERY label including the empty one,
+    // so K_i itself is never handed out — `K_i^L = TH(export-label, K_i ‖ L)`.
+    final Uint8List key =
+        widget.core.exportKey(ki, Uint8List.fromList(label.codeUnits));
     final String secret =
         full ? MasterSecret.fullHex(key) : MasterSecret.displayHex(key);
-    // Wipe the transient salted derivation (but never K_i, which is state).
-    if (!identical(key, ki)) Entropy.wipe(key);
+    // Wipe the derived key (never K_i, which is state).
+    Entropy.wipe(key);
     final int chars = secret.length;
     await Clipboard.setData(ClipboardData(text: secret));
     if (!mounted) return;
     _sounds.play(UiSound.exportOk);
-    // Confirmation never echoes the secret itself.
-    _toast(full
-        ? 'Full key copied ($chars chars) — paste it, then clear the clipboard.'
-        : 'Key copied — paste it, then clear the clipboard.');
+    // Confirmation never echoes the secret itself — only how much of it there is.
+    _toast('${full ? 'Full key' : 'Key'} copied ($chars chars) — '
+        '${_exportEntropyNote(_activeStage, chars * 4)}.'
+        '${_activeStage == 0 ? ' Stage 0 is σ-public and its points are assumed'
+            ' seizable, so this key carries no coercion resistance.' : ''}'
+        ' Paste it, then clear the clipboard.');
   }
 
   /// Append a line to the console log (the app's toast surface).
@@ -4860,8 +5517,12 @@ class _SetupScreenState extends State<SetupScreen> {
       case _Field.exportLabel:
         if (_isBoardSlot) {
           return 'Key (master-secret export): this stage’s orbit key '
-              'Kᵢ = H(oᵢ ‖ Shᵢ), fixed once rᵢ fractals are placed. '
-              'Paste into another wallet or use as a downstream pepper. This '
+              'Kᵢ = TH(tag, oᵢ ‖ Shᵢ), fixed once rᵢ fractals are placed and '
+              'domain-separated from the orbit advance — leaking it does not '
+              'expose the stages above. What you copy is Kᵢ salted by the label '
+              'below. '
+              '${_exportEntropyNote(_activeStage, MasterSecret.displayChars * 4)}. '
+              'Paste into another wallet or use as a downstream pepper. The '
               'optional salt versions the key (e.g. SIGNING-1, '
               'uppercase/digits/hyphen). Press K to copy — blind, never shown.';
         }

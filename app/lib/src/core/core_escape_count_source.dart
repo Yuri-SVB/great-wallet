@@ -19,9 +19,9 @@ import 'stage_params.dart';
 ///
 /// Responsibilities:
 ///  - Map a [FractalViewport] to the engine's `(origin, step)` raster call.
-///  - Convert the engine's `u8` escape-count buffer to the [Uint32List] the
-///    UX layer expects, including the vertical flip that reconciles the two
-///    coordinate conventions (see [escapeCountsFromPixels]).
+///  - Copy the engine's exact `u32` escape counts into the [Uint32List] the UX
+///    layer expects — the two conventions coincide, so no remap applies (see
+///    [escapeCountsFromExact]).
 ///  - Route the canonical stage to the canonical renderer and any chain-derived
 ///    stage to the perturbed renderer using the currently displayed stage's
 ///    [StageReservoirs].
@@ -62,7 +62,7 @@ class CoreEscapeCountSource implements EscapeCountSource {
     // that natural order (no flip); combined with the Flutter image sampler's
     // vertical origin and great-wall-ux's ViewportMath (imaginary axis up),
     // this displays the Burning Ship upright with overlays aligned. See
-    // escapeCountsFromPixels for the orientation note.
+    // escapeCountsFromExact for the orientation note.
     final double originRe = vp.centreRe + (0.5 - w / 2.0) * u;
     final double originIm = vp.centreIm + (0.5 - h / 2.0) * u;
 
@@ -79,9 +79,14 @@ class CoreEscapeCountSource implements EscapeCountSource {
     final int p = request.stage == Stage.stage2 ? _requireReservoirs().p : 0;
     final int q = request.stage == Stage.stage2 ? _requireReservoirs().q : 0;
 
-    final Pointer<Uint8> out = ffi.calloc<Uint8>(w * h);
+    // The exact-count path, not the u8 one: the canvas resolves a canonical
+    // island by flood-filling the pixels whose escape count equals the
+    // island's, and the u8 encoding folds counts as `(e % 255) + 1` — at the
+    // deep-render cap of 1024 that merges four distinct level sets, so the fill
+    // would leak into bands that merely share a residue.
+    final Pointer<Uint32> out = ffi.calloc<Uint32>(w * h);
     try {
-      _core.renderViewportGeneric(
+      _core.renderViewportGenericU32(
         originRe: originRe,
         originIm: originIm,
         step: u,
@@ -93,8 +98,8 @@ class CoreEscapeCountSource implements EscapeCountSource {
         q: q,
         out: out,
       );
-      final Uint8List pixels = Uint8List.fromList(out.asTypedList(w * h));
-      final Uint32List counts = escapeCountsFromPixels(pixels, w, h, maxIter);
+      final Uint32List counts =
+          escapeCountsFromExact(out.asTypedList(w * h), maxIter);
       return EscapeCountRaster(
         widthPx: w,
         heightPx: h,
@@ -118,15 +123,20 @@ class CoreEscapeCountSource implements EscapeCountSource {
   }
 }
 
-/// Convert great-wall-core's `u8` escape-count buffer into the [Uint32List]
+/// Copy great-wall-core's exact `u32` escape-count buffer into the [Uint32List]
 /// great-wall-ux expects.
 ///
-/// Engine encoding (ffi.rs): `0` for non-escaping ("inside the set") pixels,
-/// `(escape_count % 255) + 1` otherwise. great-wall-ux's shader expects raw
-/// escape counts with non-escaping == `maxIterations` (its demo source fills
-/// the inside disk with `maxIter`), so:
-///   - `0`          -> `maxIterations`   (inside / non-escaping)
-///   - `v` (1..255) -> `v - 1`           (the true escape count)
+/// The two conventions already coincide, which is the point of the exact path:
+/// `bs_render_viewport_generic_u32` writes the true count for an escaping pixel
+/// and `max_iter` for a non-escaping one, and great-wall-ux expects raw escape
+/// counts with non-escaping == `maxIterations` (its demo source fills the inside
+/// disk with `maxIter`). So this is a copy, not a remap — but a *necessary*
+/// copy: [exact] is a view onto FFI memory that the caller frees, and any value
+/// above the cap would be an engine contract violation, so it is asserted rather
+/// than quietly clamped.
+///
+/// Contrast the `u8` raster, whose `(count % 255) + 1` encoding has to be undone
+/// and cannot be undone past 255.
 ///
 /// No row flip: the buffer is returned in the engine's natural row order
 /// (`counts[y]` = `originIm + y*step`). Empirically, the Flutter image-sampler
@@ -136,16 +146,10 @@ class CoreEscapeCountSource implements EscapeCountSource {
 /// to flip rows — `counts[(h-1-y)*w + x]`.)
 ///
 /// Pure and dependency-free so it is unit-testable without Flutter or FFI.
-Uint32List escapeCountsFromPixels(
-  Uint8List pixels,
-  int width,
-  int height,
-  int maxIterations,
-) {
-  final Uint32List counts = Uint32List(width * height);
-  for (int i = 0; i < width * height; i++) {
-    final int v = pixels[i];
-    counts[i] = v == 0 ? maxIterations : (v - 1);
-  }
-  return counts;
+Uint32List escapeCountsFromExact(Uint32List exact, int maxIterations) {
+  assert(
+    exact.every((int c) => c <= maxIterations),
+    'engine returned an escape count above the iteration cap',
+  );
+  return Uint32List.fromList(exact);
 }

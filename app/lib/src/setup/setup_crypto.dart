@@ -85,13 +85,24 @@ class SetupCrypto {
     );
   }
 
-  /// Encrypt [vault] and return the ciphertext envelope plus the key. Uses
-  /// [providedKey] (the user's own entropy, 16 or 32 bytes) if given, else
-  /// generates a fresh [genLenBytes]-byte key (128-bit by default, 32 for the
-  /// 256-bit mode). The caller owns and wipes [SealedVault.key]; the plaintext
-  /// JSON is zeroed here.
+  /// Encrypt the legacy-chain [vault]. Thin wrapper over [sealPayload] on
+  /// `vault.toJson()`; see it for the key/parameter semantics.
   static Future<SealedVault> sealVault(
     SetupVault vault, {
+    Uint8List? providedKey,
+    int genLenBytes = keyLenBytes,
+  }) =>
+      sealPayload(vault.toJson(),
+          providedKey: providedKey, genLenBytes: genLenBytes);
+
+  /// Encrypt an arbitrary JSON [payload] and return the ciphertext envelope plus
+  /// the key — the protocol-agnostic core shared by the chain [SetupVault] and
+  /// the [OrbitVault]. Uses [providedKey] (the user's own entropy, 16 or 32
+  /// bytes) if given, else generates a fresh [genLenBytes]-byte key (128-bit by
+  /// default, 32 for the 256-bit mode). The caller owns and wipes
+  /// [SealedVault.key]; the plaintext JSON is zeroed here.
+  static Future<SealedVault> sealPayload(
+    Map<String, dynamic> payload, {
     Uint8List? providedKey,
     int genLenBytes = keyLenBytes,
   }) async {
@@ -100,7 +111,7 @@ class SetupCrypto {
         : _randomBytes(genLenBytes);
     final Uint8List salt = _randomBytes(_saltLen);
     final Uint8List nonce = _randomBytes(_nonceLen);
-    final List<int> plaintext = utf8.encode(jsonEncode(vault.toJson()));
+    final List<int> plaintext = utf8.encode(jsonEncode(payload));
     try {
       final SecretKey aesKey = await _deriveAesKey(
         key,
@@ -135,12 +146,20 @@ class SetupCrypto {
     }
   }
 
-  /// Decrypt an envelope produced by [sealVault] back into a [SetupVault], using
-  /// the 16- or 32-byte [keyBytes] (from a scanned QR or parsed hex). Throws a
-  /// generic [FormatException] on a non-vault file, unsupported version, wrong
-  /// key, or tampering — GCM authentication makes "wrong key" and "corrupt"
-  /// indistinguishable.
-  static Future<SetupVault> openVault(Uint8List bytes, Uint8List keyBytes) async {
+  /// Decrypt an envelope produced by [sealVault] back into a legacy-chain
+  /// [SetupVault]. Thin wrapper over [openPayload]; see it for error semantics.
+  static Future<SetupVault> openVault(Uint8List bytes, Uint8List keyBytes) async =>
+      SetupVault.fromJson(await openPayload(bytes, keyBytes));
+
+  /// Decrypt an envelope produced by [sealPayload]/[sealVault] back into its raw
+  /// JSON payload map, using the 16- or 32-byte [keyBytes] (from a scanned QR or
+  /// parsed hex). The caller reconstructs the concrete vault type
+  /// ([SetupVault.fromJson] or [OrbitVault.fromJson]), which discriminates the
+  /// payload shape. Throws a generic [FormatException] on a non-vault file,
+  /// unsupported version, wrong key, or tampering — GCM authentication makes
+  /// "wrong key" and "corrupt" indistinguishable.
+  static Future<Map<String, dynamic>> openPayload(
+      Uint8List bytes, Uint8List keyBytes) async {
     final Map<String, dynamic> env;
     try {
       env = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
@@ -182,7 +201,7 @@ class SetupCrypto {
       if (decoded is! Map<String, dynamic>) {
         throw const FormatException('Could not decrypt — corrupt file.');
       }
-      return SetupVault.fromJson(decoded);
+      return decoded;
     } finally {
       _zero(plaintext);
     }
