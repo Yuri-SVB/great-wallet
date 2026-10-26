@@ -50,6 +50,7 @@ class _SetupScreenState extends State<SetupScreen> {
   final PanZoomController _viewport =
       PanZoomController(initial: _initialViewport);
   final BrightnessController _brightness = BrightnessController();
+  bool _autoExposureWasOn = false;
 
   /// Deep render mode (Alt+L). When on, the canvas escape-count cap rises from
   /// [EncodingConstants.renderMaxIterFast] to the engine's encode cap, so the
@@ -452,6 +453,21 @@ class _SetupScreenState extends State<SetupScreen> {
     // Drive the board's cross↔square switch as the view zooms (the screen does
     // not otherwise rebuild on pan/zoom).
     _viewport.addListener(_onBoardViewportChanged);
+    _autoExposureWasOn = _brightness.autoExposure;
+    _brightness.addListener(_onBrightnessChanged);
+  }
+
+  /// Announce auto brightness switching on or off — by `A`, or off by a manual
+  /// L / G adjustment (including L / G + scroll over the canvas, which the
+  /// canvas handles itself). The mode is announced; the values never are.
+  void _onBrightnessChanged() {
+    final bool on = _brightness.autoExposure;
+    if (on == _autoExposureWasOn || !mounted) return;
+    _autoExposureWasOn = on;
+    _sounds.play(on ? UiSound.modeOn : UiSound.modeOff);
+    _toast(on
+        ? 'Auto brightness ON — follows the view; L / G take back control.'
+        : 'Auto brightness off.');
   }
 
   void _onSetupChanged() {
@@ -635,6 +651,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _setup.dispose();
     _viewport.removeListener(_onBoardViewportChanged);
     _viewport.dispose();
+    _brightness.removeListener(_onBrightnessChanged);
     _brightness.dispose();
     _sounds.dispose();
     _iterationsField.dispose();
@@ -1284,6 +1301,23 @@ class _SetupScreenState extends State<SetupScreen> {
         return KeyEventResult.handled;
       }
     }
+    // L / G + ↑/↓ — brightness offset / slope, the keyboard counterparts of
+    // L / G + scroll over the canvas. Held-key chords like V's (auto-repeat
+    // while the arrow is held); tacit, so nothing is displayed. ↑ brightens
+    // the lit band (L) or spreads its falloff over more counts (G).
+    final double arrow = event.logicalKey == LogicalKeyboardKey.arrowUp
+        ? 1.0
+        : event.logicalKey == LogicalKeyboardKey.arrowDown
+            ? -1.0
+            : 0.0;
+    if (arrow != 0.0 && kb.isLogicalKeyPressed(LogicalKeyboardKey.keyL)) {
+      _brightness.adjustBySteps(arrow);
+      return KeyEventResult.handled;
+    }
+    if (arrow != 0.0 && kb.isLogicalKeyPressed(LogicalKeyboardKey.keyG)) {
+      _brightness.adjustSlopeBySteps(arrow);
+      return KeyEventResult.handled;
+    }
     // Scheme A: all hotkeys are single, unmodified keys, active when the viewer
     // (not a text field) has focus, fired once per press. If a modifier is held,
     // bail so OS combos are left alone.
@@ -1443,7 +1477,13 @@ class _SetupScreenState extends State<SetupScreen> {
       _focusField(_iterationsFocus, 'derivation steps');
       return KeyEventResult.handled;
     }
-    // (A is currently unbound — freed from its old "abort" duty, now on H.)
+    // A — auto brightness: offset and slope follow each view's escape counts
+    // (great-wall-ux auto exposure, the demo film's rule), eased. Any L / G
+    // adjustment turns it off. (A's old "abort" duty is on H.)
+    if (event.logicalKey == LogicalKeyboardKey.keyA) {
+      _brightness.toggleAutoExposure();
+      return KeyEventResult.handled;
+    }
     // Z — reset, behind a console confirmation so a stray keypress cannot wipe a
     // setup.
     if (event.logicalKey == LogicalKeyboardKey.keyZ) {
@@ -3090,7 +3130,9 @@ class _SetupScreenState extends State<SetupScreen> {
     'V+↑/↓  sound volume (level 0 = muted) · Alt+V reveal/hide sensitive text',
     'Alt+K  copy the full export digest (not just the first 32 chars)',
     'Alt+L  deep render — reveal leaves in escape-count voids (slower)',
-    'L+scroll brightness · scroll zoom · drag pan (over the canvas)',
+    'L+scroll or L+↑/↓  brightness · G+scroll or G+↑/↓  slope (↑ more shades)',
+    'A  auto brightness — offset & slope follow the view (L / G take over)',
+    'scroll zoom · drag pan (over the canvas)',
   ];
 
   /// Console palette: "Gunmetal" — a cool, near-neutral blue-grey, translucent
@@ -5676,9 +5718,13 @@ class _HueWheelControl extends StatelessWidget {
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    // Let the V + ↑/↓ volume chord bubble up to the screen handler instead of
-    // cycling the hue, so volume works the same while the wheel holds focus.
-    if (HardwareKeyboard.instance.isLogicalKeyPressed(LogicalKeyboardKey.keyV)) {
+    // Let the held-key chords (V + ↑/↓ volume, L / G + ↑/↓ brightness offset /
+    // slope) bubble up to the screen handler instead of cycling the hue, so
+    // they work the same while the wheel holds focus.
+    final HardwareKeyboard kb = HardwareKeyboard.instance;
+    if (kb.isLogicalKeyPressed(LogicalKeyboardKey.keyV) ||
+        kb.isLogicalKeyPressed(LogicalKeyboardKey.keyL) ||
+        kb.isLogicalKeyPressed(LogicalKeyboardKey.keyG)) {
       return KeyEventResult.ignored;
     }
     final LogicalKeyboardKey k = event.logicalKey;
