@@ -7,6 +7,7 @@ import '../ffi/library_loader.dart';
 import 'core_escape_count_source.dart';
 import 'core_leaf_area_source.dart';
 import 'encoding_constants.dart';
+import 'landmark_path.dart';
 import 'stage_params.dart';
 
 /// App-level facade over great-wall-core: opens the engine once, exposes the
@@ -54,6 +55,39 @@ class GreatWallCore {
 
   /// The canonical encode area, fetched once from the engine.
   late final FixedRect encodeArea = bindings.encodeArea();
+
+  /// The canonical island's flood cap, fetched once from the engine, which
+  /// owns it: with [encodeParams] otherwise, it resolves a leaf's island into a
+  /// real shape rather than a speck. Visualisation only; never touches the
+  /// encoded bits.
+  late final int canonicalMaxFloodPoints = bindings.canonicalMaxFloodPoints();
+
+  /// The default landmark-path parameters, fetched once from the engine.
+  late final LandmarkParams landmarkParams = bindings.landmarkParams();
+
+  /// The default landmark path of a leaf (its rectangle and bisection [path]
+  /// on the fractal `(o, p, q)`), or null if the engine finds none. Computed
+  /// in a worker isolate: it takes seconds.
+  Future<LandmarkPath?> landmarkPath({
+    required FixedRect leafRect,
+    required String path,
+    required int o,
+    required int p,
+    required int q,
+  }) =>
+      _landmarkPathInIsolate(leafRect, path, o, p, q, landmarkParams);
+
+  /// Static, so the isolate's closure holds only its arguments.
+  static Future<LandmarkPath?> _landmarkPathInIsolate(FixedRect leafRect,
+          String path, int o, int p, int q, LandmarkParams params) =>
+      Isolate.run(() => GreatWallCoreBindings.open().landmarkPath(
+            leafRect: leafRect,
+            path: path,
+            o: o,
+            p: p,
+            q: q,
+            params: params,
+          ));
 
   /// Engine algorithm version (e.g. `"0.1.0"`).
   String get engineVersion => bindings.engineVersion();

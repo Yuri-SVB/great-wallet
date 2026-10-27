@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
+import '../core/landmark_path.dart';
 import 'fixed.dart';
 import 'library_loader.dart';
 
@@ -15,6 +16,19 @@ const int kOrbitPointLen = 64;
 /// `bs_orbit_advance` status: the step ran and both outputs were written
 /// (`ORBIT_ADVANCE_OK` in the engine's ffi.rs; anything else is a rejection).
 const int _kOrbitAdvanceOk = 1;
+
+/// `bs_landmark_path_status`: the path was computed (`LANDMARK_PATH_OK`).
+const int _kLandmarkPathOk = 0;
+
+/// The `u32` out-parameters of `bs_landmark_params`, between its first and
+/// last (both `u64`).
+const int _kLandmarkParams32 = 17;
+
+/// `bs_landmark_path_stop`'s `u32` outputs (kind, ladder index, bottom, bitmap
+/// width and height) and `i64` outputs (seed, barycentre, bbox, cell size,
+/// bitmap origin).
+const int _kStopU32 = 5;
+const int _kStopI64 = 11;
 
 /// Digest width of the deprecated 0.3.0 chain, in bytes (SHA-256 / Argon2-256).
 /// Deliberately separate from [kOrbitPointLen]: widening the orbit must not move
@@ -112,6 +126,42 @@ class GreatWallCoreBindings {
         _lib.lookupFunction<_CanonicalIslandFreeC, _CanonicalIslandFreeDart>(
       'bs_canonical_island_free',
     );
+    _canonicalMaxFloodPoints = _lib.lookupFunction<_CanonicalMaxFloodPointsC,
+        _CanonicalMaxFloodPointsDart>('bs_canonical_max_flood_points');
+    _landmarkParams =
+        _lib.lookupFunction<_LandmarkParamsC, _LandmarkParamsDart>(
+      'bs_landmark_params',
+    );
+    _landmarkPathVersion =
+        _lib.lookupFunction<_EngineVersionC, _EngineVersionDart>(
+      'bs_landmark_path_version',
+    );
+    _landmarkPathCompute =
+        _lib.lookupFunction<_LandmarkPathComputeC, _LandmarkPathComputeDart>(
+      'bs_landmark_path_compute',
+    );
+    _landmarkPathStatus =
+        _lib.lookupFunction<_CanonicalIslandFoundC, _CanonicalIslandFoundDart>(
+      'bs_landmark_path_status',
+    );
+    _landmarkPathNumStops = _lib.lookupFunction<_CanonicalIslandNumPointsC,
+        _CanonicalIslandNumPointsDart>('bs_landmark_path_num_stops');
+    _landmarkPathStop =
+        _lib.lookupFunction<_LandmarkPathStopC, _LandmarkPathStopDart>(
+      'bs_landmark_path_stop',
+    );
+    _landmarkPathStopCells =
+        _lib.lookupFunction<_LandmarkPathStopCellsC, _LandmarkPathStopCellsDart>(
+      'bs_landmark_path_stop_cells',
+    );
+    _landmarkPathHop =
+        _lib.lookupFunction<_LandmarkPathHopC, _LandmarkPathHopDart>(
+      'bs_landmark_path_hop',
+    );
+    _landmarkPathFree =
+        _lib.lookupFunction<_CanonicalIslandFreeC, _CanonicalIslandFreeDart>(
+      'bs_landmark_path_free',
+    );
     _orbitArgon2Single = _lib.lookupFunction<_Argon2SingleC, _Argon2SingleDart>(
         'bs_orbit_argon2_single');
     _argon2Single =
@@ -203,6 +253,16 @@ class GreatWallCoreBindings {
   late final _CanonicalIslandNumPointsDart _canonicalIslandNumPoints;
   late final _CanonicalIslandPointsDart _canonicalIslandPoints;
   late final _CanonicalIslandFreeDart _canonicalIslandFree;
+  late final _CanonicalMaxFloodPointsDart _canonicalMaxFloodPoints;
+  late final _LandmarkParamsDart _landmarkParams;
+  late final _EngineVersionDart _landmarkPathVersion;
+  late final _LandmarkPathComputeDart _landmarkPathCompute;
+  late final _CanonicalIslandFoundDart _landmarkPathStatus;
+  late final _CanonicalIslandNumPointsDart _landmarkPathNumStops;
+  late final _LandmarkPathStopDart _landmarkPathStop;
+  late final _LandmarkPathStopCellsDart _landmarkPathStopCells;
+  late final _LandmarkPathHopDart _landmarkPathHop;
+  late final _CanonicalIslandFreeDart _landmarkPathFree;
   late final _Argon2SingleDart _argon2Single;
   late final _Argon2SingleDart _orbitArgon2Single;
   late final _Argon2idMasterDart _argon2idMaster;
@@ -694,6 +754,194 @@ class GreatWallCoreBindings {
         ..free(outPixelCount)
         ..free(outPixelDelta)
         ..free(outBbox);
+    }
+  }
+
+  /// The canonical island's flood cap (`bs_canonical_max_flood_points`): the
+  /// `maxFloodPoints` of [canonicalIsland]'s params. The engine owns it.
+  int canonicalMaxFloodPoints() => _canonicalMaxFloodPoints();
+
+  // -------------------------------------------------------------------------
+  // Landmark path
+  // -------------------------------------------------------------------------
+
+  /// The default landmark-path parameters (`bs_landmark_params`).
+  LandmarkParams landmarkParams() {
+    final Pointer<Uint64> out64 = calloc<Uint64>(2);
+    final Pointer<Uint32> out32 = calloc<Uint32>(_kLandmarkParams32);
+    try {
+      _landmarkParams(out64, out32, out32 + 1, out32 + 2, out32 + 3,
+          out32 + 4, out32 + 5, out32 + 6, out32 + 7, out32 + 8, out32 + 9,
+          out32 + 10, out32 + 11, out32 + 12, out32 + 13, out32 + 14,
+          out32 + 15, out32 + 16, out64 + 1);
+      return LandmarkParams(
+        floodCells: out64[0],
+        scanMaxIter: out32[0],
+        minEscape: out32[1],
+        seedGrid: out32[2],
+        shells: out32[3],
+        reach: out32[4],
+        ladderRatioNum: out32[5],
+        ladderRatioDen: out32[6],
+        leafShareNum: out32[7],
+        leafShareDen: out32[8],
+        keep: out32[9],
+        minCells: out32[10],
+        rhoNum: out32[11],
+        rhoDen: out32[12],
+        badnessExponent: out32[13],
+        badnessChargeNum: out32[14],
+        badnessChargeDen: out32[15],
+        metricFracBits: out32[16],
+        canonicalMaxFloodPoints: out64[1],
+      );
+    } finally {
+      calloc
+        ..free(out64)
+        ..free(out32);
+    }
+  }
+
+  /// The engine's landmark-path version (`bs_landmark_path_version`).
+  String landmarkPathVersion() {
+    const int bufLen = 32;
+    final Pointer<Uint8> buf = calloc<Uint8>(bufLen);
+    try {
+      final int len = _landmarkPathVersion(buf, bufLen);
+      final int n = len < bufLen ? len : bufLen - 1;
+      return String.fromCharCodes(buf.asTypedList(n));
+    } finally {
+      calloc.free(buf);
+    }
+  }
+
+  /// The default landmark path of a leaf — its rectangle and bisection [path]
+  /// (from [decodeFull]) on the fractal `(o, p, q)` — or null when the engine
+  /// finds none (no canonical island, no coast, invalid [params]).
+  ///
+  /// Slow (seconds): run it off the UI isolate
+  /// ([GreatWallCore.landmarkPath]).
+  LandmarkPath? landmarkPath({
+    required FixedRect leafRect,
+    required String path,
+    required int o,
+    required int p,
+    required int q,
+    required LandmarkParams params,
+  }) {
+    final (Pointer<Uint8> ppPtr, int ppLen) = _allocAscii(path);
+    try {
+      final Pointer<Void> handle = _landmarkPathCompute(
+        o,
+        p,
+        q,
+        leafRect.reMin,
+        leafRect.reMax,
+        leafRect.imMin,
+        leafRect.imMax,
+        ppPtr,
+        ppLen,
+        params.floodCells,
+        params.scanMaxIter,
+        params.minEscape,
+        params.seedGrid,
+        params.shells,
+        params.reach,
+        params.ladderRatioNum,
+        params.ladderRatioDen,
+        params.leafShareNum,
+        params.leafShareDen,
+        params.keep,
+        params.minCells,
+        params.rhoNum,
+        params.rhoDen,
+        params.badnessExponent,
+        params.badnessChargeNum,
+        params.badnessChargeDen,
+        params.metricFracBits,
+        params.canonicalMaxFloodPoints,
+      );
+      if (handle == nullptr) {
+        throw StateError('bs_landmark_path_compute returned NULL handle');
+      }
+      try {
+        if (_landmarkPathStatus(handle) != _kLandmarkPathOk) return null;
+        final int n = _landmarkPathNumStops(handle);
+        final List<LandmarkFeature> stops = <LandmarkFeature>[
+          for (int k = 0; k < n; k++) _landmarkStop(handle, k),
+        ];
+        final Int64List hops = Int64List(n > 0 ? n - 1 : 0);
+        for (int k = 0; k < hops.length; k++) {
+          hops[k] = _landmarkPathHop(handle, k);
+        }
+        return LandmarkPath(
+          version: landmarkPathVersion(),
+          stops: stops,
+          hops: hops,
+        );
+      } finally {
+        _landmarkPathFree(handle);
+      }
+    } finally {
+      if (ppPtr != nullptr) calloc.free(ppPtr);
+    }
+  }
+
+  LandmarkFeature _landmarkStop(Pointer<Void> handle, int k) {
+    final Pointer<Uint32> u32 = calloc<Uint32>(_kStopU32);
+    final Pointer<Int64> i64 = calloc<Int64>(_kStopI64);
+    final Pointer<Uint64> count = calloc<Uint64>();
+    try {
+      // i64: seed[0..2), barycentre[2..4), bbox[4..8), cell[8], origin[9..11).
+      _landmarkPathStop(
+        handle,
+        k,
+        u32,
+        u32 + 1,
+        u32 + 2,
+        i64,
+        i64 + 2,
+        i64 + 4,
+        count,
+        i64 + 8,
+        i64 + 9,
+        u32 + 3,
+        u32 + 4,
+      );
+      final int len = _landmarkPathStopCells(handle, k, nullptr, 0);
+      final Pointer<Uint8> buf = calloc<Uint8>(len == 0 ? 1 : len);
+      try {
+        _landmarkPathStopCells(handle, k, buf, len);
+        return LandmarkFeature(
+          kind: LandmarkKind.values[u32[0]],
+          ladderIndex: u32[1],
+          bottom: u32[2],
+          seedRe: i64[0],
+          seedIm: i64[1],
+          barycentreRe: i64[2],
+          barycentreIm: i64[3],
+          bboxReMin: i64[4],
+          bboxReMax: i64[5],
+          bboxImMin: i64[6],
+          bboxImMax: i64[7],
+          cellCount: count.value,
+          cellRaw: i64[8],
+          cellsOriginRe: i64[9],
+          cellsOriginIm: i64[10],
+          cellsWidth: u32[3],
+          cellsHeight: u32[4],
+          cells: Uint8List.fromList(buf.asTypedList(len)),
+        );
+      } finally {
+        // The cells locate the leaf: zero the native copy before freeing it.
+        buf.asTypedList(len == 0 ? 1 : len).fillRange(0, len == 0 ? 1 : len, 0);
+        calloc.free(buf);
+      }
+    } finally {
+      calloc
+        ..free(u32)
+        ..free(i64)
+        ..free(count);
     }
   }
 
@@ -1507,3 +1755,61 @@ typedef _GetPrecisionDart = void Function(Pointer<Uint32>, Pointer<Uint32>);
 
 typedef _EngineVersionC = Uint32 Function(Pointer<Uint8>, Uint32);
 typedef _EngineVersionDart = int Function(Pointer<Uint8>, int);
+
+typedef _CanonicalMaxFloodPointsC = Uint64 Function();
+typedef _CanonicalMaxFloodPointsDart = int Function();
+
+typedef _LandmarkParamsC = Void Function(
+  Pointer<Uint64>,
+  Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
+  Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
+  Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
+  Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
+  Pointer<Uint32>,
+  Pointer<Uint64>);
+typedef _LandmarkParamsDart = void Function(
+  Pointer<Uint64>,
+  Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
+  Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
+  Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
+  Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
+  Pointer<Uint32>,
+  Pointer<Uint64>);
+
+typedef _LandmarkPathComputeC = Pointer<Void> Function(
+  Uint64, Uint64, Uint64,
+  Int64, Int64, Int64, Int64,
+  Pointer<Uint8>, Uint32,
+  Uint64,
+  Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32,
+  Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32,
+  Uint64);
+typedef _LandmarkPathComputeDart = Pointer<Void> Function(
+  int, int, int,
+  int, int, int, int,
+  Pointer<Uint8>, int,
+  int,
+  int, int, int, int, int, int, int, int, int,
+  int, int, int, int, int, int, int, int,
+  int);
+
+typedef _LandmarkPathStopC = Int32 Function(
+  Pointer<Void>, Uint32,
+  Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
+  Pointer<Int64>, Pointer<Int64>, Pointer<Int64>,
+  Pointer<Uint64>, Pointer<Int64>,
+  Pointer<Int64>, Pointer<Uint32>, Pointer<Uint32>);
+typedef _LandmarkPathStopDart = int Function(
+  Pointer<Void>, int,
+  Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
+  Pointer<Int64>, Pointer<Int64>, Pointer<Int64>,
+  Pointer<Uint64>, Pointer<Int64>,
+  Pointer<Int64>, Pointer<Uint32>, Pointer<Uint32>);
+
+typedef _LandmarkPathStopCellsC = Uint32 Function(
+  Pointer<Void>, Uint32, Pointer<Uint8>, Uint32);
+typedef _LandmarkPathStopCellsDart = int Function(
+  Pointer<Void>, int, Pointer<Uint8>, int);
+
+typedef _LandmarkPathHopC = Uint64 Function(Pointer<Void>, Uint32);
+typedef _LandmarkPathHopDart = int Function(Pointer<Void>, int);

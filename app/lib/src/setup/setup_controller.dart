@@ -656,7 +656,7 @@ class SetupController extends ChangeNotifier {
     return CoreDiscoveryParams(
       maxIter: b.maxIter,
       targetGood: b.targetGood,
-      maxFloodPoints: EncodingConstants.canonicalIslandMaxFloodPoints,
+      maxFloodPoints: _core.canonicalMaxFloodPoints,
       minGridCells: b.minGridCells,
       pMaxShift: b.pMaxShift,
       exclusionThresholdNum: b.exclusionThresholdNum,

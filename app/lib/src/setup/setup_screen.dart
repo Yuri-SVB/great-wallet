@@ -15,6 +15,7 @@ import '../core/bip39.dart';
 import '../core/encoding_constants.dart';
 import '../core/entropy.dart';
 import '../core/great_wall_core.dart';
+import '../core/landmark_path.dart';
 import '../core/master_secret.dart';
 import '../core/namtso_harvester.dart';
 import '../core/orbit_protocol.dart';
@@ -406,6 +407,21 @@ class _SetupScreenState extends State<SetupScreen> {
   /// slot, cached until the point / σ changes. Drives the square frame and the
   /// cross↔square switch.
   final Map<int, _BoardDeco?> _boardDecoCache = <int, _BoardDeco?>{};
+
+  /// Whether the active board shows its point's landmark path (Alt+E).
+  bool _showPath = false;
+
+  /// Landmark paths per (stage, slot), computed off the UI isolate, each with
+  /// the overlay it is drawn as; null for a point with no path. Dropped, and
+  /// wiped, wherever the board's points change.
+  final Map<(int, int), ({LandmarkPath path, CanvasPath overlay})?> _paths =
+      <(int, int), ({LandmarkPath path, CanvasPath overlay})?>{};
+
+  /// (stage, slot) pairs whose path is being computed.
+  final Set<(int, int)> _pathsPending = <(int, int)>{};
+
+  /// Bumped by every drop, so a computation started before it is discarded.
+  int _pathGeneration = 0;
 
   /// Whether the active board's placed point is drawn as a **square** (frame +
   /// island cells) rather than a **cross**. Switches on the island's on-screen
@@ -1001,6 +1017,7 @@ class _SetupScreenState extends State<SetupScreen> {
                             _recomputeExtraShares(stage);
                             _invalidateDeeperThan(stage);
                             _boardDecoCache.clear();
+                            _dropPaths();
                             _boardCanonicalView = false;
                           });
                         }
@@ -1335,6 +1352,12 @@ class _SetupScreenState extends State<SetupScreen> {
         if (!_busy) _copyMasterSecret(full: true);
         return KeyEventResult.handled;
       }
+      // Alt+E — the landmark path of the board's point (vs plain E, which
+      // highlights the canonical islands in view).
+      if (event.logicalKey == LogicalKeyboardKey.keyE) {
+        _toggleLandmarkPath();
+        return KeyEventResult.handled;
+      }
       // Alt+I — the hex counterpart of plain I (BIP39 words): on an editable
       // point (a chain stage or an orbit board slot) it opens the point-import
       // editor in hex.
@@ -1565,6 +1588,103 @@ class _SetupScreenState extends State<SetupScreen> {
             '(slower in voids).'
         : 'Deep render off — ${EncodingConstants.renderMaxIterFast} iterations.');
   }
+
+  /// Toggle the landmark path on the active board (Alt+E). The mode is
+  /// announced; the path never is.
+  void _toggleLandmarkPath() {
+    setState(() => _showPath = !_showPath);
+    _sounds.play(_showPath ? UiSound.modeOn : UiSound.modeOff);
+    final bool computing = _showPath &&
+        _isBoardSlot &&
+        _boardPoints[_activeStage][_slotIndex] != null &&
+        !_paths.containsKey((_activeStage, _slotIndex));
+    _toast(!_showPath
+        ? 'Landmark path off.'
+        : computing
+            ? 'Landmark path on — computing (a few seconds)…'
+            : 'Landmark path on.');
+  }
+
+  /// Drop (and wipe) every landmark path: the points they lead to changed.
+  void _dropPaths() {
+    for (final ({LandmarkPath path, CanvasPath overlay})? p in _paths.values) {
+      p?.path.wipe();
+    }
+    _paths.clear();
+    _pathsPending.clear();
+    _pathGeneration++;
+  }
+
+  /// The landmark-path overlay of [slot]'s point on the active stage, or null
+  /// while it is computed (which this starts) or if the point has none.
+  CanvasPath? _pathOverlay(int slot) {
+    final (int, int) key = (_activeStage, slot);
+    if (_paths.containsKey(key)) return _paths[key]?.overlay;
+    if (!_pathsPending.contains(key)) unawaited(_computePath(key, slot));
+    return null;
+  }
+
+  /// Decode [slot]'s point on its board and compute its landmark path off the
+  /// UI isolate (seconds), caching it under [key].
+  Future<void> _computePath((int, int) key, int slot) async {
+    final ({int reRaw, int imRaw})? pt = _boardPoints[key.$1][slot];
+    final ({int o, int p, int q})? prm = _boardPrm(slot);
+    if (pt == null || prm == null) return;
+    _pathsPending.add(key);
+    final int generation = _pathGeneration;
+    final CoreDecodeResult d = widget.core.decodePoint(
+        reRaw: pt.reRaw, imRaw: pt.imRaw, o: prm.o, p: prm.p, q: prm.q);
+    LandmarkPath? path;
+    if (d.valid) {
+      try {
+        path = await widget.core.landmarkPath(
+            leafRect: d.leafRect, path: d.path, o: prm.o, p: prm.p, q: prm.q);
+      } on Object {
+        path = null;
+      }
+    }
+    if (!mounted || generation != _pathGeneration) {
+      path?.wipe();
+      return;
+    }
+    final LandmarkPath? found = path;
+    setState(() {
+      _pathsPending.remove(key);
+      _paths[key] =
+          found == null ? null : (path: found, overlay: _canvasPathOf(found));
+    });
+    if (found == null && _showPath) _toast('No landmark path for this point.');
+  }
+
+  /// A landmark path as an overlay: each stop at its barycentre, an island
+  /// with its shells (or the leaf) highlighted by a count-range flood, the
+  /// outer shell or a fiord by its cells. The cells are shared, so wiping the
+  /// path blanks the overlay too.
+  CanvasPath _canvasPathOf(LandmarkPath path) {
+    final int shells = widget.core.landmarkParams.shells;
+    return CanvasPath(
+      stops: <CanvasPathStop>[
+        for (final LandmarkFeature f in path.stops)
+          CanvasPathStop(
+            re: fixedToDouble(f.barycentreRe),
+            im: fixedToDouble(f.barycentreIm),
+            cells: CanvasCells(
+              originRe: fixedToDouble(f.cellsOriginRe),
+              originIm: fixedToDouble(f.cellsOriginIm),
+              cellSize: fixedToDouble(f.cellRaw),
+              width: f.cellsWidth,
+              height: f.cellsHeight,
+              cells: f.cells,
+            ),
+            countLow: _flooded(f.kind) ? f.bottom : null,
+            countHigh: _flooded(f.kind) ? f.bottom + shells : null,
+          ),
+      ],
+    );
+  }
+
+  static bool _flooded(LandmarkKind kind) =>
+      kind == LandmarkKind.feature || kind == LandmarkKind.leaf;
 
   /// Select stage [index]: focus it if it is already available (Stage 0, or a
   /// fractal already derived), or — if it is the first not-yet-derived stage —
@@ -2094,6 +2214,7 @@ class _SetupScreenState extends State<SetupScreen> {
           ),
       ],
       crosses: crosses,
+      path: _showPath && pt != null ? _pathOverlay(slot) : null,
     );
   }
 
@@ -2129,7 +2250,7 @@ class _SetupScreenState extends State<SetupScreen> {
     return CoreDiscoveryParams(
       maxIter: b.maxIter,
       targetGood: b.targetGood,
-      maxFloodPoints: EncodingConstants.canonicalIslandMaxFloodPoints,
+      maxFloodPoints: widget.core.canonicalMaxFloodPoints,
       minGridCells: b.minGridCells,
       pMaxShift: b.pMaxShift,
       exclusionThresholdNum: b.exclusionThresholdNum,
@@ -2485,6 +2606,7 @@ class _SetupScreenState extends State<SetupScreen> {
       // Placing this point (and re-deriving the shares) invalidates the cached
       // island decorations; the canonical view (if any) referred to the old one.
       _boardDecoCache.clear();
+      _dropPaths();
       _boardCanonicalView = false;
     });
     // Pick the marker mode for the freshly placed point at the current zoom.
@@ -2651,6 +2773,7 @@ class _SetupScreenState extends State<SetupScreen> {
         }
       }
       _boardDecoCache.clear();
+      _dropPaths();
     });
   }
 
@@ -2683,6 +2806,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _boardKey = '';
     _boardIslands = const <CanvasIsland>[];
     _boardDecoCache.clear();
+    _dropPaths();
     _boardCanonicalView = false;
   }
 
@@ -3130,6 +3254,7 @@ class _SetupScreenState extends State<SetupScreen> {
     'V+↑/↓  sound volume (level 0 = muted) · Alt+V reveal/hide sensitive text',
     'Alt+K  copy the full export digest (not just the first 32 chars)',
     'Alt+L  deep render — reveal leaves in escape-count voids (slower)',
+    'Alt+E  landmark path of the board\'s point — line, numbered stops, highlights',
     'L+scroll or L+↑/↓  brightness · G+scroll or G+↑/↓  slope (↑ more shades)',
     'A  auto brightness — offset & slope follow the view (L / G take over)',
     'scroll zoom · drag pan (over the canvas)',
