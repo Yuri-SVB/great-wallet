@@ -411,11 +411,20 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Whether the active board shows its point's landmark path (Alt+E).
   bool _showPath = false;
 
-  /// Landmark paths per (stage, slot), computed off the UI isolate, each with
-  /// the overlay it is drawn as; null for a point with no path. Dropped, and
-  /// wiped, wherever the board's points change.
-  final Map<(int, int), ({LandmarkPath path, CanvasPath overlay})?> _paths =
-      <(int, int), ({LandmarkPath path, CanvasPath overlay})?>{};
+  /// Landmark candidates per (stage, slot), scanned once per point off the
+  /// UI isolate; null for a point with none. Freed wherever the board's
+  /// points change.
+  final Map<(int, int), LandmarkCandidates?> _candidates =
+      <(int, int), LandmarkCandidates?>{};
+
+  /// The route per (stage, slot), set in the route panel. Session only.
+  final Map<(int, int), _Route> _routes = <(int, int), _Route>{};
+
+  /// Landmark paths per (stage, slot), searched off the UI isolate, each with
+  /// the route it was searched for and the overlay it is drawn as; null for a
+  /// point with no path. Dropped, and wiped, wherever the board's points
+  /// change.
+  final Map<(int, int), _ShownPath?> _paths = <(int, int), _ShownPath?>{};
 
   /// (stage, slot) pairs whose path is being computed.
   final Set<(int, int)> _pathsPending = <(int, int)>{};
@@ -826,6 +835,13 @@ class _SetupScreenState extends State<SetupScreen> {
                                       : _canvas())),
                         ),
                         if (_busy) Positioned.fill(child: _progressOverlay()),
+                        if (_routePanel() case final Widget panel)
+                          Positioned(
+                            top: 0,
+                            bottom: 0,
+                            right: 12,
+                            child: Center(child: panel),
+                          ),
                         if (_selectMode && !_setup.isTextStage)
                           Positioned(
                             top: 56,
@@ -1605,43 +1621,113 @@ class _SetupScreenState extends State<SetupScreen> {
             : 'Landmark path on.');
   }
 
-  /// Drop (and wipe) every landmark path: the points they lead to changed.
+  /// Drop (and wipe) every landmark path and free every candidate set: the
+  /// points they lead to changed. Routes keep their ρ and exponent; every
+  /// stop shows again.
   void _dropPaths() {
-    for (final ({LandmarkPath path, CanvasPath overlay})? p in _paths.values) {
+    for (final _ShownPath? p in _paths.values) {
       p?.path.wipe();
     }
     _paths.clear();
+    for (final LandmarkCandidates? c in _candidates.values) {
+      c?.dispose();
+    }
+    _candidates.clear();
+    _routes.updateAll((_, _Route r) =>
+        (rho: r.rho, exponent: r.exponent, visible: null));
     _pathsPending.clear();
     _pathGeneration++;
   }
 
-  /// The landmark-path overlay of [slot]'s point on the active stage, or null
-  /// while it is computed (which this starts) or if the point has none.
-  CanvasPath? _pathOverlay(int slot) {
-    final (int, int) key = (_activeStage, slot);
-    if (_paths.containsKey(key)) return _paths[key]?.overlay;
-    if (!_pathsPending.contains(key)) unawaited(_computePath(key, slot));
-    return null;
+  /// The engine's default route: its ρ and exponent among the choices, every
+  /// stop visible.
+  _Route get _defaultRoute {
+    final LandmarkParams p = widget.core.landmarkParams;
+    return (
+      rho: widget.core.landmarkRhoChoices.indexWhere(
+          (LandmarkRho r) => r.num * p.rhoDen == p.rhoNum * r.den),
+      exponent:
+          widget.core.landmarkExponentChoices.indexOf(p.badnessExponent),
+      visible: null,
+    );
   }
 
-  /// Decode [slot]'s point on its board and compute its landmark path off the
-  /// UI isolate (seconds), caching it under [key].
+  _Route _routeOf((int, int) key) => _routes[key] ?? _defaultRoute;
+
+  /// Set [key]'s route. A new ρ or exponent searches again, with every stop
+  /// visible; the current path stays drawn until the new one is found.
+  void _setRoute((int, int) key, _Route route) {
+    final _Route old = _routeOf(key);
+    final bool reroute = route.rho != old.rho || route.exponent != old.exponent;
+    final _Route next = reroute
+        ? (rho: route.rho, exponent: route.exponent, visible: null)
+        : route;
+    setState(() {
+      _routes[key] = next;
+      final _ShownPath? p = _paths[key];
+      if (!reroute && p != null) {
+        _paths[key] = (
+          path: p.path,
+          rho: p.rho,
+          exponent: p.exponent,
+          overlay: _canvasPathOf(p.path, next.visible),
+        );
+      }
+    });
+  }
+
+  /// The landmark-path overlay of [slot]'s point on the active stage, or null
+  /// while it is first computed (which this starts) or if the point has none.
+  /// A path searched for another route stays drawn while this searches again.
+  CanvasPath? _pathOverlay(int slot) {
+    final (int, int) key = (_activeStage, slot);
+    final _Route route = _routeOf(key);
+    final _ShownPath? shown = _paths[key];
+    final bool current = _paths.containsKey(key) &&
+        (shown == null ||
+            (shown.rho == route.rho && shown.exponent == route.exponent));
+    if (!current && !_pathsPending.contains(key)) {
+      unawaited(_computePath(key, slot));
+    }
+    return shown?.overlay;
+  }
+
+  /// Search [slot]'s landmark path for [key]'s route off the UI isolate,
+  /// scanning its candidates first if needed (seconds; a search alone is
+  /// fast), and cache it under [key].
   Future<void> _computePath((int, int) key, int slot) async {
     final ({int reRaw, int imRaw})? pt = _boardPoints[key.$1][slot];
     final ({int o, int p, int q})? prm = _boardPrm(slot);
     if (pt == null || prm == null) return;
     _pathsPending.add(key);
     final int generation = _pathGeneration;
-    final CoreDecodeResult d = widget.core.decodePoint(
-        reRaw: pt.reRaw, imRaw: pt.imRaw, o: prm.o, p: prm.p, q: prm.q);
-    LandmarkPath? path;
-    if (d.valid) {
-      try {
-        path = await widget.core.landmarkPath(
-            leafRect: d.leafRect, path: d.path, o: prm.o, p: prm.p, q: prm.q);
-      } on Object {
-        path = null;
+    LandmarkCandidates? candidates = _candidates[key];
+    if (!_candidates.containsKey(key)) {
+      final CoreDecodeResult d = widget.core.decodePoint(
+          reRaw: pt.reRaw, imRaw: pt.imRaw, o: prm.o, p: prm.p, q: prm.q);
+      if (d.valid) {
+        try {
+          candidates = await widget.core.landmarkCandidates(
+              leafRect: d.leafRect, path: d.path, o: prm.o, p: prm.p, q: prm.q);
+        } on Object {
+          candidates = null;
+        }
       }
+      if (!mounted || generation != _pathGeneration) {
+        candidates?.dispose();
+        return;
+      }
+      _candidates[key] = candidates;
+    }
+    final _Route route = _routeOf(key);
+    LandmarkPath? path;
+    try {
+      path = await candidates?.search(
+        rho: widget.core.landmarkRhoChoices[route.rho],
+        exponent: widget.core.landmarkExponentChoices[route.exponent],
+      );
+    } on Object {
+      path = null;
     }
     if (!mounted || generation != _pathGeneration) {
       path?.wipe();
@@ -1650,21 +1736,32 @@ class _SetupScreenState extends State<SetupScreen> {
     final LandmarkPath? found = path;
     setState(() {
       _pathsPending.remove(key);
-      _paths[key] =
-          found == null ? null : (path: found, overlay: _canvasPathOf(found));
+      _paths[key]?.path.wipe();
+      // If the route changed meanwhile, the next build searches again.
+      _paths[key] = found == null
+          ? null
+          : (
+              path: found,
+              rho: route.rho,
+              exponent: route.exponent,
+              overlay: _canvasPathOf(found, _routeOf(key).visible),
+            );
     });
     if (found == null && _showPath) _toast('No landmark path for this point.');
   }
 
   /// A landmark path as an overlay: each stop at its barycentre, an island
   /// with its shells (or the leaf) highlighted by a count-range flood, the
-  /// outer shell or a fiord by its cells. The cells are shared, so wiping the
-  /// path blanks the overlay too.
-  CanvasPath _canvasPathOf(LandmarkPath path) {
+  /// outer shell or a fiord by its cells. With [visible] set, only that many
+  /// stops before the leaf are drawn, the shallowest hidden first. The cells
+  /// are shared, so wiping the path blanks the overlay too.
+  CanvasPath _canvasPathOf(LandmarkPath path, int? visible) {
     final int shells = widget.core.landmarkParams.shells;
+    final int before = path.stops.length - 1;
+    final int shown = visible == null ? before : visible.clamp(0, before);
     return CanvasPath(
       stops: <CanvasPathStop>[
-        for (final LandmarkFeature f in path.stops)
+        for (final LandmarkFeature f in path.stops.skip(before - shown))
           CanvasPathStop(
             re: fixedToDouble(f.barycentreRe),
             im: fixedToDouble(f.barycentreIm),
@@ -1685,6 +1782,83 @@ class _SetupScreenState extends State<SetupScreen> {
 
   static bool _flooded(LandmarkKind kind) =>
       kind == LandmarkKind.feature || kind == LandmarkKind.leaf;
+
+  /// The route panel of the active board's path, while it is shown: ρ
+  /// (left favours zooming, right panning), the exponent (fewer or more
+  /// stops) and the stops visible before the leaf. Both route sliders give
+  /// more stops to the right. Words only: the values are the engine's.
+  Widget? _routePanel() {
+    if (!_showPath || !_isBoardSlot || _slotIndex < 1) return null;
+    final (int, int) key = (_activeStage, _slotIndex);
+    final _ShownPath? shown = _paths[key];
+    if (shown == null) return null;
+    final _Route route = _routeOf(key);
+    final int rhos = widget.core.landmarkRhoChoices.length;
+    final int exponents = widget.core.landmarkExponentChoices.length;
+    final int before = shown.path.stops.length - 1;
+    final int visible = (route.visible ?? before).clamp(0, before);
+    Widget row(String left, String right, int value, int max,
+            ValueChanged<int>? onChanged) =>
+        Row(
+          children: <Widget>[
+            SizedBox(width: 48, child: Text(left, style: _routeLabel)),
+            Expanded(
+              child: Slider(
+                value: value.toDouble(),
+                max: max < 1 ? 1 : max.toDouble(),
+                divisions: max < 1 ? 1 : max,
+                onChanged: max < 1 || onChanged == null
+                    ? null
+                    : (double v) => onChanged(v.round()),
+              ),
+            ),
+            SizedBox(
+              width: 48,
+              child: Text(right, style: _routeLabel, textAlign: TextAlign.end),
+            ),
+          ],
+        );
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: const Color(0x99000000),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        child: SizedBox(
+          width: 240,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              // Higher ρ favours zooming: the list runs right to left.
+              row('zoom', 'pan', rhos - 1 - route.rho, rhos - 1,
+                  (int v) => _setRoute(key, (
+                        rho: rhos - 1 - v,
+                        exponent: route.exponent,
+                        visible: route.visible,
+                      ))),
+              row('fewer', 'more stops', route.exponent, exponents - 1,
+                  (int v) => _setRoute(key, (
+                        rho: route.rho,
+                        exponent: v,
+                        visible: route.visible,
+                      ))),
+              const Text('visible stops', style: _routeLabel),
+              row('none', 'all', visible, before,
+                  (int v) => _setRoute(key, (
+                        rho: route.rho,
+                        exponent: route.exponent,
+                        visible: v,
+                      ))),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  static const TextStyle _routeLabel =
+      TextStyle(color: Colors.white, fontSize: 12);
 
   /// Select stage [index]: focus it if it is already available (Stage 0, or a
   /// fractal already derived), or — if it is the first not-yet-derived stage —
@@ -3254,7 +3428,8 @@ class _SetupScreenState extends State<SetupScreen> {
     'V+↑/↓  sound volume (level 0 = muted) · Alt+V reveal/hide sensitive text',
     'Alt+K  copy the full export digest (not just the first 32 chars)',
     'Alt+L  deep render — reveal leaves in escape-count voids (slower)',
-    'Alt+E  landmark path of the board\'s point — line, numbered stops, highlights',
+    'Alt+E  landmark path of the board\'s point — line, numbered stops, highlights;'
+        ' the panel on the right sets the route and the visible stops',
     'L+scroll or L+↑/↓  brightness · G+scroll or G+↑/↓  slope (↑ more shades)',
     'A  auto brightness — offset & slope follow the view (L / G take over)',
     'scroll zoom · drag pan (over the canvas)',
@@ -6197,6 +6372,19 @@ const FractalViewport _initialViewport = FractalViewport(
 );
 
 /// Small translucent label shown over the canvas (e.g. the select-mode hint).
+/// A landmark route: indices into the engine's ρ and exponent choices, and
+/// how many stops before the leaf are visible (null: all).
+typedef _Route = ({int rho, int exponent, int? visible});
+
+/// A landmark path with the ρ and exponent (indices) it was searched for, and
+/// the overlay it is drawn as.
+typedef _ShownPath = ({
+  LandmarkPath path,
+  int rho,
+  int exponent,
+  CanvasPath overlay,
+});
+
 class _Badge extends StatelessWidget {
   const _Badge(this.text);
 

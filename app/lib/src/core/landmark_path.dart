@@ -15,6 +15,9 @@ enum LandmarkKind {
   leaf,
 }
 
+/// A value of ρ, `num / den`, from the engine's list of choices.
+typedef LandmarkRho = ({int num, int den});
+
 /// The landmark-path parameters (great-wall-core `LandmarkParams`), read from
 /// the engine (`bs_landmark_params`) and passed back unchanged. Ratios are
 /// `num / den`.

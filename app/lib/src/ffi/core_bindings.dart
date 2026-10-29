@@ -162,6 +162,28 @@ class GreatWallCoreBindings {
         _lib.lookupFunction<_CanonicalIslandFreeC, _CanonicalIslandFreeDart>(
       'bs_landmark_path_free',
     );
+    _landmarkCandidatesCompute = _lib.lookupFunction<
+        _LandmarkCandidatesComputeC, _LandmarkCandidatesComputeDart>(
+      'bs_landmark_candidates_compute',
+    );
+    _landmarkCandidatesStatus =
+        _lib.lookupFunction<_CanonicalIslandFoundC, _CanonicalIslandFoundDart>(
+      'bs_landmark_candidates_status',
+    );
+    _landmarkCandidatesFree =
+        _lib.lookupFunction<_CanonicalIslandFreeC, _CanonicalIslandFreeDart>(
+      'bs_landmark_candidates_free',
+    );
+    _landmarkPathSearch =
+        _lib.lookupFunction<_LandmarkPathSearchC, _LandmarkPathSearchDart>(
+      'bs_landmark_path_search',
+    );
+    _landmarkRhoChoices =
+        _lib.lookupFunction<_LandmarkRhoChoicesC, _LandmarkRhoChoicesDart>(
+      'bs_landmark_rho_choices',
+    );
+    _landmarkExponentChoices = _lib.lookupFunction<_LandmarkExponentChoicesC,
+        _LandmarkExponentChoicesDart>('bs_landmark_exponent_choices');
     _orbitArgon2Single = _lib.lookupFunction<_Argon2SingleC, _Argon2SingleDart>(
         'bs_orbit_argon2_single');
     _argon2Single =
@@ -263,6 +285,12 @@ class GreatWallCoreBindings {
   late final _LandmarkPathStopCellsDart _landmarkPathStopCells;
   late final _LandmarkPathHopDart _landmarkPathHop;
   late final _CanonicalIslandFreeDart _landmarkPathFree;
+  late final _LandmarkCandidatesComputeDart _landmarkCandidatesCompute;
+  late final _CanonicalIslandFoundDart _landmarkCandidatesStatus;
+  late final _CanonicalIslandFreeDart _landmarkCandidatesFree;
+  late final _LandmarkPathSearchDart _landmarkPathSearch;
+  late final _LandmarkRhoChoicesDart _landmarkRhoChoices;
+  late final _LandmarkExponentChoicesDart _landmarkExponentChoices;
   late final _Argon2SingleDart _argon2Single;
   late final _Argon2SingleDart _orbitArgon2Single;
   late final _Argon2idMasterDart _argon2idMaster;
@@ -864,26 +892,145 @@ class GreatWallCoreBindings {
       if (handle == nullptr) {
         throw StateError('bs_landmark_path_compute returned NULL handle');
       }
-      try {
-        if (_landmarkPathStatus(handle) != _kLandmarkPathOk) return null;
-        final int n = _landmarkPathNumStops(handle);
-        final List<LandmarkFeature> stops = <LandmarkFeature>[
-          for (int k = 0; k < n; k++) _landmarkStop(handle, k),
-        ];
-        final Int64List hops = Int64List(n > 0 ? n - 1 : 0);
-        for (int k = 0; k < hops.length; k++) {
-          hops[k] = _landmarkPathHop(handle, k);
-        }
-        return LandmarkPath(
-          version: landmarkPathVersion(),
-          stops: stops,
-          hops: hops,
-        );
-      } finally {
-        _landmarkPathFree(handle);
-      }
+      return _readLandmarkPath(handle);
     } finally {
       if (ppPtr != nullptr) calloc.free(ppPtr);
+    }
+  }
+
+  /// The path a `bs_landmark_path_*` handle holds, or null if it failed;
+  /// frees the handle.
+  LandmarkPath? _readLandmarkPath(Pointer<Void> handle) {
+    try {
+      if (_landmarkPathStatus(handle) != _kLandmarkPathOk) return null;
+      final int n = _landmarkPathNumStops(handle);
+      final List<LandmarkFeature> stops = <LandmarkFeature>[
+        for (int k = 0; k < n; k++) _landmarkStop(handle, k),
+      ];
+      final Int64List hops = Int64List(n > 0 ? n - 1 : 0);
+      for (int k = 0; k < hops.length; k++) {
+        hops[k] = _landmarkPathHop(handle, k);
+      }
+      return LandmarkPath(
+        version: landmarkPathVersion(),
+        stops: stops,
+        hops: hops,
+      );
+    } finally {
+      _landmarkPathFree(handle);
+    }
+  }
+
+  /// Scan a leaf's landmark candidates (`bs_landmark_candidates_compute`):
+  /// the slow part of [landmarkPath], with the scan fields of [params]. Returns
+  /// the engine handle's address, for [landmarkPathSearch] in any isolate, or
+  /// 0 when the engine finds none (no canonical island, no coast, invalid
+  /// [params]). Free a non-zero address with [landmarkCandidatesFree].
+  int landmarkCandidatesCompute({
+    required FixedRect leafRect,
+    required String path,
+    required int o,
+    required int p,
+    required int q,
+    required LandmarkParams params,
+  }) {
+    final (Pointer<Uint8> ppPtr, int ppLen) = _allocAscii(path);
+    try {
+      final Pointer<Void> handle = _landmarkCandidatesCompute(
+        o,
+        p,
+        q,
+        leafRect.reMin,
+        leafRect.reMax,
+        leafRect.imMin,
+        leafRect.imMax,
+        ppPtr,
+        ppLen,
+        params.floodCells,
+        params.scanMaxIter,
+        params.minEscape,
+        params.seedGrid,
+        params.shells,
+        params.reach,
+        params.ladderRatioNum,
+        params.ladderRatioDen,
+        params.leafShareNum,
+        params.leafShareDen,
+        params.keep,
+        params.minCells,
+        params.canonicalMaxFloodPoints,
+      );
+      if (handle == nullptr) {
+        throw StateError('bs_landmark_candidates_compute returned NULL handle');
+      }
+      if (_landmarkCandidatesStatus(handle) != _kLandmarkPathOk) {
+        _landmarkCandidatesFree(handle);
+        return 0;
+      }
+      return handle.address;
+    } finally {
+      if (ppPtr != nullptr) calloc.free(ppPtr);
+    }
+  }
+
+  /// Search the candidates at [candidates] (from [landmarkCandidatesCompute])
+  /// for the path under the route [rhoNum]/[rhoDen] and [exponent], with the
+  /// other search fields of [params] (`bs_landmark_path_search`): fast next to
+  /// the scan. Null if the engine refuses the values.
+  LandmarkPath? landmarkPathSearch(
+    int candidates, {
+    required int rhoNum,
+    required int rhoDen,
+    required int exponent,
+    required LandmarkParams params,
+  }) {
+    final Pointer<Void> handle = _landmarkPathSearch(
+      Pointer<Void>.fromAddress(candidates),
+      rhoNum,
+      rhoDen,
+      exponent,
+      params.badnessChargeNum,
+      params.badnessChargeDen,
+      params.metricFracBits,
+    );
+    if (handle == nullptr) {
+      throw StateError('bs_landmark_path_search returned NULL handle');
+    }
+    return _readLandmarkPath(handle);
+  }
+
+  /// Free the candidates at [candidates] (`bs_landmark_candidates_free`).
+  void landmarkCandidatesFree(int candidates) =>
+      _landmarkCandidatesFree(Pointer<Void>.fromAddress(candidates));
+
+  /// The values a user may pick for ρ, increasing
+  /// (`bs_landmark_rho_choices`).
+  List<LandmarkRho> landmarkRhoChoices() {
+    final int n = _landmarkRhoChoices(nullptr, nullptr, 0);
+    final Pointer<Uint32> num = calloc<Uint32>(n);
+    final Pointer<Uint32> den = calloc<Uint32>(n);
+    try {
+      _landmarkRhoChoices(num, den, n);
+      return <LandmarkRho>[
+        for (int k = 0; k < n; k++) (num: num[k], den: den[k]),
+      ];
+    } finally {
+      calloc
+        ..free(num)
+        ..free(den);
+    }
+  }
+
+  /// The values a user may pick for the badness exponent, increasing
+  /// (`bs_landmark_exponent_choices`).
+  List<int> landmarkExponentChoices() {
+    final int n = _landmarkExponentChoices(nullptr, 0);
+    final Pointer<Uint32> out = calloc<Uint32>(n);
+    try {
+      _landmarkExponentChoices(out, n);
+      return List<int>.unmodifiable(out.asTypedList(n));
+    } finally {
+      calloc.free(out);
     }
   }
 
@@ -1792,6 +1939,36 @@ typedef _LandmarkPathComputeDart = Pointer<Void> Function(
   int, int, int, int, int, int, int, int, int,
   int, int, int, int, int, int, int, int,
   int);
+
+typedef _LandmarkCandidatesComputeC = Pointer<Void> Function(
+  Uint64, Uint64, Uint64,
+  Int64, Int64, Int64, Int64,
+  Pointer<Uint8>, Uint32,
+  Uint64,
+  Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32,
+  Uint32, Uint32,
+  Uint64);
+typedef _LandmarkCandidatesComputeDart = Pointer<Void> Function(
+  int, int, int,
+  int, int, int, int,
+  Pointer<Uint8>, int,
+  int,
+  int, int, int, int, int, int, int, int, int,
+  int, int,
+  int);
+
+typedef _LandmarkPathSearchC = Pointer<Void> Function(
+  Pointer<Void>, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32);
+typedef _LandmarkPathSearchDart = Pointer<Void> Function(
+  Pointer<Void>, int, int, int, int, int, int);
+
+typedef _LandmarkRhoChoicesC = Uint32 Function(
+  Pointer<Uint32>, Pointer<Uint32>, Uint32);
+typedef _LandmarkRhoChoicesDart = int Function(
+  Pointer<Uint32>, Pointer<Uint32>, int);
+
+typedef _LandmarkExponentChoicesC = Uint32 Function(Pointer<Uint32>, Uint32);
+typedef _LandmarkExponentChoicesDart = int Function(Pointer<Uint32>, int);
 
 typedef _LandmarkPathStopC = Int32 Function(
   Pointer<Void>, Uint32,
