@@ -7,6 +7,7 @@ import '../ffi/library_loader.dart';
 import 'core_escape_count_source.dart';
 import 'core_leaf_area_source.dart';
 import 'encoding_constants.dart';
+import 'landmark_path.dart';
 import 'stage_params.dart';
 
 /// App-level facade over great-wall-core: opens the engine once, exposes the
@@ -54,6 +55,84 @@ class GreatWallCore {
 
   /// The canonical encode area, fetched once from the engine.
   late final FixedRect encodeArea = bindings.encodeArea();
+
+  /// The canonical island's flood cap, fetched once from the engine, which
+  /// owns it: with [encodeParams] otherwise, it resolves a leaf's island into a
+  /// real shape rather than a speck. Visualisation only; never touches the
+  /// encoded bits.
+  late final int canonicalMaxFloodPoints = bindings.canonicalMaxFloodPoints();
+
+  /// The default landmark-path parameters, fetched once from the engine.
+  late final LandmarkParams landmarkParams = bindings.landmarkParams();
+
+  /// The default landmark path of a leaf (its rectangle and bisection [path]
+  /// on the fractal `(o, p, q)`), or null if the engine finds none. Computed
+  /// in a worker isolate: it takes seconds.
+  Future<LandmarkPath?> landmarkPath({
+    required FixedRect leafRect,
+    required String path,
+    required int o,
+    required int p,
+    required int q,
+  }) =>
+      _landmarkPathInIsolate(leafRect, path, o, p, q, landmarkParams);
+
+  /// Static, so the isolate's closure holds only its arguments.
+  static Future<LandmarkPath?> _landmarkPathInIsolate(FixedRect leafRect,
+          String path, int o, int p, int q, LandmarkParams params) =>
+      Isolate.run(() => GreatWallCoreBindings.open().landmarkPath(
+            leafRect: leafRect,
+            path: path,
+            o: o,
+            p: p,
+            q: q,
+            params: params,
+          ));
+
+  /// The values a user may pick for ρ and for the badness exponent, each
+  /// increasing (more stops toward lower ρ and higher exponents), fetched once
+  /// from the engine; the defaults of [landmarkParams] are among them.
+  late final List<LandmarkRho> landmarkRhoChoices =
+      bindings.landmarkRhoChoices();
+  late final List<int> landmarkExponentChoices =
+      bindings.landmarkExponentChoices();
+
+  /// A leaf's landmark candidates (its rectangle and bisection [path] on the
+  /// fractal `(o, p, q)`), or null if the engine finds none: the slow part of
+  /// [landmarkPath], run once in a worker isolate, then searched per route
+  /// with [LandmarkCandidates.search].
+  Future<LandmarkCandidates?> landmarkCandidates({
+    required FixedRect leafRect,
+    required String path,
+    required int o,
+    required int p,
+    required int q,
+  }) async {
+    final int address = await _candidatesInIsolate(
+        leafRect, path, o, p, q, landmarkParams);
+    return address == 0 ? null : LandmarkCandidates._(this, address);
+  }
+
+  static Future<int> _candidatesInIsolate(FixedRect leafRect, String path,
+          int o, int p, int q, LandmarkParams params) =>
+      Isolate.run(() => GreatWallCoreBindings.open().landmarkCandidatesCompute(
+            leafRect: leafRect,
+            path: path,
+            o: o,
+            p: p,
+            q: q,
+            params: params,
+          ));
+
+  static Future<LandmarkPath?> _searchInIsolate(int address, LandmarkRho rho,
+          int exponent, LandmarkParams params) =>
+      Isolate.run(() => GreatWallCoreBindings.open().landmarkPathSearch(
+            address,
+            rhoNum: rho.num,
+            rhoDen: rho.den,
+            exponent: exponent,
+            params: params,
+          ));
 
   /// Engine algorithm version (e.g. `"0.1.0"`).
   String get engineVersion => bindings.engineVersion();
@@ -966,4 +1045,50 @@ class Argon2Cancelled implements Exception {
   const Argon2Cancelled();
   @override
   String toString() => 'Argon2Cancelled';
+}
+
+/// A leaf's landmark candidates, held by the engine: scanned once
+/// ([GreatWallCore.landmarkCandidates]), then searched per route. Sensitive,
+/// as a path is: [dispose] frees them, at once or when the running searches
+/// end.
+class LandmarkCandidates {
+  LandmarkCandidates._(this._core, this._address);
+
+  final GreatWallCore _core;
+  int _address;
+  int _searching = 0;
+  bool _disposed = false;
+
+  /// The path under [rho] and [exponent] (values from the engine's choices),
+  /// searched in a worker isolate; null once disposed or if the engine
+  /// refuses the values.
+  Future<LandmarkPath?> search({
+    required LandmarkRho rho,
+    required int exponent,
+  }) async {
+    if (_disposed) return null;
+    _searching++;
+    try {
+      return await GreatWallCore._searchInIsolate(
+          _address, rho, exponent, _core.landmarkParams);
+    } finally {
+      _searching--;
+      if (_disposed && _searching == 0) _free();
+    }
+  }
+
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    if (_searching == 0) _free();
+  }
+
+  void _free() {
+    if (_address == 0) return;
+    _core.bindings.landmarkCandidatesFree(_address);
+    _address = 0;
+  }
+
+  @override
+  String toString() => 'LandmarkCandidates(<redacted>)';
 }

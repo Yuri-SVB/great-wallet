@@ -25,6 +25,12 @@ dependencies:
   great_wall_ux:
     path: ../great-wall-ux
 
+  # The memory engine: the deck of memorised maps, its SM-2 schedule and the
+  # maps' landmark cues. Pure Dart; a flat submodule pinned by this app, like
+  # great-wall-ux.
+  celestial_peace_nf_core:
+    path: ../celestial-peace-nf-core
+
   # Foreign-function interface helpers (calloc / free for the per-frame
   # escape-count pixel buffer). The raw dart:ffi binding to the Rust core's
   # C ABI lives in lib/src/ffi (TECH_STACK.md §"FFI: hybrid" — raw dart:ffi on

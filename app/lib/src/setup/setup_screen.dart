@@ -6,6 +6,8 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart'
     show defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:flutter/material.dart';
+import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
+    show CardKind, Cues, Deck, MemCard, buildDeck;
 import 'package:flutter/services.dart';
 import 'package:great_wall_ux/great_wall_ux.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
@@ -15,6 +17,7 @@ import '../core/bip39.dart';
 import '../core/encoding_constants.dart';
 import '../core/entropy.dart';
 import '../core/great_wall_core.dart';
+import '../core/landmark_path.dart';
 import '../core/master_secret.dart';
 import '../core/namtso_harvester.dart';
 import '../core/orbit_protocol.dart';
@@ -406,6 +409,38 @@ class _SetupScreenState extends State<SetupScreen> {
   /// slot, cached until the point / σ changes. Drives the square frame and the
   /// cross↔square switch.
   final Map<int, _BoardDeco?> _boardDecoCache = <int, _BoardDeco?>{};
+
+  /// Whether the active board shows its point's landmark path (Alt+E).
+  bool _showPath = false;
+
+  /// Landmark candidates per (stage, slot), scanned once per point off the
+  /// UI isolate; null for a point with none. Freed wherever the board's
+  /// points change.
+  final Map<(int, int), LandmarkCandidates?> _candidates =
+      <(int, int), LandmarkCandidates?>{};
+
+  /// The route per (stage, slot), set in the route panel. Saved as the cues of
+  /// the map's card in [_deck] when the setup is saved, and read back when it
+  /// is opened.
+  final Map<(int, int), _Route> _routes = <(int, int), _Route>{};
+
+  /// The CPNF deck saved with this setup (celestial-peace-nf-core): a card per
+  /// memorised map with its cues and SM-2 state, plus the fact cards. Null
+  /// until the setup is first saved or opened with one. Kept in step with the
+  /// boards: a map whose point changes restarts its card ([_mapsChanged]).
+  Deck? _deck;
+
+  /// Landmark paths per (stage, slot), searched off the UI isolate, each with
+  /// the route it was searched for and the overlay it is drawn as; null for a
+  /// point with no path. Dropped, and wiped, wherever the board's points
+  /// change.
+  final Map<(int, int), _ShownPath?> _paths = <(int, int), _ShownPath?>{};
+
+  /// (stage, slot) pairs whose path is being computed.
+  final Set<(int, int)> _pathsPending = <(int, int)>{};
+
+  /// Bumped by every drop, so a computation started before it is discarded.
+  int _pathGeneration = 0;
 
   /// Whether the active board's placed point is drawn as a **square** (frame +
   /// island cells) rather than a **cross**. Switches on the island's on-screen
@@ -810,6 +845,13 @@ class _SetupScreenState extends State<SetupScreen> {
                                       : _canvas())),
                         ),
                         if (_busy) Positioned.fill(child: _progressOverlay()),
+                        if (_routePanel() case final Widget panel)
+                          Positioned(
+                            top: 0,
+                            bottom: 0,
+                            right: 12,
+                            child: Center(child: panel),
+                          ),
                         if (_selectMode && !_setup.isTextStage)
                           Positioned(
                             top: 56,
@@ -1000,7 +1042,11 @@ class _SetupScreenState extends State<SetupScreen> {
                             // (hence K_i) changes, which re-roots deeper stages.
                             _recomputeExtraShares(stage);
                             _invalidateDeeperThan(stage);
+                            // The stage's unplaced slots now hold other shares.
+                            _mapsChanged((int st, int sl) =>
+                                st == stage && !_placed(st, sl));
                             _boardDecoCache.clear();
+                            _dropPaths();
                             _boardCanonicalView = false;
                           });
                         }
@@ -1335,6 +1381,12 @@ class _SetupScreenState extends State<SetupScreen> {
         if (!_busy) _copyMasterSecret(full: true);
         return KeyEventResult.handled;
       }
+      // Alt+E — the landmark path of the board's point (vs plain E, which
+      // highlights the canonical islands in view).
+      if (event.logicalKey == LogicalKeyboardKey.keyE) {
+        _toggleLandmarkPath();
+        return KeyEventResult.handled;
+      }
       // Alt+I — the hex counterpart of plain I (BIP39 words): on an editable
       // point (a chain stage or an orbit board slot) it opens the point-import
       // editor in hex.
@@ -1565,6 +1617,329 @@ class _SetupScreenState extends State<SetupScreen> {
             '(slower in voids).'
         : 'Deep render off — ${EncodingConstants.renderMaxIterFast} iterations.');
   }
+
+  /// Toggle the landmark path on the active board (Alt+E). The mode is
+  /// announced; the path never is.
+  void _toggleLandmarkPath() {
+    setState(() => _showPath = !_showPath);
+    _sounds.play(_showPath ? UiSound.modeOn : UiSound.modeOff);
+    final bool computing = _showPath &&
+        _isBoardSlot &&
+        _boardPoints[_activeStage][_slotIndex] != null &&
+        !_paths.containsKey((_activeStage, _slotIndex));
+    _toast(!_showPath
+        ? 'Landmark path off.'
+        : computing
+            ? 'Landmark path on — computing (a few seconds)…'
+            : 'Landmark path on.');
+  }
+
+  /// Drop (and wipe) every landmark path and free every candidate set: the
+  /// points they lead to changed, or may have. Routes are kept; the maps whose
+  /// points did change are reset by [_mapsChanged].
+  void _dropPaths() {
+    for (final _ShownPath? p in _paths.values) {
+      p?.path.wipe();
+    }
+    _paths.clear();
+    for (final LandmarkCandidates? c in _candidates.values) {
+      c?.dispose();
+    }
+    _candidates.clear();
+    _pathsPending.clear();
+    _pathGeneration++;
+  }
+
+  /// The engine's default route: its ρ and exponent among the choices, every
+  /// stop visible.
+  _Route get _defaultRoute {
+    final LandmarkParams p = widget.core.landmarkParams;
+    return (
+      rho: widget.core.landmarkRhoChoices.indexWhere(
+          (LandmarkRho r) => r.num * p.rhoDen == p.rhoNum * r.den),
+      exponent:
+          widget.core.landmarkExponentChoices.indexOf(p.badnessExponent),
+      visible: null,
+    );
+  }
+
+  _Route _routeOf((int, int) key) => _routes[key] ?? _defaultRoute;
+
+  /// A route as a card's cues: the engine's values, not the panel's indices.
+  Cues _cuesOf(_Route r) {
+    final LandmarkRho rho = widget.core.landmarkRhoChoices[r.rho];
+    return Cues(
+      rhoNum: rho.num,
+      rhoDen: rho.den,
+      exponent: widget.core.landmarkExponentChoices[r.exponent],
+      visible: r.visible,
+    );
+  }
+
+  /// A card's cues as a route, or null if its ρ or exponent is not among this
+  /// engine's choices (the map then shows the default route).
+  _Route? _routeOfCues(Cues c) {
+    final int rho = widget.core.landmarkRhoChoices
+        .indexWhere((LandmarkRho r) => r.num * c.rhoDen == c.rhoNum * r.den);
+    final int exponent =
+        widget.core.landmarkExponentChoices.indexOf(c.exponent);
+    if (rho < 0 || exponent < 0) return null;
+    return (rho: rho, exponent: exponent, visible: c.visible);
+  }
+
+  /// The maps matching [changed] hold new points, or none ([drop]: their stage
+  /// is gone). Their routes keep ρ and the exponent with every stop shown
+  /// again; their deck cards restart — the schedule was for another point —
+  /// or, with [drop], leave the deck.
+  void _mapsChanged(
+    bool Function(int stage, int slot) changed, {
+    bool drop = false,
+  }) {
+    for (final (int, int) key in _routes.keys.toList()) {
+      if (!changed(key.$1, key.$2)) continue;
+      final _Route r = _routes[key]!;
+      _routes[key] = (rho: r.rho, exponent: r.exponent, visible: null);
+    }
+    final Deck? deck = _deck;
+    if (deck == null) return;
+    Deck next = deck;
+    for (final MemCard c in deck.cards) {
+      if (c.kind != CardKind.point || !changed(c.stageIndex, c.slot)) continue;
+      next = drop
+          ? next.removeMap(c.stageIndex, c.slot)
+          : next.withCard(MemCard.map(c.stageIndex, c.slot,
+              (c.cues ?? _cuesOf(_defaultRoute)).withVisible(null)));
+    }
+    _deck = next;
+  }
+
+  /// Whether stage [stage]'s slot [slot] holds a point the holder placed (not
+  /// a derived share).
+  bool _placed(int stage, int slot) =>
+      _boardPoints[stage][slot] != null && !_boardDerived[stage][slot];
+
+  /// The deck to save: the current one (or a fresh one, a card per placed
+  /// map), every placed map in it, and the session's routes as its cues.
+  Deck _deckForSave(int deepest) {
+    final Cues start = _cuesOf(_defaultRoute);
+    final List<List<int>> placed = <List<int>>[
+      for (int i = 0; i <= deepest; i++)
+        <int>[
+          for (int s = 1; s <= _maxSlot; s++)
+            if (_placed(i, s)) s,
+        ],
+    ];
+    Deck deck = _deck ?? buildDeck(maps: placed, cues: start);
+    for (int i = 0; i <= deepest; i++) {
+      for (final int s in placed[i]) {
+        deck = deck.addMap(i, s, start);
+      }
+    }
+    _routes.forEach(((int, int) key, _Route r) {
+      final MemCard? card = deck.map(key.$1, key.$2);
+      if (card != null) deck = deck.withCard(card.copyWith(cues: _cuesOf(r)));
+    });
+    return deck;
+  }
+
+  /// Set [key]'s route. A new ρ or exponent searches again, with every stop
+  /// visible; the current path stays drawn until the new one is found.
+  void _setRoute((int, int) key, _Route route) {
+    final _Route old = _routeOf(key);
+    final bool reroute = route.rho != old.rho || route.exponent != old.exponent;
+    final _Route next = reroute
+        ? (rho: route.rho, exponent: route.exponent, visible: null)
+        : route;
+    setState(() {
+      _routes[key] = next;
+      final _ShownPath? p = _paths[key];
+      if (!reroute && p != null) {
+        _paths[key] = (
+          path: p.path,
+          rho: p.rho,
+          exponent: p.exponent,
+          overlay: _canvasPathOf(p.path, next.visible),
+        );
+      }
+    });
+  }
+
+  /// The landmark-path overlay of [slot]'s point on the active stage, or null
+  /// while it is first computed (which this starts) or if the point has none.
+  /// A path searched for another route stays drawn while this searches again.
+  CanvasPath? _pathOverlay(int slot) {
+    final (int, int) key = (_activeStage, slot);
+    final _Route route = _routeOf(key);
+    final _ShownPath? shown = _paths[key];
+    final bool current = _paths.containsKey(key) &&
+        (shown == null ||
+            (shown.rho == route.rho && shown.exponent == route.exponent));
+    if (!current && !_pathsPending.contains(key)) {
+      unawaited(_computePath(key, slot));
+    }
+    return shown?.overlay;
+  }
+
+  /// Search [slot]'s landmark path for [key]'s route off the UI isolate,
+  /// scanning its candidates first if needed (seconds; a search alone is
+  /// fast), and cache it under [key].
+  Future<void> _computePath((int, int) key, int slot) async {
+    final ({int reRaw, int imRaw})? pt = _boardPoints[key.$1][slot];
+    final ({int o, int p, int q})? prm = _boardPrm(slot);
+    if (pt == null || prm == null) return;
+    _pathsPending.add(key);
+    final int generation = _pathGeneration;
+    LandmarkCandidates? candidates = _candidates[key];
+    if (!_candidates.containsKey(key)) {
+      final CoreDecodeResult d = widget.core.decodePoint(
+          reRaw: pt.reRaw, imRaw: pt.imRaw, o: prm.o, p: prm.p, q: prm.q);
+      if (d.valid) {
+        try {
+          candidates = await widget.core.landmarkCandidates(
+              leafRect: d.leafRect, path: d.path, o: prm.o, p: prm.p, q: prm.q);
+        } on Object {
+          candidates = null;
+        }
+      }
+      if (!mounted || generation != _pathGeneration) {
+        candidates?.dispose();
+        return;
+      }
+      _candidates[key] = candidates;
+    }
+    final _Route route = _routeOf(key);
+    LandmarkPath? path;
+    try {
+      path = await candidates?.search(
+        rho: widget.core.landmarkRhoChoices[route.rho],
+        exponent: widget.core.landmarkExponentChoices[route.exponent],
+      );
+    } on Object {
+      path = null;
+    }
+    if (!mounted || generation != _pathGeneration) {
+      path?.wipe();
+      return;
+    }
+    final LandmarkPath? found = path;
+    setState(() {
+      _pathsPending.remove(key);
+      _paths[key]?.path.wipe();
+      // If the route changed meanwhile, the next build searches again.
+      _paths[key] = found == null
+          ? null
+          : (
+              path: found,
+              rho: route.rho,
+              exponent: route.exponent,
+              overlay: _canvasPathOf(found, _routeOf(key).visible),
+            );
+    });
+    if (found == null && _showPath) _toast('No landmark path for this point.');
+  }
+
+  /// A landmark path as an overlay: each stop at its barycentre, its feature
+  /// highlighted from its own cells. With [visible] set, only that many stops
+  /// before the leaf are drawn, the shallowest hidden first. The cells are
+  /// shared, so wiping the path blanks the overlay too.
+  CanvasPath _canvasPathOf(LandmarkPath path, int? visible) {
+    final int before = path.stops.length - 1;
+    final int shown = visible == null ? before : visible.clamp(0, before);
+    return CanvasPath(
+      stops: <CanvasPathStop>[
+        for (final LandmarkFeature f in path.stops.skip(before - shown))
+          CanvasPathStop(
+            re: fixedToDouble(f.barycentreRe),
+            im: fixedToDouble(f.barycentreIm),
+            cells: CanvasCells(
+              originRe: fixedToDouble(f.cellsOriginRe),
+              originIm: fixedToDouble(f.cellsOriginIm),
+              cellSize: fixedToDouble(f.cellRaw),
+              width: f.cellsWidth,
+              height: f.cellsHeight,
+              cells: f.cells,
+            ),
+          ),
+      ],
+    );
+  }
+
+  /// The route panel of the active board's path, while it is shown: ρ
+  /// (left favours zooming, right panning), the exponent (fewer or more
+  /// stops) and the stops visible before the leaf. Both route sliders give
+  /// more stops to the right. Words only: the values are the engine's.
+  Widget? _routePanel() {
+    if (!_showPath || !_isBoardSlot || _slotIndex < 1) return null;
+    final (int, int) key = (_activeStage, _slotIndex);
+    final _ShownPath? shown = _paths[key];
+    if (shown == null) return null;
+    final _Route route = _routeOf(key);
+    final int rhos = widget.core.landmarkRhoChoices.length;
+    final int exponents = widget.core.landmarkExponentChoices.length;
+    final int before = shown.path.stops.length - 1;
+    final int visible = (route.visible ?? before).clamp(0, before);
+    Widget row(String left, String right, int value, int max,
+            ValueChanged<int>? onChanged) =>
+        Row(
+          children: <Widget>[
+            SizedBox(width: 48, child: Text(left, style: _routeLabel)),
+            Expanded(
+              child: Slider(
+                value: value.toDouble(),
+                max: max < 1 ? 1 : max.toDouble(),
+                divisions: max < 1 ? 1 : max,
+                onChanged: max < 1 || onChanged == null
+                    ? null
+                    : (double v) => onChanged(v.round()),
+              ),
+            ),
+            SizedBox(
+              width: 48,
+              child: Text(right, style: _routeLabel, textAlign: TextAlign.end),
+            ),
+          ],
+        );
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: const Color(0x99000000),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        child: SizedBox(
+          width: 240,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              // Higher ρ favours zooming: the list runs right to left.
+              row('zoom', 'pan', rhos - 1 - route.rho, rhos - 1,
+                  (int v) => _setRoute(key, (
+                        rho: rhos - 1 - v,
+                        exponent: route.exponent,
+                        visible: route.visible,
+                      ))),
+              row('fewer', 'more stops', route.exponent, exponents - 1,
+                  (int v) => _setRoute(key, (
+                        rho: route.rho,
+                        exponent: v,
+                        visible: route.visible,
+                      ))),
+              const Text('visible stops', style: _routeLabel),
+              row('none', 'all', visible, before,
+                  (int v) => _setRoute(key, (
+                        rho: route.rho,
+                        exponent: route.exponent,
+                        visible: v,
+                      ))),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  static const TextStyle _routeLabel =
+      TextStyle(color: Colors.white, fontSize: 12);
 
   /// Select stage [index]: focus it if it is already available (Stage 0, or a
   /// fractal already derived), or — if it is the first not-yet-derived stage —
@@ -2094,6 +2469,7 @@ class _SetupScreenState extends State<SetupScreen> {
           ),
       ],
       crosses: crosses,
+      path: _showPath && pt != null ? _pathOverlay(slot) : null,
     );
   }
 
@@ -2129,7 +2505,7 @@ class _SetupScreenState extends State<SetupScreen> {
     return CoreDiscoveryParams(
       maxIter: b.maxIter,
       targetGood: b.targetGood,
-      maxFloodPoints: EncodingConstants.canonicalIslandMaxFloodPoints,
+      maxFloodPoints: widget.core.canonicalMaxFloodPoints,
       minGridCells: b.minGridCells,
       pMaxShift: b.pMaxShift,
       exclusionThresholdNum: b.exclusionThresholdNum,
@@ -2482,9 +2858,13 @@ class _SetupScreenState extends State<SetupScreen> {
       // (o_{i+1}=H*(u_i)), so their advanced o_i / K_i and any placed points no
       // longer decode — drop them; the user re-advances from the settled prefix.
       _invalidateDeeperThan(stage);
+      // This map, and the stage's derived shares, hold new points.
+      _mapsChanged((int st, int sl) =>
+          st == stage && (sl == slot || !_placed(st, sl)));
       // Placing this point (and re-deriving the shares) invalidates the cached
       // island decorations; the canonical view (if any) referred to the old one.
       _boardDecoCache.clear();
+      _dropPaths();
       _boardCanonicalView = false;
     });
     // Pick the marker mode for the freshly placed point at the current zoom.
@@ -2500,6 +2880,8 @@ class _SetupScreenState extends State<SetupScreen> {
     // just changed, so its checkpoint no longer leads anywhere.
     final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
     if (cp != null && cp.stage > stage) _clearAdvanceCheckpoint();
+    // The deeper stages' maps are gone until re-advanced, to other maps.
+    _mapsChanged((int st, int _) => st > stage, drop: true);
     for (int st = stage + 1; st <= _maxStage; st++) {
       _shareEncodeGen[st]++; // discard any in-flight share-marker encode for st
       for (int s = 1; s <= _maxSlot; s++) {
@@ -2651,6 +3033,7 @@ class _SetupScreenState extends State<SetupScreen> {
         }
       }
       _boardDecoCache.clear();
+      _dropPaths();
     });
   }
 
@@ -2683,6 +3066,9 @@ class _SetupScreenState extends State<SetupScreen> {
     _boardKey = '';
     _boardIslands = const <CanvasIsland>[];
     _boardDecoCache.clear();
+    _mapsChanged((int _, int __) => true);
+    _deck = null;
+    _dropPaths();
     _boardCanonicalView = false;
   }
 
@@ -3130,6 +3516,8 @@ class _SetupScreenState extends State<SetupScreen> {
     'V+↑/↓  sound volume (level 0 = muted) · Alt+V reveal/hide sensitive text',
     'Alt+K  copy the full export digest (not just the first 32 chars)',
     'Alt+L  deep render — reveal leaves in escape-count voids (slower)',
+    'Alt+E  landmark path of the board\'s point — line, numbered stops, highlights;'
+        ' the panel on the right sets the route and the visible stops',
     'L+scroll or L+↑/↓  brightness · G+scroll or G+↑/↓  slope (↑ more shades)',
     'A  auto brightness — offset & slope follow the view (L / G take over)',
     'scroll zoom · drag pan (over the canvas)',
@@ -3988,6 +4376,7 @@ class _SetupScreenState extends State<SetupScreen> {
     final int deepest = _orbitDeepestStage;
     final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
     return OrbitVault(
+      deck: _deckForSave(deepest),
       sigma: _sigmaCtrl.text.trim().replaceAll(RegExp(r'\s'), ''),
       iterations: _iterations,
       profile: _profile,
@@ -4046,6 +4435,7 @@ class _SetupScreenState extends State<SetupScreen> {
       );
       await tmp.writeAsBytes(sealed.fileBytes, flush: true);
       await tmp.rename(path);
+      _deck = vault.deck; // what the file now holds
       return (error: null, key: sealed.key);
     } catch (e) {
       // Best effort: never leave the partial temp behind. It is ciphertext, but
@@ -4158,6 +4548,13 @@ class _SetupScreenState extends State<SetupScreen> {
       // Drop whatever is on the boards now: a restore replaces the orbit, and a
       // leftover placement from another σ would neither decode nor be visible.
       _clearOrbitPlacements();
+      // The saved deck and its maps' routes.
+      _deck = vault.deck;
+      for (final MemCard c in vault.deck?.cards ?? const <MemCard>[]) {
+        final Cues? cues = c.cues;
+        final _Route? route = cues == null ? null : _routeOfCues(cues);
+        if (route != null) _routes[(c.stageIndex, c.slot)] = route;
+      }
       _sigmaCtrl.text = vault.sigma;
       _iterations = vault.iterations;
       _iterationsField.text = '${vault.iterations}';
@@ -6072,6 +6469,19 @@ const FractalViewport _initialViewport = FractalViewport(
 );
 
 /// Small translucent label shown over the canvas (e.g. the select-mode hint).
+/// A landmark route: indices into the engine's ρ and exponent choices, and
+/// how many stops before the leaf are visible (null: all).
+typedef _Route = ({int rho, int exponent, int? visible});
+
+/// A landmark path with the ρ and exponent (indices) it was searched for, and
+/// the overlay it is drawn as.
+typedef _ShownPath = ({
+  LandmarkPath path,
+  int rho,
+  int exponent,
+  CanvasPath overlay,
+});
+
 class _Badge extends StatelessWidget {
   const _Badge(this.text);
 

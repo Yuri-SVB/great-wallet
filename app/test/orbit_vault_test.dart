@@ -1,3 +1,4 @@
+import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:great_wallet_app/src/ffi/core_bindings.dart'
     show Argon2Profile, kOrbitPointLen;
@@ -68,6 +69,42 @@ void main() {
     });
   });
 
+  group('CPNF deck section', () {
+    const Cues cues = Cues(rhoNum: 1, rhoDen: 2, exponent: 3, visible: 4);
+    Deck deck() => buildDeck(
+          maps: <List<int>>[
+            <int>[1, 2],
+            <int>[1, 3, 5],
+          ],
+          cues: cues,
+        );
+
+    test('is absent until there is a deck', () {
+      expect(sample().toJson().containsKey('deck'), isFalse);
+      expect(OrbitVault.fromJson(sample().toJson()).deck, isNull);
+    });
+
+    test('round-trips with the vault', () {
+      final OrbitVault v = sample()..deck = deck();
+      final OrbitVault back = OrbitVault.fromJson(v.toJson());
+      expect(back.deck!.toJson(), deck().toJson());
+      expect(back.deck!.map(1, 5)!.cues, cues);
+    });
+
+    test('a bad deck fails as an opaque bad vault', () {
+      final Map<String, dynamic> json = (sample()..deck = deck()).toJson();
+      json['deck'] = <String, dynamic>{
+        'v': 1,
+        'cards': <Object?>[7]
+      };
+      expect(
+        () => OrbitVault.fromJson(json),
+        throwsA(isA<FormatException>()
+            .having((FormatException e) => e.message, 'message', 'bad vault')),
+      );
+    });
+  });
+
   group('halted-advance resume section', () {
     OrbitVault halted() => OrbitVault(
           sigma: 'DEADBEEF',
@@ -125,7 +162,10 @@ void main() {
       for (final Object? bad in <Object?>[
         <String, dynamic>{'stage': 1, 'pass': 3}, // no digest
         <String, dynamic>{'stage': 1, 'pass': 3, 'digest': <int>[]}, // empty
-        <String, dynamic>{'pass': 3, 'digest': <int>[1]}, // no stage
+        <String, dynamic>{
+          'pass': 3,
+          'digest': <int>[1]
+        }, // no stage
         'not-an-object',
       ]) {
         final Map<String, dynamic> json = sample().toJson()..['resume'] = bad;
