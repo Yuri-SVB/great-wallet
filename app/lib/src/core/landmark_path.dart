@@ -35,6 +35,8 @@ class LandmarkParams {
     required this.leafShareDen,
     required this.keep,
     required this.minCells,
+    required this.islandReachNum,
+    required this.islandReachDen,
     required this.rhoNum,
     required this.rhoDen,
     required this.badnessExponent,
@@ -58,6 +60,11 @@ class LandmarkParams {
   final int leafShareDen;
   final int keep;
   final int minCells;
+
+  /// A feature's shells reach at most `islandReachNum / islandReachDen` times
+  /// the square root of its island's area from the island.
+  final int islandReachNum;
+  final int islandReachDen;
   final int rhoNum;
   final int rhoDen;
   final int badnessExponent;

@@ -1838,13 +1838,11 @@ class _SetupScreenState extends State<SetupScreen> {
     if (found == null && _showPath) _toast('No landmark path for this point.');
   }
 
-  /// A landmark path as an overlay: each stop at its barycentre, an island
-  /// with its shells (or the leaf) highlighted by a count-range flood, the
-  /// outer shell or a fiord by its cells. With [visible] set, only that many
-  /// stops before the leaf are drawn, the shallowest hidden first. The cells
-  /// are shared, so wiping the path blanks the overlay too.
+  /// A landmark path as an overlay: each stop at its barycentre, its feature
+  /// highlighted from its own cells. With [visible] set, only that many stops
+  /// before the leaf are drawn, the shallowest hidden first. The cells are
+  /// shared, so wiping the path blanks the overlay too.
   CanvasPath _canvasPathOf(LandmarkPath path, int? visible) {
-    final int shells = widget.core.landmarkParams.shells;
     final int before = path.stops.length - 1;
     final int shown = visible == null ? before : visible.clamp(0, before);
     return CanvasPath(
@@ -1861,15 +1859,10 @@ class _SetupScreenState extends State<SetupScreen> {
               height: f.cellsHeight,
               cells: f.cells,
             ),
-            countLow: _flooded(f.kind) ? f.bottom : null,
-            countHigh: _flooded(f.kind) ? f.bottom + shells : null,
           ),
       ],
     );
   }
-
-  static bool _flooded(LandmarkKind kind) =>
-      kind == LandmarkKind.feature || kind == LandmarkKind.leaf;
 
   /// The route panel of the active board's path, while it is shown: ρ
   /// (left favours zooming, right panning), the exponent (fewer or more

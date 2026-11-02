@@ -22,7 +22,7 @@ const int _kLandmarkPathOk = 0;
 
 /// The `u32` out-parameters of `bs_landmark_params`, between its first and
 /// last (both `u64`).
-const int _kLandmarkParams32 = 17;
+const int _kLandmarkParams32 = 19;
 
 /// `bs_landmark_path_stop`'s `u32` outputs (kind, ladder index, bottom, bitmap
 /// width and height) and `i64` outputs (seed, barycentre, bbox, cell size,
@@ -801,7 +801,7 @@ class GreatWallCoreBindings {
       _landmarkParams(out64, out32, out32 + 1, out32 + 2, out32 + 3,
           out32 + 4, out32 + 5, out32 + 6, out32 + 7, out32 + 8, out32 + 9,
           out32 + 10, out32 + 11, out32 + 12, out32 + 13, out32 + 14,
-          out32 + 15, out32 + 16, out64 + 1);
+          out32 + 15, out32 + 16, out32 + 17, out32 + 18, out64 + 1);
       return LandmarkParams(
         floodCells: out64[0],
         scanMaxIter: out32[0],
@@ -815,12 +815,14 @@ class GreatWallCoreBindings {
         leafShareDen: out32[8],
         keep: out32[9],
         minCells: out32[10],
-        rhoNum: out32[11],
-        rhoDen: out32[12],
-        badnessExponent: out32[13],
-        badnessChargeNum: out32[14],
-        badnessChargeDen: out32[15],
-        metricFracBits: out32[16],
+        islandReachNum: out32[11],
+        islandReachDen: out32[12],
+        rhoNum: out32[13],
+        rhoDen: out32[14],
+        badnessExponent: out32[15],
+        badnessChargeNum: out32[16],
+        badnessChargeDen: out32[17],
+        metricFracBits: out32[18],
         canonicalMaxFloodPoints: out64[1],
       );
     } finally {
@@ -881,6 +883,8 @@ class GreatWallCoreBindings {
         params.leafShareDen,
         params.keep,
         params.minCells,
+        params.islandReachNum,
+        params.islandReachDen,
         params.rhoNum,
         params.rhoDen,
         params.badnessExponent,
@@ -958,6 +962,8 @@ class GreatWallCoreBindings {
         params.leafShareDen,
         params.keep,
         params.minCells,
+        params.islandReachNum,
+        params.islandReachDen,
         params.canonicalMaxFloodPoints,
       );
       if (handle == nullptr) {
@@ -1912,7 +1918,7 @@ typedef _LandmarkParamsC = Void Function(
   Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
   Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
   Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
-  Pointer<Uint32>,
+  Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
   Pointer<Uint64>);
 typedef _LandmarkParamsDart = void Function(
   Pointer<Uint64>,
@@ -1920,7 +1926,7 @@ typedef _LandmarkParamsDart = void Function(
   Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
   Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
   Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
-  Pointer<Uint32>,
+  Pointer<Uint32>, Pointer<Uint32>, Pointer<Uint32>,
   Pointer<Uint64>);
 
 typedef _LandmarkPathComputeC = Pointer<Void> Function(
@@ -1929,7 +1935,8 @@ typedef _LandmarkPathComputeC = Pointer<Void> Function(
   Pointer<Uint8>, Uint32,
   Uint64,
   Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32,
-  Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32,
+  Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32,
+  Uint32,
   Uint64);
 typedef _LandmarkPathComputeDart = Pointer<Void> Function(
   int, int, int,
@@ -1937,7 +1944,8 @@ typedef _LandmarkPathComputeDart = Pointer<Void> Function(
   Pointer<Uint8>, int,
   int,
   int, int, int, int, int, int, int, int, int,
-  int, int, int, int, int, int, int, int,
+  int, int, int, int, int, int, int, int, int,
+  int,
   int);
 
 typedef _LandmarkCandidatesComputeC = Pointer<Void> Function(
@@ -1946,7 +1954,7 @@ typedef _LandmarkCandidatesComputeC = Pointer<Void> Function(
   Pointer<Uint8>, Uint32,
   Uint64,
   Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32,
-  Uint32, Uint32,
+  Uint32, Uint32, Uint32, Uint32,
   Uint64);
 typedef _LandmarkCandidatesComputeDart = Pointer<Void> Function(
   int, int, int,
@@ -1954,7 +1962,7 @@ typedef _LandmarkCandidatesComputeDart = Pointer<Void> Function(
   Pointer<Uint8>, int,
   int,
   int, int, int, int, int, int, int, int, int,
-  int, int,
+  int, int, int, int,
   int);
 
 typedef _LandmarkPathSearchC = Pointer<Void> Function(
