@@ -6,6 +6,8 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart'
     show defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:flutter/material.dart';
+import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
+    show CardKind, Cues, Deck, MemCard, buildDeck;
 import 'package:flutter/services.dart';
 import 'package:great_wall_ux/great_wall_ux.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
@@ -417,8 +419,16 @@ class _SetupScreenState extends State<SetupScreen> {
   final Map<(int, int), LandmarkCandidates?> _candidates =
       <(int, int), LandmarkCandidates?>{};
 
-  /// The route per (stage, slot), set in the route panel. Session only.
+  /// The route per (stage, slot), set in the route panel. Saved as the cues of
+  /// the map's card in [_deck] when the setup is saved, and read back when it
+  /// is opened.
   final Map<(int, int), _Route> _routes = <(int, int), _Route>{};
+
+  /// The CPNF deck saved with this setup (celestial-peace-nf-core): a card per
+  /// memorised map with its cues and SM-2 state, plus the fact cards. Null
+  /// until the setup is first saved or opened with one. Kept in step with the
+  /// boards: a map whose point changes restarts its card ([_mapsChanged]).
+  Deck? _deck;
 
   /// Landmark paths per (stage, slot), searched off the UI isolate, each with
   /// the route it was searched for and the overlay it is drawn as; null for a
@@ -1032,6 +1042,9 @@ class _SetupScreenState extends State<SetupScreen> {
                             // (hence K_i) changes, which re-roots deeper stages.
                             _recomputeExtraShares(stage);
                             _invalidateDeeperThan(stage);
+                            // The stage's unplaced slots now hold other shares.
+                            _mapsChanged((int st, int sl) =>
+                                st == stage && !_placed(st, sl));
                             _boardDecoCache.clear();
                             _dropPaths();
                             _boardCanonicalView = false;
@@ -1622,8 +1635,8 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Drop (and wipe) every landmark path and free every candidate set: the
-  /// points they lead to changed. Routes keep their ρ and exponent; every
-  /// stop shows again.
+  /// points they lead to changed, or may have. Routes are kept; the maps whose
+  /// points did change are reset by [_mapsChanged].
   void _dropPaths() {
     for (final _ShownPath? p in _paths.values) {
       p?.path.wipe();
@@ -1633,8 +1646,6 @@ class _SetupScreenState extends State<SetupScreen> {
       c?.dispose();
     }
     _candidates.clear();
-    _routes.updateAll((_, _Route r) =>
-        (rho: r.rho, exponent: r.exponent, visible: null));
     _pathsPending.clear();
     _pathGeneration++;
   }
@@ -1653,6 +1664,83 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   _Route _routeOf((int, int) key) => _routes[key] ?? _defaultRoute;
+
+  /// A route as a card's cues: the engine's values, not the panel's indices.
+  Cues _cuesOf(_Route r) {
+    final LandmarkRho rho = widget.core.landmarkRhoChoices[r.rho];
+    return Cues(
+      rhoNum: rho.num,
+      rhoDen: rho.den,
+      exponent: widget.core.landmarkExponentChoices[r.exponent],
+      visible: r.visible,
+    );
+  }
+
+  /// A card's cues as a route, or null if its ρ or exponent is not among this
+  /// engine's choices (the map then shows the default route).
+  _Route? _routeOfCues(Cues c) {
+    final int rho = widget.core.landmarkRhoChoices
+        .indexWhere((LandmarkRho r) => r.num * c.rhoDen == c.rhoNum * r.den);
+    final int exponent =
+        widget.core.landmarkExponentChoices.indexOf(c.exponent);
+    if (rho < 0 || exponent < 0) return null;
+    return (rho: rho, exponent: exponent, visible: c.visible);
+  }
+
+  /// The maps matching [changed] hold new points, or none ([drop]: their stage
+  /// is gone). Their routes keep ρ and the exponent with every stop shown
+  /// again; their deck cards restart — the schedule was for another point —
+  /// or, with [drop], leave the deck.
+  void _mapsChanged(
+    bool Function(int stage, int slot) changed, {
+    bool drop = false,
+  }) {
+    for (final (int, int) key in _routes.keys.toList()) {
+      if (!changed(key.$1, key.$2)) continue;
+      final _Route r = _routes[key]!;
+      _routes[key] = (rho: r.rho, exponent: r.exponent, visible: null);
+    }
+    final Deck? deck = _deck;
+    if (deck == null) return;
+    Deck next = deck;
+    for (final MemCard c in deck.cards) {
+      if (c.kind != CardKind.point || !changed(c.stageIndex, c.slot)) continue;
+      next = drop
+          ? next.removeMap(c.stageIndex, c.slot)
+          : next.withCard(MemCard.map(c.stageIndex, c.slot,
+              (c.cues ?? _cuesOf(_defaultRoute)).withVisible(null)));
+    }
+    _deck = next;
+  }
+
+  /// Whether stage [stage]'s slot [slot] holds a point the holder placed (not
+  /// a derived share).
+  bool _placed(int stage, int slot) =>
+      _boardPoints[stage][slot] != null && !_boardDerived[stage][slot];
+
+  /// The deck to save: the current one (or a fresh one, a card per placed
+  /// map), every placed map in it, and the session's routes as its cues.
+  Deck _deckForSave(int deepest) {
+    final Cues start = _cuesOf(_defaultRoute);
+    final List<List<int>> placed = <List<int>>[
+      for (int i = 0; i <= deepest; i++)
+        <int>[
+          for (int s = 1; s <= _maxSlot; s++)
+            if (_placed(i, s)) s,
+        ],
+    ];
+    Deck deck = _deck ?? buildDeck(maps: placed, cues: start);
+    for (int i = 0; i <= deepest; i++) {
+      for (final int s in placed[i]) {
+        deck = deck.addMap(i, s, start);
+      }
+    }
+    _routes.forEach(((int, int) key, _Route r) {
+      final MemCard? card = deck.map(key.$1, key.$2);
+      if (card != null) deck = deck.withCard(card.copyWith(cues: _cuesOf(r)));
+    });
+    return deck;
+  }
 
   /// Set [key]'s route. A new ρ or exponent searches again, with every stop
   /// visible; the current path stays drawn until the new one is found.
@@ -2777,6 +2865,9 @@ class _SetupScreenState extends State<SetupScreen> {
       // (o_{i+1}=H*(u_i)), so their advanced o_i / K_i and any placed points no
       // longer decode — drop them; the user re-advances from the settled prefix.
       _invalidateDeeperThan(stage);
+      // This map, and the stage's derived shares, hold new points.
+      _mapsChanged((int st, int sl) =>
+          st == stage && (sl == slot || !_placed(st, sl)));
       // Placing this point (and re-deriving the shares) invalidates the cached
       // island decorations; the canonical view (if any) referred to the old one.
       _boardDecoCache.clear();
@@ -2796,6 +2887,8 @@ class _SetupScreenState extends State<SetupScreen> {
     // just changed, so its checkpoint no longer leads anywhere.
     final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
     if (cp != null && cp.stage > stage) _clearAdvanceCheckpoint();
+    // The deeper stages' maps are gone until re-advanced, to other maps.
+    _mapsChanged((int st, int _) => st > stage, drop: true);
     for (int st = stage + 1; st <= _maxStage; st++) {
       _shareEncodeGen[st]++; // discard any in-flight share-marker encode for st
       for (int s = 1; s <= _maxSlot; s++) {
@@ -2980,6 +3073,8 @@ class _SetupScreenState extends State<SetupScreen> {
     _boardKey = '';
     _boardIslands = const <CanvasIsland>[];
     _boardDecoCache.clear();
+    _mapsChanged((int _, int __) => true);
+    _deck = null;
     _dropPaths();
     _boardCanonicalView = false;
   }
@@ -4288,6 +4383,7 @@ class _SetupScreenState extends State<SetupScreen> {
     final int deepest = _orbitDeepestStage;
     final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
     return OrbitVault(
+      deck: _deckForSave(deepest),
       sigma: _sigmaCtrl.text.trim().replaceAll(RegExp(r'\s'), ''),
       iterations: _iterations,
       profile: _profile,
@@ -4346,6 +4442,7 @@ class _SetupScreenState extends State<SetupScreen> {
       );
       await tmp.writeAsBytes(sealed.fileBytes, flush: true);
       await tmp.rename(path);
+      _deck = vault.deck; // what the file now holds
       return (error: null, key: sealed.key);
     } catch (e) {
       // Best effort: never leave the partial temp behind. It is ciphertext, but
@@ -4458,6 +4555,13 @@ class _SetupScreenState extends State<SetupScreen> {
       // Drop whatever is on the boards now: a restore replaces the orbit, and a
       // leftover placement from another σ would neither decode nor be visible.
       _clearOrbitPlacements();
+      // The saved deck and its maps' routes.
+      _deck = vault.deck;
+      for (final MemCard c in vault.deck?.cards ?? const <MemCard>[]) {
+        final Cues? cues = c.cues;
+        final _Route? route = cues == null ? null : _routeOfCues(cues);
+        if (route != null) _routes[(c.stageIndex, c.slot)] = route;
+      }
       _sigmaCtrl.text = vault.sigma;
       _iterations = vault.iterations;
       _iterationsField.text = '${vault.iterations}';

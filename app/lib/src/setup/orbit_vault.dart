@@ -1,3 +1,6 @@
+import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
+    show Deck;
+
 import '../ffi/core_bindings.dart' show Argon2Profile, kOrbitPointLen;
 
 /// The serializable **orbit provisional key** — everything needed to restore a
@@ -35,6 +38,7 @@ class OrbitVault {
     required this.profile,
     required this.stages,
     this.resume,
+    this.deck,
   });
 
   /// On-disk format version written by this build.
@@ -42,7 +46,8 @@ class OrbitVault {
   /// - **v1** — settled orbit, protocol 0.4.0 (256-bit `o_i`).
   /// - **v2** — adds optional sections: [resume], and the CPNF deck when it
   ///   lands. Still 0.4.0 widths.
-  /// - **v3** — protocol 0.5.0: `o_i` and the resume digest are 512-bit.
+  /// - **v3** — protocol 0.5.0: `o_i` and the resume digest are 512-bit; the
+  ///   optional CPNF [deck] section.
   ///
   /// The file stores `o_i`, so its version must move whenever the orbit's width
   /// or derivation moves. Optional *sections* remain additive within a version —
@@ -83,6 +88,13 @@ class OrbitVault {
   /// instead of restarting it — the orbit peer of [SetupVault]'s `resume`.
   OrbitVaultResume? resume;
 
+  /// The CPNF deck (celestial-peace-nf-core): which maps are memorised, their
+  /// landmark cues and their SM-2 state, saved with the setup under the
+  /// provisional key. Null until the setup is first saved with one. It holds
+  /// no point, coordinate or key — only schedules and cues — but it shows
+  /// which maps are memorised and how well, so it rides inside the encryption.
+  Deck? deck;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
         'v': formatVersion,
         kindKey: kind,
@@ -93,6 +105,7 @@ class OrbitVault {
           for (final OrbitVaultStage s in stages) s.toJson()
         ],
         if (resume != null) 'resume': resume!.toJson(),
+        if (deck != null) 'deck': deck!.toJson(),
       };
 
   /// Rebuild a vault from decoded JSON. Throws a generic [FormatException] on any
@@ -118,6 +131,7 @@ class OrbitVault {
       throw const FormatException('bad vault');
     }
     final Object? rawResume = json['resume'];
+    final Object? rawDeck = json['deck'];
     return OrbitVault(
       sigma: sigma,
       iterations: _int(json, 'iterations'),
@@ -133,6 +147,7 @@ class OrbitVault {
           : OrbitVaultResume.fromJson(rawResume is Map<String, dynamic>
               ? rawResume
               : throw const FormatException('bad vault')),
+      deck: rawDeck == null ? null : _deck(rawDeck),
     );
   }
 
@@ -298,6 +313,16 @@ class OrbitVaultPoint {
 
   @override
   String toString() => 'OrbitVaultPoint(<redacted>)';
+}
+
+/// The deck section, under the vault's own opaque error.
+Deck _deck(Object raw) {
+  if (raw is! Map<String, dynamic>) throw const FormatException('bad vault');
+  try {
+    return Deck.fromJson(raw);
+  } on FormatException {
+    throw const FormatException('bad vault');
+  }
 }
 
 /// Read an int field, throwing a generic [FormatException] (no value echoed) if
