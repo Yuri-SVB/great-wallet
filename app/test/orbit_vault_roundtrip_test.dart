@@ -9,7 +9,6 @@ import 'package:great_wallet_app/src/ffi/core_bindings.dart';
 import 'package:great_wallet_app/src/ffi/library_loader.dart';
 import 'package:great_wallet_app/src/setup/orbit_vault.dart';
 import 'package:great_wallet_app/src/setup/setup_crypto.dart';
-import 'package:great_wallet_app/src/setup/setup_vault.dart';
 
 /// Phase-1 tests for the **settled orbit provisional key**: the encrypted
 /// envelope it rides in, and the capture → seal → open → restore algebra that
@@ -163,24 +162,21 @@ void main() {
     }, timeout: slow);
   });
 
-  group('chain / orbit discrimination', () {
+  group('pre-orbit chain payloads', () {
     // Payload-level, so no Argon2: this is the check `_openVaultFile` makes
-    // after decrypting, and both directions must fail rather than misread.
-    test('an orbit payload does not load as a legacy chain vault', () {
-      expect(() => SetupVault.fromJson(envelopeVault().toJson()),
-          throwsFormatException);
-    });
-
-    test('a legacy chain payload does not load as an orbit vault', () {
-      final SetupVault chain = SetupVault(
-        text: 'SALT-1',
-        iterations: 7,
-        profile: Argon2Profile.basic,
-        stages: <VaultStage>[
-          VaultStage(o: 1, p: 2, q: 3, reRaw: 4, imRaw: 5),
+    // after decrypting. A chain setup (no `kind`) must fail, not be misread.
+    test('a chain payload does not load as an orbit vault', () {
+      final Map<String, dynamic> chain = <String, dynamic>{
+        'v': 1,
+        'text': 'SALT-1',
+        'iterations': 7,
+        'profile': Argon2Profile.basic.value,
+        'stages': <Map<String, dynamic>>[
+          <String, dynamic>{'o': 1, 'p': 2, 'q': 3, 'reRaw': 4, 'imRaw': 5},
         ],
-      );
-      expect(() => OrbitVault.fromJson(chain.toJson()), throwsFormatException);
+      };
+      expect(chain.containsKey(OrbitVault.kindKey), isFalse);
+      expect(() => OrbitVault.fromJson(chain), throwsFormatException);
     });
   });
 

@@ -30,18 +30,16 @@ import '../ffi/core_bindings.dart';
 import '../ffi/fixed.dart';
 import 'desktop_qr_scanner.dart';
 import 'orbit_vault.dart';
-import 'setup_controller.dart';
 import 'setup_crypto.dart';
-import 'setup_vault.dart';
 
-/// Setup mode screen: encode a fresh seed onto the chained fractals (one
-/// 32-bit point per stage) and let the user memorise the points.
+/// Setup mode screen: build an orbit setup — place points on each stage's
+/// maps, advance between stages, and memorise them.
 ///
 /// This is the concrete `great-wall-core + great-wall-ux` integration the
 /// architecture assigns to Setup (ARCHITECTURE.md §"7. great-wallet", mode 1):
-/// great-wall-ux's [FractalCanvas] / palette / brightness drive the visuals,
-/// while a [SetupController] runs the engine's encode/Argon2 pipeline and feeds
-/// the canvas its [EscapeCountSource] and overlays.
+/// great-wall-ux's [FractalCanvas] / palette / brightness drive the visuals of
+/// the orbit's maps, the engine encodes their points, and a worker isolate runs
+/// the memory-hard advance between stages.
 class SetupScreen extends StatefulWidget {
   const SetupScreen({super.key, required this.core});
 
@@ -53,8 +51,6 @@ class SetupScreen extends StatefulWidget {
 
 class _SetupScreenState extends State<SetupScreen>
     with TickerProviderStateMixin {
-  late final SetupController _setup = SetupController(widget.core);
-
   final PanZoomController _viewport =
       PanZoomController(initial: _initialViewport);
   final BrightnessController _brightness = BrightnessController();
@@ -68,26 +64,18 @@ class _SetupScreenState extends State<SetupScreen>
   /// laggy (hence the persistent on-canvas marker).
   bool _deepRender = false;
 
-  /// The displayed stage last seen, so deep render can snap back to fast when
-  /// the view moves to a new stage (mirrors the per-stage brightness reset).
-  int _shownStage = 0;
-
   /// UI sound cues. The canvas plays the tap "click"; the selection-outcome
-  /// cues (select / confirm / deny) are dispatched from [_onCanvasSelect],
-  /// where the decode result is known.
+  /// cues (select / confirm / deny) are dispatched where the result is known.
   final SoundBoard _sounds = SoundBoard();
 
   /// Focus node for the canvas/hotkey handler, so we can return keyboard focus
   /// to it after the user has been typing in a text field.
   final FocusNode _hotkeys = FocusNode(debugLabel: 'setup-hotkeys');
 
-  // Focus nodes for the input controls. N/I/R focus the stages slider / import
-  // field; C focuses the colour wheel; the rest are reached with Tab. Each field
+  // Focus nodes for the input controls, brought up from the board. Each field
   // is wrapped in _track(_Field…) so focus also drives the console help.
   final FocusNode _iterationsFocus = FocusNode(debugLabel: 'iterations');
-  final FocusNode _stagesFocus = FocusNode(debugLabel: 'stages');
   final FocusNode _profileFocus = FocusNode(debugLabel: 'profile');
-  final FocusNode _mnemonicFocus = FocusNode(debugLabel: 'import');
   final FocusNode _exportLabelFocus = FocusNode(debugLabel: 'export-label');
   final FocusNode _hueFocus = FocusNode(debugLabel: 'hue');
 
@@ -118,9 +106,6 @@ class _SetupScreenState extends State<SetupScreen>
   /// material, hidden by default.
   bool _importHidden = true;
 
-  /// Whether the legacy chain's stage-0 text is obscured.
-  bool _stage0Hidden = true;
-
   HueOffset _hue = HueOffset.red;
   Argon2Profile _profile = Argon2Profile.basic;
   /// N — the per-stage **Argon2 iteration count**, entered as a free number.
@@ -136,48 +121,17 @@ class _SetupScreenState extends State<SetupScreen>
     return n != null && n >= 0;
   }
 
-  /// Number of fractal **point stages** for a fresh/recall setup, chosen on a
-  /// discrete slider with five positions, 0..[SetupController.maxPointStages].
-  /// 0 is a Stage-0-text-only setup (no fractal points); each higher position
-  /// adds one 32-bit fractal stage (`32 × count` bits / `3 × count` BIP39
-  /// words). Every position is a valid setup, so the count needs no validity
-  /// gate. (N is reserved for the Argon2 iteration count, below.)
-  ///
-  /// The stages slider that set this was removed with the deprecated legacy
-  /// chain; the value is now fixed and only feeds the Argon2 calibration
-  /// estimate.
-  final int _pointStages = 4;
-
-  /// Select mode: when on, tapping the canvas decodes the point under the
-  /// cursor instead of panning. Toggled by the panel button or the `S` key.
-  bool _selectMode = false;
+  /// The number of deep stages the Argon2 calibration estimates for: all of
+  /// them, [OrbitProtocol.maxStage].
+  final int _pointStages = OrbitProtocol.maxStage;
 
   /// True while the user is picking a replacement point for the displayed stage
   /// (the `R` edit): the next canvas click sets the new point. Esc cancels.
   bool _editPointMode = false;
 
-  /// The stage whose point is being replaced by import (the `I` edit), or null
-  /// when the inline bit editor is closed.
-  int? _pointImportStage;
   _ImportFormat _pointImportFmt = _ImportFormat.dice;
   final TextEditingController _pointImport = TextEditingController();
   final FocusNode _pointImportFocus = FocusNode(debugLabel: 'point-import');
-
-  /// The point-stage count a pending expansion would grow to, while the method
-  /// picker (New / Import / Manual) is open in the console. Null otherwise.
-  int? _expandTarget;
-
-  /// The point-stage count an in-progress import expansion will reach, while its
-  /// inline m-point bit editor is open. Reuses the [_pointImport] field/focus
-  /// (the two import editors are mutually exclusive). Null otherwise.
-  int? _expandImportTarget;
-
-  /// True during a **manual** expansion (the R method): the new stages derive
-  /// one at a time and the user clicks each point on its fresh fractal. Canvas
-  /// selection is enabled while this is on; [_expandManualTarget] is the
-  /// point-stage count the walk grows to.
-  bool _expandManualActive = false;
-  int? _expandManualTarget;
 
   /// Provisional-key save/load: the destination/source file path. The
   /// provisional key itself is never kept in a screen field — it is entered,
@@ -187,19 +141,13 @@ class _SetupScreenState extends State<SetupScreen>
   final FocusNode _vaultPathFocus = FocusNode(debugLabel: 'vault-path');
   bool _vaultBusy = false;
 
-  /// True while a master-secret export's Argon2id pass is in flight, so a second
-  /// tap on "Copy master secret" is ignored until it finishes.
-  bool _exporting = false;
-
   /// True while the memory-hard orbit advance `o_{i+1} = H*(u_i)` is running in a
   /// worker isolate (a forward stage navigation). Folds into [_busy] so the
   /// progress scrim shows and other hotkeys/navigation are blocked meanwhile.
   bool _advancing = false;
 
-  /// The stage the advance in flight is deriving *into*, or null. Screen-owned,
-  /// because the orbit never goes through [SetupController] — which is exactly
-  /// why the stage bar could not show this before: it reads the controller's
-  /// `derivingStageIndex` / `stageProgress`, and an orbit advance sets neither.
+  /// The stage the advance in flight is deriving *into*, or null: its stage
+  /// tab fills as the passes complete.
   int? _advanceTarget;
 
   /// Completed / total memory-hard passes of the advance in flight, streamed
@@ -219,7 +167,7 @@ class _SetupScreenState extends State<SetupScreen>
   /// A **halted** advance's preserved work: the stage it was deriving into, the
   /// passes completed, and the intermediary digest after them. Kept so Halt
   /// costs one pass rather than the whole stage, saved into the vault, and
-  /// restored from it — the orbit peer of `SetupController`'s `_halted`.
+  /// restored from it.
   ///
   /// Dropped whenever it could no longer apply: a successful advance, a
   /// re-rooted prefix ([_invalidateDeeperThan] / [_clearOrbitPlacements]), or a
@@ -302,11 +250,9 @@ class _SetupScreenState extends State<SetupScreen>
   /// digit key.
   static const int _maxSlot = 9;
 
-  /// The **orbit** stage cursor (`0..`[_maxStage]) — the screen-owned active
-  /// stage while building the orbit pre-session. Stage 0 is rooted by σ; a deep
-  /// stage is entered by the forward memory-hard advance `o_i = H*(u_{i-1})`.
-  /// (During a legacy chain session the active stage instead follows the
-  /// controller's `displayStageIndex`; see [_activeStage].)
+  /// The **orbit** stage cursor (`0..`[_maxStage]). Stage 0 is rooted by σ; a
+  /// deep stage is entered by the forward memory-hard advance
+  /// `o_i = H*(u_{i-1})`.
   int _orbitStage = 0;
 
   // --- salt slot (`#0`) — Namtso σ harvest (stage 0) / retirement (stage i>0).
@@ -330,12 +276,9 @@ class _SetupScreenState extends State<SetupScreen>
   static int _requiredOf(int stage) =>
       stage == 0 ? _rootRequired : _deepRequired;
 
-  /// The stage whose slots/`r_i` the secondary row currently reflects. In a
-  /// legacy chain session it follows the controller's `displayStageIndex`; while
-  /// building the orbit (pre-session) it is the screen-owned [_orbitStage].
-  int get _activeStage =>
-      (_hasSession ? _setup.displayStageIndex : _orbitStage)
-          .clamp(0, _maxStage);
+  /// The stage whose slots/`r_i` the secondary row reflects: the orbit
+  /// stage cursor.
+  int get _activeStage => _orbitStage.clamp(0, _maxStage);
 
   // --- P5: stage-0 orbit board render cache ---------------------------------
   // Stage 0's fractal slots (#j≥1) render the real board `θ_0_(j-1)` derived
@@ -343,16 +286,14 @@ class _SetupScreenState extends State<SetupScreen>
   // (stage_params.dart); [_boardParams] is the display-proxy the canvas uses
   // only to trigger repaints. Both are cached, keyed by [_boardKey] = "σ#slot",
   // so panning/zooming (which rebuilds this screen) does not re-run the θ hash
-  // or force a needless canvas repaint. Only ever populated at stage 0, where
-  // the legacy controller leaves the render reservoirs free (stage 0 is its
-  // text stage) — so there is no clash with the deep-stage `_applyReservoirs`.
+  // or force a needless canvas repaint.
   StageParameters? _boardParams;
   StageReservoirs? _boardReservoirs;
   String _boardKey = '';
 
   // --- P5: per-stage orbit board state --------------------------------------
-  // Highest orbit stage index (mirrors the legacy stage ceiling).
-  static const int _maxStage = SetupController.maxPointStages;
+  // Highest orbit stage index.
+  static const int _maxStage = OrbitProtocol.maxStage;
 
   // Per orbit stage i (0..[_maxStage]) and fractal slot (1..[_maxSlot]): the
   // placed 32-bit chunk and its encoded board point. Every slot is equal: the
@@ -393,9 +334,8 @@ class _SetupScreenState extends State<SetupScreen>
   /// The active stage's master secret `K_i`, or null until `r_i` fractals are placed.
   Uint8List? get _activeK => _orbitK[_activeStage];
 
-  /// The stage-0 slot whose point is being imported inline, or null. Reuses the
-  /// legacy point-import editor ([_importEditorBody] / [_pointImport]) — one
-  /// import surface, mutually exclusive with the chain import.
+  /// The slot whose point is being imported inline ([_importEditorBody] /
+  /// [_pointImport]), or null.
   int? _boardImportSlot;
 
   /// Canonical islands enumerated under the current view (the `E` reveal) on the
@@ -460,11 +400,8 @@ class _SetupScreenState extends State<SetupScreen>
   /// elongated island still fits fully on screen (overflow guard).
   static const double _kCanonicalLargeEdgeCap = 0.9;
 
-  /// True at an orbit-board fractal slot (`#j≥1`). While building the orbit
-  /// (pre-session) every stage's fractal slots are boards; during a legacy chain
-  /// session only stage 0's are (deep session stages ride the chain canvas).
-  bool get _isBoardSlot =>
-      _slotIndex >= 1 && (!_hasSession || _activeStage == 0);
+  /// True at an orbit-board fractal slot (`#j≥1`).
+  bool get _isBoardSlot => _slotIndex >= 1;
 
   /// True when the current board slot still takes a point — i.e. it is not a
   /// derived (auto-computed) share. All fractals at a stage are operationally
@@ -481,7 +418,6 @@ class _SetupScreenState extends State<SetupScreen>
   @override
   void initState() {
     super.initState();
-    _setup.addListener(_onSetupChanged);
     // Drive the board's cross↔square switch as the view zooms (the screen does
     // not otherwise rebuild on pan/zoom).
     _viewport.addListener(_onBoardViewportChanged);
@@ -502,126 +438,15 @@ class _SetupScreenState extends State<SetupScreen>
         : 'Auto brightness off.');
   }
 
-  void _onSetupChanged() {
-    if (!mounted) return;
-    // Snap deep render back to fast when the view moves to a new stage — it is a
-    // per-view escalation, not a sticky preference (mirrors the brightness
-    // per-stage reset).
-    if (_setup.displayStageIndex != _shownStage) {
-      _shownStage = _setup.displayStageIndex;
-      _deepRender = false;
-      _editPointMode = false; // cancel an armed point edit if the view moved
-      if (_pointImportStage != null) {
-        _pointImport.clear();
-        _pointImportStage = null;
-      }
-      // A moved view also dismisses an open expansion picker / import editor.
-      _expandTarget = null;
-      if (_expandImportTarget != null) {
-        _pointImport.clear();
-        _expandImportTarget = null;
-      }
-    }
-    _updateEta();
-    setState(() {});
-  }
-
-  // --- Derivation ETA estimate ------------------------------------------------
-  // Timed off the controller's per-pass notifications: every point stage runs
-  // the same N passes at ~the same cost, so a running average of completed-pass
-  // durations projects both "this stage" and "to the last stage" honestly.
-
-  final Stopwatch _passWatch = Stopwatch();
-  int _etaStage = 0; // stage the watch is timing (0 = none)
-  int _etaPass0 = 0; // argon2Done when the watch started
-  int _etaLastDone = 0; // argon2Done at the last completed pass
-  int _etaLastMs = 0; // watch elapsed at that pass (avg is over completed passes)
-
-  /// Refresh the pass-timing watch from the controller's current state. Resets
-  /// when the deriving stage changes; records a timestamp when a pass completes.
-  void _updateEta() {
-    final int? ds = _setup.derivingStageIndex;
-    if (ds == null) {
-      if (_passWatch.isRunning) _passWatch.stop();
-      _passWatch.reset();
-      _etaStage = 0;
-      return;
-    }
-    if (ds != _etaStage) {
-      _etaStage = ds;
-      _etaPass0 = _setup.argon2Done;
-      _etaLastDone = _setup.argon2Done;
-      _etaLastMs = 0;
-      _passWatch
-        ..reset()
-        ..start();
-    } else if (_setup.argon2Done > _etaLastDone) {
-      _etaLastDone = _setup.argon2Done;
-      _etaLastMs = _passWatch.elapsedMilliseconds;
-    }
-  }
-
-  /// Average completed-pass duration in ms, or null until a pass has completed
-  /// since timing began ("estimating…").
-  double? _avgPassMs() {
-    final int passes = _etaLastDone - _etaPass0;
-    if (passes <= 0 || _etaLastMs <= 0) return null;
-    return _etaLastMs / passes;
-  }
-
-  /// Estimated time left on the deriving stage.
-  Duration? _stageEta() {
-    final double? avg = _avgPassMs();
-    if (avg == null) return null;
-    final int remaining =
-        (_setup.argon2Total - _setup.argon2Done).clamp(0, _setup.argon2Total);
-    return Duration(milliseconds: (remaining * avg).round());
-  }
-
-  /// Estimated time left until the batch's last stage finishes.
-  Duration? _totalEta() {
-    final double? avg = _avgPassMs();
-    final Duration? stage = _stageEta();
-    final int? ds = _setup.derivingStageIndex;
-    if (avg == null || stage == null || ds == null) return null;
-    final int last = _setup.nStages - 1;
-    final int fullAfter = (last - ds).clamp(0, last);
-    return stage +
-        Duration(milliseconds: (fullAfter * _setup.argon2Total * avg).round());
-  }
-
-  /// Estimated time until stage [k] finishes (null if it is already done or
-  /// not yet estimable).
-  Duration? _etaToStage(int k) {
-    final int? ds = _setup.derivingStageIndex;
-    final double? avg = _avgPassMs();
-    final Duration? stage = _stageEta();
-    if (ds == null || avg == null || stage == null || k < ds) return null;
-    final Duration fullStage =
-        Duration(milliseconds: (_setup.argon2Total * avg).round());
-    return stage + fullStage * (k - ds);
-  }
-
-  /// Compact duration: `4h 50m` / `33m 12s` / `45s`.
-  String _fmtEta(Duration d) {
-    if (d.inHours >= 1) return '${d.inHours}h ${d.inMinutes % 60}m';
-    if (d.inMinutes >= 1) return '${d.inMinutes}m ${d.inSeconds % 60}s';
-    return '${d.inSeconds}s';
-  }
-
   /// Show [text] in the log in place of its lines (a board button or a tab
   /// under the pointer or focus), or restore them (null).
   void _explain(String? text) {
     if (text != _explaining) setState(() => _explaining = text);
   }
 
-  /// A stage tab's explanation: what the stage holds and how far it is, plus
-  /// its ETA while it derives.
+  /// A stage tab's explanation: what the stage holds and how far it is.
   String _stageExplanation(int i) {
     final String head = 'Stage $i (Alt+$i).';
-    final Duration? eta = _etaToStage(i);
-    final String tail = eta == null ? '' : ' ETA ~${_fmtEta(eta)}.';
-    if (_hasSession) return '$head$tail';
     final String state;
     if (_advanceTarget == i) {
       state = 'Advancing into it (memory-hard).';
@@ -637,7 +462,7 @@ class _SetupScreenState extends State<SetupScreen>
     } else {
       state = 'Not reached.';
     }
-    return '$head $state$tail';
+    return '$head $state';
   }
 
   /// A slot tab's explanation at the active stage: the slot's role, its
@@ -651,7 +476,6 @@ class _SetupScreenState extends State<SetupScreen>
           : 'Slot 0 — retirement: burying o_$stage on-chain retires the '
               'shallower stages. Coming soon.';
     }
-    if (_hasSession) return 'Slot $slot — fractal.';
     final int r = _requiredOf(stage);
     final bool derived = _boardDerived[stage][slot];
     final bool placed = _boardPoints[stage][slot] != null;
@@ -695,52 +519,6 @@ class _SetupScreenState extends State<SetupScreen>
     return '$head $body $press$complete';
   }
 
-  /// One-line derivation status for the console, or null when nothing derives.
-  String? _derivationStatus() {
-    final int? ds = _setup.derivingStageIndex;
-    if (ds == null) return null;
-    final Duration? t = _totalEta();
-    final String eta = t == null ? 'estimating…' : '~${_fmtEta(t)} left';
-    final int last = _setup.nStages - 1;
-    return 'Deriving Stage $ds/$last — pass ${_setup.argon2Done}/'
-        '${_setup.argon2Total} · $eta';
-  }
-
-  /// The two-line derivation block for the expanded console: the live pass and
-  /// the stage / batch ETAs.
-  Widget _derivationBlock() {
-    final int? ds = _setup.derivingStageIndex;
-    final int last = _setup.nStages - 1;
-    final Duration? s = _stageEta();
-    final Duration? t = _totalEta();
-    final String line2 = (s == null || t == null)
-        ? 'estimating…'
-        : '~${_fmtEta(s)} to this stage · ~${_fmtEta(t)} to Stage $last';
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        Row(
-          children: <Widget>[
-            const Icon(Icons.hourglass_top, size: 14),
-            const SizedBox(width: 6),
-            Expanded(
-              child: Text(
-                'Deriving Stage $ds/$last — pass ${_setup.argon2Done}/'
-                '${_setup.argon2Total}',
-                style: _termStyle.copyWith(
-                    color: _kConsoleAccent, fontWeight: FontWeight.bold),
-              ),
-            ),
-          ],
-        ),
-        Padding(
-          padding: const EdgeInsets.only(left: 20),
-          child: Text(line2),
-        ),
-      ],
-    );
-  }
-
   @override
   void dispose() {
     _stopFlight();
@@ -759,8 +537,6 @@ class _SetupScreenState extends State<SetupScreen>
     _clearOrbitPlacements();
     _sigmaCtrl.dispose();
     _explorerCtrl.dispose();
-    _setup.removeListener(_onSetupChanged);
-    _setup.dispose();
     _viewport.removeListener(_onBoardViewportChanged);
     _viewport.dispose();
     _brightness.removeListener(_onBrightnessChanged);
@@ -774,18 +550,13 @@ class _SetupScreenState extends State<SetupScreen>
     _vaultPathFocus.dispose();
     _hotkeys.dispose();
     _iterationsFocus.dispose();
-    _stagesFocus.dispose();
     _profileFocus.dispose();
-    _mnemonicFocus.dispose();
     _exportLabelFocus.dispose();
     _hueFocus.dispose();
     super.dispose();
   }
 
-  bool get _busy =>
-      _advancing ||
-      _setup.phase == SetupPhase.encoding ||
-      _setup.phase == SetupPhase.deriving;
+  bool get _busy => _advancing;
 
   /// Whether in-app webcam QR scanning is available — only on the platforms
   /// `mobile_scanner` implements (Android / iOS / macOS). Linux/Windows hide the
@@ -803,14 +574,6 @@ class _SetupScreenState extends State<SetupScreen>
       !kIsWeb &&
       (defaultTargetPlatform == TargetPlatform.linux ||
           defaultTargetPlatform == TargetPlatform.windows);
-
-  /// Whether a setup session is live (stages exist to navigate / focus): not the
-  /// initial config screen, an error, or a finished/wiped session.
-  bool get _hasSession =>
-      _setup.phase == SetupPhase.encoding ||
-      _setup.phase == SetupPhase.deriving ||
-      _setup.phase == SetupPhase.memorise ||
-      _setup.phase == SetupPhase.recallComplete;
 
   /// Bring up input field [f] in the current context's pane and focus it by
   /// its [node]. If the field is not shown in the current mode, say so in the
@@ -864,19 +627,12 @@ class _SetupScreenState extends State<SetupScreen>
   /// Return keyboard focus to the fractal viewer (and so out of any text field),
   /// re-enabling the single-key hotkeys. The non-directional counterpart to Tab.
   void _focusViewer() {
-    // Esc also cancels an armed manual point edit and any open expansion picker
-    // or import editor.
+    // Esc also cancels an armed manual point edit and an open import editor.
     if (_editPointMode) setState(() => _editPointMode = false);
     if (_boardImportSlot != null) {
       _pointImport.clear();
       setState(() => _boardImportSlot = null);
     }
-    if (_expandTarget != null) setState(() => _expandTarget = null);
-    if (_expandImportTarget != null) {
-      _pointImport.clear();
-      setState(() => _expandImportTarget = null);
-    }
-    if (_expandManualActive) _endManualExpand();
     _hotkeys.requestFocus();
   }
 
@@ -925,29 +681,14 @@ class _SetupScreenState extends State<SetupScreen>
                       children: <Widget>[
                         // Slot #0 is the salt (Namtso σ at stage 0; retirement
                         // placeholder at stage i>0). Fractal slots (#j≥1) render
-                        // the real orbit board θ_i_(j-1) whenever the board flow
-                        // is active ([_isBoardSlot] — every stage pre-session,
-                        // stage 0 during a legacy session); a legacy session's
-                        // deep stages fall through to the chain canvas.
+                        // the real orbit board θ_i_(j-1).
                         Positioned.fill(
                           child: _slotIndex == 0
                               ? _saltSlotPanel()
-                              : (_isBoardSlot
-                                  ? _orbitBoardPanel(_slotIndex)
-                                  : (_setup.isTextStage
-                                      ? _textStagePanel()
-                                      : _canvas())),
+                              : _orbitBoardPanel(_slotIndex),
                         ),
                         if (_busy) Positioned.fill(child: _progressOverlay()),
-                        if (_selectMode && !_setup.isTextStage)
-                          Positioned(
-                            top: 56,
-                            left: 12,
-                            child: _Badge(_expandManualActive
-                                ? 'Add stage — click your point'
-                                : 'Recall — click your point'),
-                          ),
-                        if (_editPointMode && (!_setup.isTextStage || _isBoardSlot))
+                        if (_editPointMode && _isBoardSlot)
                           const Positioned(
                             top: 56,
                             left: 12,
@@ -955,7 +696,7 @@ class _SetupScreenState extends State<SetupScreen>
                           ),
                         // Deep render reminder: explains the lag while the high
                         // escape-count cap is active, and how to turn it off.
-                        if (_deepRender && !_setup.isTextStage)
+                        if (_deepRender && _isBoardSlot)
                           Positioned(
                             top: 56,
                             right: 12,
@@ -1002,13 +743,6 @@ class _SetupScreenState extends State<SetupScreen>
     );
   }
 
-  /// The upper-edge stage tabs: a **fixed** bar of five numbered tabs (0..4,
-  /// the protocol ceiling) spanning the fractal-view width. Stage 0 is the
-  /// salt/pepper text; 1..N-1 are the chain-derived fractals. The stage under
-  /// focus is highlighted; tabs that are not currently reachable — outside this
-  /// setup's stage count, not yet derived, or before any session — stay visible
-  /// but greyed out and inert. Tapping a reachable tab focuses it (the same as
-  /// pressing its number key).
   /// Select a **secondary slot** within the active stage (the lower tab row).
   /// Out-of-range digits give the usual blocked cue. Content per slot is wired
   /// in later phases; for now this just moves the selection.
@@ -1277,20 +1011,15 @@ class _SetupScreenState extends State<SetupScreen>
     );
   }
 
+  /// The upper-edge stage tabs: a **fixed** bar of five numbered tabs
+  /// (0..[_maxStage]) spanning the view's width. Stage 0 is rooted by σ; the
+  /// deeper ones are entered by the memory-hard advance. The stage under focus
+  /// is lit; stages not reached yet stay visible as ghosts.
   Widget _stageTabs() {
-    const int maxTab = SetupController.maxPointStages; // 0..4 → five fixed tabs
-    final bool session = _hasSession;
-    // Orbit build (pre-session): the cursor is [_orbitStage]; a stage is
-    // reachable up to the derived ceiling, and the next stage is tappable to
-    // advance into it.
-    final int ceiling = session ? 0 : _orbitReachableCeiling;
-    final int current = session ? _setup.displayStageIndex : _orbitStage;
-    // A legacy chain session reads its derivation state off the controller; an
-    // orbit advance is screen-owned, so the stage bar takes it from
-    // [_advanceTarget] / [_advanceProgress]. Only one can be live at a time.
-    final int? deriving = _advanceTarget ?? _setup.derivingStageIndex;
-    final double progress =
-        _advanceTarget != null ? _advanceProgress : _setup.stageProgress;
+    // The cursor is [_orbitStage]; a stage is reachable up to the derived
+    // ceiling, and the next stage is tappable to advance into it. The advance
+    // in flight fills its tab ([_advanceTarget] / [_advanceProgress]).
+    final int ceiling = _orbitReachableCeiling;
     // Transparent so the tabs hover over the fractal (no opaque bar).
     return Material(
       type: MaterialType.transparency,
@@ -1301,40 +1030,22 @@ class _SetupScreenState extends State<SetupScreen>
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: <Widget>[
-              for (int i = 0; i <= maxTab; i++)
+              for (int i = 0; i <= _maxStage; i++)
                 Expanded(
                   child: Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 3),
                     child: _StageTab(
                       index: i,
-                      // In the (possibly slider-previewed) setup, so it shows as
-                      // a real box rather than an out-of-setup ghost slot. In the
-                      // orbit build the derived stages plus the next (advanceable)
-                      // one are the setup so far.
-                      inSetup:
-                          session ? i < _setup.nStages : i <= ceiling + 1,
-                      selected: i == current,
-                      available: session
-                          ? _setup.isStageAvailable(i)
-                          : i <= ceiling,
-                      deriving: deriving == i,
-                      progress: progress,
+                      // The derived stages plus the next (advanceable) one are
+                      // the setup so far; the rest show as ghost slots.
+                      inSetup: i <= ceiling + 1,
+                      selected: i == _orbitStage,
+                      available: i <= ceiling,
+                      deriving: _advanceTarget == i,
+                      progress: _advanceProgress,
                       explanation: _stageExplanation(i),
                       onExplain: _explain,
-                      // Tappable for a stage in the active setup; a ghost slot
-                      // beyond it is tappable too when the setup can grow, to
-                      // start an expansion up to that slot. In the orbit build the
-                      // reachable stages and the next (advanceable) one are
-                      // tappable via [_selectStage] → [_selectOrbitStage].
-                      onTap: session
-                          ? ((i < _setup.nStages)
-                              ? () => _selectStage(i)
-                              : (_setup.canExpand &&
-                                      i >= _setup.nStages &&
-                                      i <= SetupController.maxPointStages)
-                                  ? () => _beginExpand(i)
-                                  : null)
-                          : (i <= ceiling + 1 ? () => _selectStage(i) : null),
+                      onTap: i <= ceiling + 1 ? () => _selectStage(i) : null,
                     ),
                   ),
                 ),
@@ -1488,7 +1199,7 @@ class _SetupScreenState extends State<SetupScreen>
               '(a QR, a password manager or your own key): a crutch for the '
               'memorisation window, deleted at graduation.',
           icon: Icons.save,
-          enabled: _vaultPanelShown && !_vaultBusy,
+          enabled: !_vaultBusy,
           run: _writeSetup,
         );
       case _Cmd.open:
@@ -1497,7 +1208,7 @@ class _SetupScreenState extends State<SetupScreen>
           help: 'Opens an encrypted setup file with its provisional key (scan '
               'the QR or type the key).',
           icon: Icons.folder_open,
-          enabled: _vaultPanelShown && !_vaultBusy,
+          enabled: !_vaultBusy,
           run: _openSetup,
         );
       case _Cmd.templates:
@@ -1506,7 +1217,7 @@ class _SetupScreenState extends State<SetupScreen>
           help: 'Saves the 128- and 256-bit QR skeletons, to print and colour '
               'in by hand with the key.',
           icon: Icons.qr_code_2,
-          enabled: _vaultPanelShown && !_vaultBusy,
+          enabled: !_vaultBusy,
           run: _exportBlankTemplate,
         );
       case _Cmd.volumeDown:
@@ -1523,10 +1234,9 @@ class _SetupScreenState extends State<SetupScreen>
       case _Cmd.secrets:
         return BoardCommand(
           name: 'Show or hide secrets',
-          help: 'Reveals or hides the sensitive text fields — the salt and the '
-              'imported dice rolls or hex — together.',
+          help: 'Reveals or hides the imported dice rolls or hex.',
           icon: Icons.visibility,
-          active: !_stage0Hidden && !_importHidden,
+          active: !_importHidden,
           run: _toggleSensitiveVisibility,
         );
       case _Cmd.filePath:
@@ -1534,14 +1244,15 @@ class _SetupScreenState extends State<SetupScreen>
           name: 'File path',
           help: 'Shows the setup file path, where save and open look.',
           icon: Icons.description,
-          enabled: _vaultPanelShown,
           run: _focusVaultPath,
         );
       case _Cmd.reset:
         return BoardCommand(
           name: 'Reset',
-          help: 'Clears the setup, after asking.',
+          help: 'Clears the setup — σ, every point and stage — after asking. '
+              'Not while an advance runs: halt it first.',
           icon: Icons.restart_alt,
+          enabled: !_busy,
           run: _confirmReset,
         );
       case _Cmd.label:
@@ -1581,9 +1292,7 @@ class _SetupScreenState extends State<SetupScreen>
       case _Cmd.dice:
       case _Cmd.importHex:
       case _Cmd.placeByClick:
-        final bool editable = _expandTarget != null ||
-            _placeableBoardSlot ||
-            _setup.canEditCurrentPoint;
+        final bool editable = _placeableBoardSlot;
         return switch (c) {
           _Cmd.newPoint => BoardCommand(
               name: 'System random',
@@ -1608,31 +1317,15 @@ class _SetupScreenState extends State<SetupScreen>
                   ? null
                   : (Color colour) => D20Glyph(colour: colour),
               enabled: editable,
-              run: () {
-                final bool hex = c == _Cmd.importHex;
-                if (_expandTarget != null) {
-                  _expandImport(hex: hex);
-                } else if (_placeableBoardSlot) {
-                  _beginBoardImport(_slotIndex, hex: hex);
-                } else if (_setup.canEditCurrentPoint) {
-                  _changePointImport(hex: hex);
-                }
-              },
+              run: () =>
+                  _beginBoardImport(_slotIndex, hex: c == _Cmd.importHex),
             ),
           _ => BoardCommand(
               name: 'Place by click',
               help: 'Arms a click: your next click on the map places its point.',
               icon: Icons.ads_click,
               enabled: editable,
-              run: () {
-                if (_expandTarget != null) {
-                  _expandManual();
-                } else if (_placeableBoardSlot) {
-                  _armBoardManual();
-                } else if (_setup.canEditCurrentPoint) {
-                  _changePointManual();
-                }
-              },
+              run: _armBoardManual,
             ),
         };
       case _Cmd.exclude:
@@ -1640,11 +1333,11 @@ class _SetupScreenState extends State<SetupScreen>
           name: 'Exclude stage',
           help: 'Drops this stage and every deeper one, after asking.',
           icon: Icons.content_cut,
-          run: () => _hasSession ? _truncate() : _truncateOrbit(),
+          run: _truncateOrbit,
         );
       case _Cmd.halt:
         // Halt while something derives; Resume while an advance is halted.
-        final bool resume = !_busy && !_setup.isGenerating && _canResumeAdvance;
+        final bool resume = !_busy && _canResumeAdvance;
         return BoardCommand(
           name: resume ? 'Resume' : 'Halt',
           help: resume
@@ -1653,7 +1346,7 @@ class _SetupScreenState extends State<SetupScreen>
               : 'Halts the running derivation, after asking; the passes done '
                   'are kept, and this key then resumes.',
           icon: resume ? Icons.play_arrow : Icons.pause,
-          enabled: resume || _busy || _setup.isGenerating,
+          enabled: resume || _busy,
           run: resume
               ? () {
                   _sounds.play(UiSound.select);
@@ -1775,9 +1468,8 @@ class _SetupScreenState extends State<SetupScreen>
           help: 'Highlights the canonical islands in view (zoom in if there are '
               'too many).',
           icon: Icons.diamond,
-          enabled: !_busy,
-          run: () => unawaited(
-              _isBoardSlot ? _boardEnumerateIslands() : _enumerateIslands()),
+          enabled: !_busy && _isBoardSlot,
+          run: () => unawaited(_boardEnumerateIslands()),
         );
       case _Cmd.deepRender:
         return BoardCommand(
@@ -1833,16 +1525,11 @@ class _SetupScreenState extends State<SetupScreen>
     }
   }
 
-  /// Reveal or hide the obscured sensitive text fields (the salt/pepper and the
-  /// import rolls/hex) together: if any is hidden, reveal all; if all are
-  /// shown, hide all (Main board).
+  /// Reveal or hide the imported dice rolls or hex (Main board).
   void _toggleSensitiveVisibility() {
-    final bool reveal = _stage0Hidden || _importHidden;
+    final bool reveal = _importHidden;
     _sounds.play(UiSound.click);
-    setState(() {
-      _stage0Hidden = !reveal;
-      _importHidden = !reveal;
-    });
+    setState(() => _importHidden = !reveal);
     _toast(reveal ? 'Sensitive text revealed.' : 'Sensitive text hidden.');
   }
 
@@ -2288,88 +1975,13 @@ class _SetupScreenState extends State<SetupScreen>
   static const double _kRouteLabelWidth = 72;
   static const double _kRouteThumbReach = 14;
 
-  /// Select stage [index]: focus it if it is already available (Stage 0, or a
-  /// fractal already derived), or — if it is the first not-yet-derived stage —
-  /// trigger that stage's derivation. Anything else (out of range, or a gap
-  /// beyond the next stage) sounds a deny cue and explains why.
+  /// Select stage [index] (its tab or Alt+digit), unless an advance runs.
   void _selectStage(int index) {
     if (_busy) {
       _sounds.play(UiSound.denyBlocked);
       return;
     }
-    // Building the orbit (no legacy session): the screen owns the stage cursor.
-    if (!_hasSession) {
-      _selectOrbitStage(index);
-      return;
-    }
-    if (index == _setup.displayStageIndex) {
-      // Re-selecting the current stage zooms to its point (if any).
-      _focusPoint(index);
-      return;
-    }
-    if (index < 0 || index >= _setup.nStages) {
-      // A ghost slot beyond the setup starts an expansion up to it (if the setup
-      // can grow); anything else is out of range.
-      if (index >= _setup.nStages &&
-          index <= SetupController.maxPointStages &&
-          _setup.canExpand) {
-        _beginExpand(index);
-        return;
-      }
-      _sounds.play(UiSound.denyBlocked);
-      _toast('This setup has ${_setup.nStages - 1} stage'
-          '${_setup.nStages - 1 == 1 ? '' : 's'} (0–${_setup.nStages - 1}).');
-      return;
-    }
-    // Already derived (or the Stage-0 text) — focus it and recenter the view.
-    if (_setup.isStageAvailable(index)) {
-      _sounds.play(UiSound.navStage);
-      _setup.showStage(index);
-      _recenter();
-      return;
-    }
-    // Not derived yet because generation is still running in the background —
-    // it will open on its own when ready.
-    if (_setup.isGenerating) {
-      _sounds.play(UiSound.denyPending);
-      _toast('Stage $index is still deriving — it will open when ready.');
-      return;
-    }
-    // Not derived. Only the very next stage can be derived, and only once the
-    // previous stage carries a selected point.
-    if (index != _setup.firstUnderivedStage) {
-      _sounds.play(UiSound.denyBlocked);
-      _toast('Recall the earlier stages first.');
-      return;
-    }
-    if (!_setup.hasSelectedPoint(index - 1)) {
-      _sounds.play(UiSound.denyBlocked);
-      _toast('Select your point on Stage ${index - 1} first.');
-      return;
-    }
-    _deriveNextStage();
-  }
-
-  /// Derive the next stage's fractal (the explicit chain-advance step). Shows the
-  /// progress overlay while the Argon2 pass runs, then lands on the new fractal.
-  Future<void> _deriveNextStage() async {
-    final DeriveOutcome outcome = await _setup.deriveNextStage(
-      argon2Iterations: _iterations,
-      profile: _profile,
-    );
-    if (!mounted) return;
-    switch (outcome) {
-      case DeriveOutcome.derived:
-        _sounds.play(UiSound.stageReady);
-        _recenter(); // land centred on the fresh fractal
-        _toast('Stage ${_setup.displayStageIndex} derived — recall your point.');
-      case DeriveOutcome.noPriorPoint:
-        _sounds.play(UiSound.denyBlocked);
-        _toast('Select your point on the previous stage first.');
-      case DeriveOutcome.none:
-      case DeriveOutcome.busy:
-        break;
-    }
+    _selectOrbitStage(index);
   }
 
   /// Highest **derived** orbit stage: stage 0 plus the contiguous run of deep
@@ -2690,10 +2302,6 @@ class _SetupScreenState extends State<SetupScreen>
     return c.findAncestorWidgetOfExactType<EditableText>() != null;
   }
 
-  /// Soft-coded target: a focused point's leaf should occupy this fraction of
-  /// the view's (shorter-axis) span — half by default.
-  static const double _kFocusLeafRatio = 0.5;
-
   /// Recenter the canvas to the default position/zoom and reset brightness,
   /// without touching the session. Triggered automatically on arriving at a
   /// stage (the old `R` behaviour, now folded into stage selection).
@@ -2703,66 +2311,11 @@ class _SetupScreenState extends State<SetupScreen>
     setState(() {});
   }
 
-  /// Zoom-to-fit the point of [index] ("focus"): centre on its coordinates and
-  /// set the zoom so the leaf's largest dimension is [_kFocusLeafRatio] of the
-  /// view's shorter-axis span. No-op (deny) if that stage has no point.
-  void _focusPoint(int index) {
-    final ({double re, double im, double leafW, double leafH})? t =
-        _setup.focusTargetAt(index);
-    if (t == null) {
-      _sounds.play(UiSound.denyBlocked);
-      _toast('No point on Stage $index to focus yet.');
-      return;
-    }
-    final double leafMax = math.max(t.leafW, t.leafH);
-    final FractalViewport cur = _viewport.viewport;
-    // half-extent is half the shorter-axis span; choose it so leafMax /
-    // (2*halfExtent) == ratio. Fall back to the current zoom if the leaf size is
-    // unknown.
-    final double half =
-        leafMax > 0 ? leafMax / (2 * _kFocusLeafRatio) : cur.halfExtent;
-    _sounds.play(UiSound.navZoom);
-    _viewport.viewport = cur.copyWith(
-      centreRe: t.re,
-      centreIm: t.im,
-      halfExtent: half,
-    );
-    setState(() {});
-  }
-
-  Widget _canvas() {
-    final Stage stage = _setup.displayStage;
-    return FractalCanvas(
-      source: widget.core.source,
-      controller: _viewport,
-      palette: Palette.forHue(_hue),
-      brightness: _brightness,
-      sounds: _sounds,
-      stage: stage,
-      stageParameters:
-          stage == Stage.stage2 ? _setup.displayStageParams : null,
-      maxIterations: _renderMaxIter,
-      // Generated points (white, after Generate) plus selected points (green,
-      // in select mode). Empty until there is something to show.
-      overlays: _setup.overlaysForDisplayStage(),
-      semanticLabel: 'Fractal canvas',
-      // Selection is enabled only once points exist and the user turns on
-      // select mode (button or `S`). Otherwise taps do nothing and the canvas
-      // is pan/zoom only.
-      onSelect: (_selectMode || _editPointMode)
-          ? (FractalSelection sel) {
-              _onCanvasSelect(sel);
-            }
-          : null,
-    );
-  }
-
   /// Stage-0 fractal slot (`#j≥1`): the real orbit board `θ_0_(j-1)` derived
   /// from σ → o₀. Any slot may carry a placed point (shown as a white cross)
   /// until `r_0` are placed; the rest then derive and lock. Point
-  /// entry uses the *existing* mechanisms — `R` arms a manual click, exactly
-  /// like editing a chain point (so the canvas takes a click only in select /
-  /// edit mode). When σ is unset/invalid a "set σ first" panel is shown.
+  /// entry: Place by click arms a manual click (the canvas takes a click only
+  /// while it is armed). When σ is unset/invalid a "set σ first" panel is shown.
   Widget _orbitBoardPanel(int slot) {
     final StageParameters? bp = _boardRenderParams(slot);
     if (bp == null) return _boardNeedsSigmaPanel(slot);
@@ -2778,10 +2331,14 @@ class _SetupScreenState extends State<SetupScreen>
       maxIterations: _renderMaxIter,
       overlays: overlays,
       semanticLabel: 'Orbit fractal board (stage 0, slot $slot)',
-      // Same gate as the chain canvas: a click lands only while select / edit
-      // mode is armed (here, by `R`), and routes through [_onCanvasSelect].
-      onSelect: (_selectMode || _editPointMode)
-          ? (FractalSelection sel) => _onCanvasSelect(sel)
+      // A click lands only while Place by click is armed; on a leaf that
+      // cannot encode the mode stays armed to retry.
+      onSelect: _editPointMode
+          ? (FractalSelection sel) {
+              if (_placeableBoardSlot && _placePrimaryAt(_slotIndex, sel)) {
+                setState(() => _editPointMode = false);
+              }
+            }
           : null,
     );
   }
@@ -2849,8 +2406,7 @@ class _SetupScreenState extends State<SetupScreen>
 
   /// Discovery params for resolving a canonical island's *shape* — the engine's
   /// encode params with a larger flood cap so the island is a real shape, not a
-  /// speck. Pure visualisation; never affects encoded bits. (Peer of
-  /// SetupController's `_islandVizParams`.)
+  /// speck. Pure visualisation; never affects encoded bits.
   CoreDiscoveryParams get _islandVizParams {
     final CoreDiscoveryParams b = widget.core.encodeParams;
     return CoreDiscoveryParams(
@@ -2865,8 +2421,7 @@ class _SetupScreenState extends State<SetupScreen>
   }
 
   /// Build the canonical-island decoration (cells + bbox) for a known leaf on the
-  /// board's `(o, p, q)`, or null if the island can't be resolved. (Peer of
-  /// SetupController's `_islandDecoForLeaf`.)
+  /// board's `(o, p, q)`, or null if the island can't be resolved.
   _BoardDeco? _boardIslandDecoForLeaf(
       FixedRect leafRect, String path, int o, int p, int q) {
     final CoreCanonicalIsland? isl = widget.core.bindings.canonicalIsland(
@@ -2901,7 +2456,7 @@ class _SetupScreenState extends State<SetupScreen>
 
   /// `E` on a board: enumerate the canonical leaf areas under the current view on
   /// the active board's fractal and highlight each one's island (the board peer
-  /// of [_enumerateIslands] / SetupController.enumerateCanonicalIslands).
+  /// of the engine's canonical-island enumeration).
   Future<void> _boardEnumerateIslands() async {
     final int slot = _slotIndex;
     final ({int o, int p, int q})? prm = _boardPrm(slot);
@@ -2956,7 +2511,7 @@ class _SetupScreenState extends State<SetupScreen>
 
   /// Focus decoration for a board's placed point: the canonical island (cells +
   /// bbox) when it resolves, else the whole leaf rect (no cells) so the point is
-  /// always framed. Peer of SetupController's `_focusDecoForLeaf`.
+  /// always framed.
   _BoardDeco _boardFocusDecoForLeaf(
       FixedRect leafRect, String path, int o, int p, int q) {
     final _BoardDeco? isl = _boardIslandDecoForLeaf(leafRect, path, o, p, q);
@@ -3162,19 +2717,6 @@ class _SetupScreenState extends State<SetupScreen>
   /// Hex digits in a point: 4 bits a digit.
   static const int _kHexDigitsPerPoint = EncodingConstants.bitsPerPoint ~/ 4;
 
-  /// [bits] as uppercase hex, 4 bits a digit (the legacy chain's import form).
-  static String _bitsToHex(List<int> bits) {
-    final StringBuffer out = StringBuffer();
-    for (int i = 0; i < bits.length; i += 4) {
-      int v = 0;
-      for (int b = 0; b < 4; b++) {
-        v = (v << 1) | bits[i + b];
-      }
-      out.write(v.toRadixString(16).toUpperCase());
-    }
-    return out.toString();
-  }
-
   /// Open the shared inline import editor for slot [slot]'s point — the board
   /// peer of [_changePointImport] (`I` / `Alt+I`), reusing [_importEditorBody].
   void _beginBoardImport(int slot, {required bool hex}) {
@@ -3217,7 +2759,7 @@ class _SetupScreenState extends State<SetupScreen>
   Widget _boardImportEditor() {
     final int slot = _boardImportSlot!;
     return _importEditorBody(
-      title: 'Slot $slot\'s point (${EncodingConstants.bitsPerPoint} bits).',
+      title: 'Slot $slot',
       points: 1,
       onApply: _applyBoardImport,
       onCancel: _cancelBoardImport,
@@ -3455,10 +2997,6 @@ class _SetupScreenState extends State<SetupScreen>
     _boardCanonicalView = false;
   }
 
-  /// Informational panel section for the active orbit board: the slot's role,
-  /// its placed/derived state, the hotkeys that set the point (`R` manual click,
-  /// `N` random, `I`/`Alt+I` import) — routed through the existing point-entry
-  /// mechanisms, so there are no bespoke buttons — and the reset-view gesture.
   /// Derive stage-0 board `θ_0_(slot-1)` from the current σ, point the render
   /// source at its authoritative u64 reservoirs, and return the display-proxy
   /// [StageParameters] the canvas repaints on. Returns null when σ is unset or
@@ -3489,9 +3027,9 @@ class _SetupScreenState extends State<SetupScreen>
         _boardParams = StageParameters(o: dk.o, p: dk.p, q: dk.q);
       }
     }
-    // Re-point the render source every build (cheap): a deep-stage visit or the
-    // legacy chain may have set its own reservoirs since this board was last
-    // shown, so reclaim the shared source for the board on screen.
+    // Re-point the render source every build (cheap): another board may have
+    // set its own reservoirs since this one was last shown, so reclaim the
+    // shared source for the board on screen.
     widget.core.source.reservoirs = _boardReservoirs;
     widget.core.leafSource.reservoirs = _boardReservoirs;
     return _boardParams;
@@ -3542,168 +3080,6 @@ class _SetupScreenState extends State<SetupScreen>
     return out;
   }
 
-  /// The left-pane panel shown for Stage 0 (the salt/pepper text): there is no
-  /// fractal and no point to select here. Shows the text the chain was seeded
-  /// with, behind a reveal toggle (it may be a secret pepper).
-  Widget _textStagePanel() {
-    final String text = _setup.saltPepper;
-    return ColoredBox(
-      color: Theme.of(context).colorScheme.surface,
-      // Sit a little above centre so the derivation progress overlay (which sits
-      // a little below centre) never lands on top of this text.
-      child: Align(
-        alignment: const Alignment(0, -0.3),
-        child: Padding(
-          padding: const EdgeInsets.all(32),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: <Widget>[
-              const Icon(Icons.password, size: 48),
-              const SizedBox(height: 16),
-              Text('Stage 0 — salt / pepper',
-                  style: Theme.of(context).textTheme.titleLarge),
-              const SizedBox(height: 8),
-              Text(
-                'This text seeds every fractal in your chain — there is no '
-                'shared "canonical" fractal, and no point to select here. '
-                'You chose whether it is a public label or a secret pepper.',
-                textAlign: TextAlign.center,
-                style: Theme.of(context).textTheme.bodyMedium,
-              ),
-              const SizedBox(height: 20),
-              if (text.isEmpty)
-                Text('(no salt / pepper set)',
-                    style: Theme.of(context).textTheme.bodySmall)
-              else
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: <Widget>[
-                    SelectableText(
-                      _stage0Hidden ? '•' * text.length : text,
-                      style: const TextStyle(
-                        fontFamily: GreatWallTypography.fontFamily,
-                        fontFamilyFallback: <String>['monospace'],
-                        fontSize: 18,
-                        letterSpacing: 1.5,
-                      ),
-                    ),
-                    IconButton(
-                      tooltip: _stage0Hidden ? 'Reveal' : 'Hide',
-                      icon: Icon(_stage0Hidden
-                          ? Icons.visibility
-                          : Icons.visibility_off),
-                      onPressed: () =>
-                          setState(() => _stage0Hidden = !_stage0Hidden),
-                    ),
-                  ],
-                ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// Run the `E` canonical-leaf-area enumeration: a start cue, then a result
-  /// cue + toast/console log. See [SetupController.enumerateCanonicalIslands].
-  Future<void> _enumerateIslands() async {
-    _sounds.play(UiSound.focus);
-    final LeafScanOutcome r =
-        await _setup.enumerateCanonicalIslands(_viewport.viewport);
-    if (!mounted) return;
-    switch (r) {
-      case LeafScanOutcome.shown:
-        _sounds.play(UiSound.confirm);
-        _toast('Highlighted ${_setup.islandCount} canonical island(s).');
-      case LeafScanOutcome.tooMany:
-        _sounds.play(UiSound.warn);
-        _toast('Too many / too dense to enumerate here — zoom in.');
-      case LeafScanOutcome.empty:
-        _sounds.play(UiSound.denyMiss);
-        _toast('No canonical islands in view — zoom in.');
-    }
-  }
-
-  Future<void> _onCanvasSelect(FractalSelection sel) async {
-    // Placing a stage-0 orbit board point (the `R` manual arm): the click sets
-    // this slot's point. On an invalid leaf the mode stays armed to retry.
-    if (_editPointMode && _placeableBoardSlot) {
-      if (_placePrimaryAt(_slotIndex, sel)) {
-        setState(() => _editPointMode = false);
-      }
-      return;
-    }
-    // Editing the displayed stage's point (the R edit): the click sets the new
-    // point and the tail (if any) was already confirmed when arming the mode.
-    if (_editPointMode) {
-      final SelectionOutcome o = _setup.changeCurrentPointAt(sel);
-      final int k = _setup.displayStageIndex;
-      switch (o) {
-        case SelectionOutcome.invalid:
-          _sounds.play(UiSound.denyMiss);
-          _toast('No encodable leaf there — zoom in and click closer.');
-        case SelectionOutcome.marked:
-          setState(() => _editPointMode = false);
-          _sounds.play(UiSound.changePoint);
-          _toast('Stage $k point changed.');
-        default:
-          setState(() => _editPointMode = false);
-      }
-      return;
-    }
-    // During a manual expansion, only the fresh (point-less) new stages accept a
-    // click; an existing stage's point is never clobbered by a stray tap.
-    if (_expandManualActive && _setup.hasPointAt(_setup.displayStageIndex)) {
-      _sounds.play(UiSound.denyBlocked);
-      _toast('Stage ${_setup.displayStageIndex} already has its point.');
-      return;
-    }
-    SelectionOutcome outcome = _setup.selectPoint(sel);
-    // A valid click that would clobber a re-selected stage's later fractals asks
-    // for confirmation before discarding them.
-    if (outcome == SelectionOutcome.needsConfirm) {
-      final bool ok = await _confirmReselect();
-      if (!mounted || !ok) return;
-      outcome = _setup.selectPoint(sel, confirmedReselect: true);
-      if (!mounted) return;
-    }
-    final String? msg;
-    switch (outcome) {
-      case SelectionOutcome.invalid:
-        _sounds.play(UiSound.denyMiss);
-        msg = 'No encodable leaf there — zoom in and click closer.';
-      case SelectionOutcome.marked:
-        _sounds.play(UiSound.selectPoint);
-        final int k = _setup.displayStageIndex;
-        // Manual expansion: the click set this new stage's point; advance to the
-        // next new stage (deriving it) until the target is reached.
-        if (_expandManualActive) {
-          final int g = _expandManualTarget ?? k;
-          if (k < g) {
-            _toast('Point set on Stage $k — deriving Stage ${k + 1}…');
-            await _deriveNextStage();
-          } else {
-            _endManualExpand();
-            _sounds.play(UiSound.finalReady);
-            _toast('Expansion complete — Stage $g added.');
-          }
-          return;
-        }
-        msg = k < _setup.nStages - 1
-            ? 'Point marked on Stage $k/${_setup.nStages - 1} — '
-                'select Stage ${k + 1} to derive it.'
-            : 'Point marked on Stage $k/${_setup.nStages - 1}.';
-      case SelectionOutcome.complete:
-        _sounds.play(UiSound.finalReady);
-        msg = 'Recall complete — seed reconstructed.';
-      case SelectionOutcome.needsConfirm:
-      case SelectionOutcome.busy:
-        msg = null;
-    }
-    if (msg == null) return;
-    _toast(msg);
-  }
-
   /// Show an inline console confirmation and complete with the user's choice
   /// when they press a button. Shared by every confirm flow (re-derive, abort,
   /// reset). Ensures the console is expanded so the prompt is visible.
@@ -3729,17 +3105,11 @@ class _SetupScreenState extends State<SetupScreen>
     return completer.future;
   }
 
-  /// Place a point from the device's random generator (Setup board), after
-  /// the disclaimer: on the map, or the legacy chain's edit or expansion.
+  /// Place a point on the map from the device's random generator (Setup
+  /// board), after the disclaimer.
   Future<void> _systemRandom() async {
     if (!await _confirmSystemRandom() || !mounted) return;
-    if (_expandTarget != null) {
-      await _expandNew();
-    } else if (_placeableBoardSlot) {
-      _generatePrimary(_slotIndex);
-    } else if (_setup.canEditCurrentPoint) {
-      await _changePointGenerated();
-    }
+    if (_placeableBoardSlot) _generatePrimary(_slotIndex);
   }
 
   /// The disclaimer before every use of the device's random generator for a
@@ -3754,67 +3124,36 @@ class _SetupScreenState extends State<SetupScreen>
         warning: true,
       );
 
-  /// Confirm a point re-selection that will discard the later fractals already
-  /// derived from this stage. The confirmation is shown **inline in the
-  /// console** (not a modal dialog); the returned future completes when the user
-  /// presses one of the console's action buttons.
-  Future<bool> _confirmReselect() => _consoleConfirm(
-        message: 'Re-derive later stages? This stage already has a point and '
-            'later stages were derived from it. Choosing a new point discards '
-            'those later stages — you will re-derive and re-select them.',
-        confirmLabel: 'Discard & re-select',
-      );
-
   Widget _progressOverlay() {
-    final bool deriving = _setup.phase == SetupPhase.deriving;
-    // The stage-tab strip (above this scrim) is the progress bar and the console
-    // carries the live text + ETA, so the overlay avoids a third copy: while
-    // deriving it shows only Halt; for the brief encode (no Halt) it shows a
-    // short label so the dim is not blank.
+    // The stage tab above fills as the bar; this states the cost in passes and
+    // offers Halt: cancelling kills the worker isolate, costing at most the
+    // pass in flight.
     return ColoredBox(
       color: Colors.black54,
-      // Sit a little below centre so it clears the Stage-0 text panel (which
-      // sits a little above centre) during the foreground Stage-1 derivation.
       child: Align(
         alignment: const Alignment(0, 0.3),
-        child: deriving
-            ? TextButton(
-                onPressed: _setup.halt,
-                child: const Text('Halt'),
-              )
-            : _advancing
-                // The orbit advance now streams pass by pass, so it gets the
-                // same Halt the chain derivation has: cancelling kills the
-                // worker isolate, costing at most the pass in flight. The stage
-                // tab above carries the bar; this states the cost in passes.
-                ? Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: <Widget>[
-                      Text(
-                        _advanceTotal > 0
-                            ? 'Advancing the orbit (memory-hard) — pass '
-                                '$_advanceDone/$_advanceTotal…'
-                            : 'Advancing the orbit (memory-hard)…',
-                        style: const TextStyle(color: Colors.white),
-                      ),
-                      const SizedBox(height: 8),
-                      TextButton(
-                        onPressed: _advanceJob == null
-                            ? null
-                            : () {
-                                _sounds.play(UiSound.select);
-                                _advanceJob?.cancel();
-                              },
-                        child: const Text('Halt'),
-                      ),
-                    ],
-                  )
-                : Text(
-                    _setup.phase == SetupPhase.encoding
-                        ? 'Encoding…'
-                        : 'Working…',
-                    style: const TextStyle(color: Colors.white),
-                  ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Text(
+              _advanceTotal > 0
+                  ? 'Advancing the orbit (memory-hard) — pass '
+                      '$_advanceDone/$_advanceTotal…'
+                  : 'Advancing the orbit (memory-hard)…',
+              style: const TextStyle(color: Colors.white),
+            ),
+            const SizedBox(height: 8),
+            TextButton(
+              onPressed: _advanceJob == null
+                  ? null
+                  : () {
+                      _sounds.play(UiSound.select);
+                      _advanceJob?.cancel();
+                    },
+              child: const Text('Halt'),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -3827,21 +3166,6 @@ class _SetupScreenState extends State<SetupScreen>
   /// than an abstract flat grey; it stays unsaturated enough to sit neutrally
   /// against all six fractal hue schemes. See great-wall-ux/SCOPE.md
   /// §"Console palette" for the rationale.
-  /// Memorise-mode guidance. Lives in the console (not the control panel) so the
-  /// panel stays a stable, compact action surface.
-  static const String _memoriseHelp =
-      'Memorise your points. Stage 0 is the salt/pepper you entered; each later '
-      'stage is its own fractal carrying one point. Study the marked location on '
-      'every fractal until you can find it from memory, then finish — the seed '
-      'is then held only in your recall.';
-
-  /// Whether the user is studying a settled generated/imported setup (the state
-  /// the [_memoriseHelp] guidance applies to).
-  bool get _inMemoriseStudy =>
-      _setup.phase == SetupPhase.memorise &&
-      !_setup.isGenerating &&
-      !_setup.isRecallSession;
-
   static const Color _kConsoleBg = Color(0xE6131519); // ~90% opaque gunmetal
   static const Color _kConsoleFg = Color(0xFFE9EDF2); // cool off-white
   static const Color _kConsoleAccent = Color(0xFFB8C2CC); // brighter, same cast
@@ -3861,14 +3185,9 @@ class _SetupScreenState extends State<SetupScreen>
   Widget _console() {
     final String? focusHelp =
         _focusedField != null ? _fieldHelp(_focusedField!) : null;
-    final String status = _prompt != null
-        ? _prompt!.message
-        : _expandTarget != null
-            ? 'Add stages — ${_keys(<_Cmd>[_Cmd.newPoint, _Cmd.dice])} · Esc cancel.'
-            : _derivationStatus() ??
-            focusHelp ??
-            (_inMemoriseStudy ? _memoriseHelp : null) ??
-            (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
+    final String status = _prompt?.message ??
+        focusHelp ??
+        (_consoleLog.isEmpty ? 'Ready.' : _consoleLog.last);
     return Material(
       color: _kConsoleBg,
       child: DecoratedBox(
@@ -4006,39 +3325,19 @@ class _SetupScreenState extends State<SetupScreen>
             ),
           )
         else ...<Widget>[
-          if (_expandTarget != null)
-            Padding(padding: pad, child: _expandPickerBlock()),
-          if (_expandTarget == null &&
-              _setup.derivingStageIndex != null)
-            Padding(padding: pad, child: _derivationBlock()),
-          if (_expandTarget == null &&
-              _setup.derivingStageIndex == null &&
-              _focusedField != null)
-            Padding(
-              padding: pad,
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  const Icon(Icons.info_outline, size: 14),
-                  const SizedBox(width: 6),
-                  Expanded(child: Text(_fieldHelp(_focusedField!))),
-                ],
-              ),
-            ),
-          // Memorise guidance, shown only when nothing more urgent is.
-          if (_expandTarget == null &&
-              _setup.derivingStageIndex == null &&
-              _focusedField == null &&
-              _inMemoriseStudy)
-            const Padding(
-              padding: pad,
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Icon(Icons.menu_book, size: 14),
-                  SizedBox(width: 6),
-                  Expanded(child: Text(_memoriseHelp)),
-                ],
+          // The focused field's help; it scrolls rather than overflow.
+          if (_focusedField != null)
+            Flexible(
+              child: SingleChildScrollView(
+                padding: pad,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    const Icon(Icons.info_outline, size: 14),
+                    const SizedBox(width: 6),
+                    Expanded(child: Text(_fieldHelp(_focusedField!))),
+                  ],
+                ),
               ),
             ),
           Expanded(
@@ -4121,106 +3420,14 @@ class _SetupScreenState extends State<SetupScreen>
 
   /// The Setup board's pane: an open import editor, else the field the board
   /// last brought up (key label, profile or steps D) — input only, centred.
-  /// A legacy chain session keeps its own controls, scrolling.
   Widget? _setupPane() {
     if (_boardImportSlot != null) return _boardImportEditor();
-    if (_pointImportStage != null) return _pointImportEditor();
-    if (_expandImportTarget != null) return _expandImportEditor();
-    if (_hasSession) {
-      return SingleChildScrollView(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: _legacyPane(),
-        ),
-      );
-    }
     return switch (_paneField[CommandContext.setup]) {
       _Field.exportLabel => _exportLabelField(),
       _Field.profile => _argon2ProfileSlider(),
       _Field.iterations => _iterationsInput(),
       _ => null,
     };
-  }
-
-  /// The legacy chain session's pane controls (pre-orbit setup files).
-  List<Widget> _legacyPane() {
-    final bool hasResult = _setup.phase == SetupPhase.memorise;
-    return <Widget>[
-          if (_setup.phase == SetupPhase.recallComplete)
-            ..._recallCompleteControls()
-          else if (_setup.isRecallSession && hasResult)
-            ..._recallControls()
-          else if (!hasResult)
-            ..._configControls()
-          else
-            ..._memoriseControls(),
-
-          // (Stage navigation lives in the fixed 0–4 tab bar above the canvas;
-          // the redundant "< Stage k / N >" row was dropped.)
-
-          // Background generation progress: later stages are still deriving
-          // while the user studies the ones already done.
-          if (_setup.isGenerating || _setup.generationError != null) ...<Widget>[
-            const Divider(height: 32),
-            _generationNotice(),
-          ],
-
-          // A halted generation: its progress is preserved; offer to resume.
-          if (_setup.canResume) ...<Widget>[
-            const Divider(height: 32),
-            _haltedNotice(),
-          ],
-
-          // Truncation: delete the displayed stage and every deeper one.
-          if (_setup.canTruncateFromDisplayed) ...<Widget>[
-            const Divider(height: 32),
-            _truncateControl(),
-          ],
-
-          // The cold-start recall walk shows a per-stage hint while the user
-          // clicks their points back. There is no select-mode toggle: a recall
-          // session selects implicitly (the answer is hidden), and a
-          // generated/imported setup displays its points, so there is nothing to
-          // practise.
-          if (_selectMode &&
-              !_setup.isTextStage &&
-              _setup.phase != SetupPhase.recallComplete) ...<Widget>[
-            const Divider(height: 32),
-            Text(
-              _expandManualActive
-                  ? 'Adding Stage ${_setup.displayStageIndex}/'
-                      '${_expandManualTarget ?? _setup.nStages - 1} — click your '
-                      'point on this fractal; the next stage then derives '
-                      'automatically.'
-                  : 'Recalling Stage ${_setup.displayStageIndex}/'
-                      '${_setup.nStages - 1} — click your point to mark it, then '
-                      'select the next stage (tab or number key) to derive it.',
-            ),
-          ],
-
-          // Blind BIP39 export of the seed recalled so far — recall only (it
-          // needs the decoded points). Available at every recall stage once a
-          // point is back; before the final stage it is a partial,
-          // shorter-than-standard seed.
-          if (_setup.canExport &&
-              _setup.phase != SetupPhase.recallComplete) ...<Widget>[
-            const Divider(height: 32),
-            Text(
-              'Blind copy — partial seed',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const SizedBox(height: 4),
-            Text(
-              '${_setup.recalledStageCount}/${_setup.nStages - 1} points '
-              'recalled (${_setup.recalledBitCount} bits). Until the final '
-              'stage this is a non-standard, shorter — therefore weaker — seed.',
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
-            const SizedBox(height: 12),
-            _bip39CopyButton(),
-          ],
-
-    ];
   }
 
   /// Width of a board context's pane, between the board and the log.
@@ -4264,8 +3471,7 @@ class _SetupScreenState extends State<SetupScreen>
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: <Widget>[
-                  if (_paneField[CommandContext.main] == _Field.vault &&
-                      _vaultPanelShown)
+                  if (_paneField[CommandContext.main] == _Field.vault)
                     _vaultPathField(),
                   if (_vaultBusy)
                     const Padding(
@@ -4308,29 +3514,6 @@ class _SetupScreenState extends State<SetupScreen>
   /// Width of the version labels' column, in logical pixels.
   static const double _kVersionLabelWidth = 96;
 
-  List<Widget> _configControls() {
-    // The configuration's fields come up from the Setup board one at a time
-    // ([_paneField]); this shows only its feedback.
-    return <Widget>[
-      if (_setup.phase == SetupPhase.error && _setup.errorMessage != null) ...<Widget>[
-        const SizedBox(height: 12),
-        Text(
-          _setup.errorMessage!,
-          style: const TextStyle(color: Colors.redAccent),
-        ),
-      ],
-      // Leaf-area / island enumeration feedback (the `E` action): "too many",
-      // "no islands", or nothing while islands are shown.
-      if (_setup.islandStatus != null) ...<Widget>[
-        const SizedBox(height: 12),
-        Text(
-          _setup.islandStatus!,
-          style: const TextStyle(color: Colors.white70),
-        ),
-      ],
-    ];
-  }
-
   /// A fixed-width label placed to the left of a slider, so the label adds no
   /// vertical height (layout stays put) and never shifts horizontally.
   Widget _sliderLabel(String text) => SizedBox(
@@ -4350,7 +3533,7 @@ class _SetupScreenState extends State<SetupScreen>
   /// Apply — returns N, which we write into the derivation-steps field. Exit is
   /// Esc + confirm (handled inside the dialog).
   Future<void> _openCalibrationDialog() async {
-    if (_busy || _hasSession) return;
+    if (_busy) return;
     final int profileIdx =
         _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
     final int? n = await showDialog<int>(
@@ -4458,131 +3641,24 @@ class _SetupScreenState extends State<SetupScreen>
   }
 
 
-  /// Controls shown during a cold-start recall walk (select mode on). The
-  /// select-mode switch, the per-stage recall hint, the blind-copy export and
-  /// Reset all live in the always-shown section below.
-  List<Widget> _recallControls() {
-    return <Widget>[
-      const Text('Recall your points'),
-      const SizedBox(height: 8),
-      Text(
-        'Select mode is on. Click your memorised point to mark it, then select '
-        'the next stage (its tab or number key) to derive that fractal (the '
-        'same Argon2 cost as setup). Nothing is shown — the seed is rebuilt only '
-        'from your clicks.',
-        style: Theme.of(context).textTheme.bodySmall,
-      ),
-    ];
-  }
-
-  List<Widget> _memoriseControls() {
-    // The "what to do" guidance lives in the console now (see _memoriseHelp), so
-    // the panel stays a stable, compact action surface.
-    return <Widget>[
-      FilledButton(
-        onPressed: () {
-          _sounds.play(UiSound.confirm);
-          _setup.finish();
-        },
-        child: const Text('I have memorised them'),
-      ),
-    ];
-  }
-
-  List<Widget> _recallCompleteControls() {
-    return <Widget>[
-      Row(
-        children: <Widget>[
-          const Icon(Icons.verified, color: Color(0xFF00E676)),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              'Recall complete',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-          ),
-        ],
-      ),
-      const SizedBox(height: 8),
-      Text(
-        'Every stage was selected back and the seed was reconstructed from '
-        'your points. It is never shown on screen — the buttons below copy it '
-        'straight to the clipboard so you can paste it blind into another '
-        "wallet's import wizard and continue without ever reading it.",
-        style: Theme.of(context).textTheme.bodySmall,
-      ),
-      const SizedBox(height: 16),
-      _bip39CopyButton(),
-      const SizedBox(height: 24),
-      FilledButton(onPressed: _reset, child: const Text('Done')),
-    ];
-  }
-
-  /// A subtle, non-blocking notice while later stages derive in the background
-  /// (or a one-line warning if a background derivation failed). The stages
-  /// already derived are fully navigable meanwhile; focus stays put.
-  Widget _generationNotice() {
-    final String? err = _setup.generationError;
-    if (err != null) {
-      return Text(err, style: const TextStyle(color: Colors.orangeAccent));
-    }
-    final int total = _setup.nStages - 1;
-    // Progress now reads off the stage-tab strip (the deriving stage's box
-    // fills), so this notice is just the explanatory line.
-    return Text(
-      'Deriving stage ${_setup.generatingStage}/$total in the background — '
-      'the stages already done are ready to study now.'
-      '${_setup.canExportResumable ? ' Write (${_hint(_Cmd.save)}) snapshots '
-          'the progress so far to resume in a later session.' : ''}',
-      style: Theme.of(context).textTheme.bodySmall,
-    );
-  }
-
-  /// The halted-derivation notice: how much of the stalled stage was preserved,
-  /// and a button to resume it (and the rest of the chain).
-  Widget _haltedNotice() {
-    final int k = _setup.haltedStage;
-    final int last = _setup.nStages - 1;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        Text(
-          'Halted at Stage $k/$last — pass ${_setup.haltedPass}/'
-          '${_setup.haltedTotal} kept. Resume picks up where it stopped'
-          '${_setup.canExportResumable ? ', or Write (${_hint(_Cmd.save)}) saves '
-              'it to resume in a later session (the file then holds the seed — '
-              'guard it).' : '.'}',
-          style: Theme.of(context).textTheme.bodySmall,
-        ),
-        const SizedBox(height: 8),
-        FilledButton.icon(
-          onPressed: _resumeDerivation,
-          icon: const Icon(Icons.play_arrow),
-          label: Text('Resume Stage $k'),
-        ),
-      ],
-    );
-  }
-
-  void _resumeDerivation() {
-    _sounds.play(UiSound.select);
-    _setup.resumeDerivation();
-  }
-
   // --- Orbit provisional key: capture / write / restore ----------------------
-  // The orbit peer of SetupController's chain vault. It lives on the screen
-  // because the orbit state does: σ, D, P, r_i, o_i and the placed points are
-  // all screen-owned fields (none of them go through the controller), so an
-  // orbit save/load that routed through SetupController would have to mirror
-  // them first. See next-steps/orbit-save-load-and-cpnf-rederivation-plan.md §3.
+  // It lives on the screen because the orbit state does: σ, D, P, o_i and the
+  // placed points are all screen-owned fields.
 
   /// The single failure message every vault open reports. A wrong key, a corrupt
-  /// file, a chain/orbit mix-up and a doctored payload MUST be indistinguishable
-  /// — otherwise someone holding the file learns from probing it whether a
-  /// candidate key was right. (GCM authentication already makes the first two
-  /// identical; this keeps the parse failures from breaking that.)
+  /// file and a doctored payload MUST be indistinguishable — otherwise someone
+  /// holding the file learns from probing it whether a candidate key was
+  /// right. (GCM authentication makes them identical; this keeps the parse
+  /// failures from breaking that.) Only a file that decrypted — the key was
+  /// right, and its contents are its holder's anyway — may be named: a
+  /// pre-orbit chain or non-standard setup.
   static const String _vaultOpaqueError =
       'Could not open — wrong key, or not a setup file.';
+
+  /// A file that decrypts but holds a pre-orbit chain setup.
+  static const String _vaultChainError =
+      'Could not open — a pre-orbit chain setup. Chain setups are no longer '
+      'supported; only orbit setups open.';
 
   /// A file whose stages require other than the standard number of points.
   static const String _vaultNonStandardError =
@@ -4612,7 +3688,7 @@ class _SetupScreenState extends State<SetupScreen>
   }
 
   /// Capture the settled orbit setup as an [OrbitVault] — pure, synchronous and
-  /// read straight off the screen-owned state, with no [SetupController] call.
+  /// read straight off the screen-owned state.
   ///
   /// Stage 0's `o₀` is omitted (it re-derives from σ) and the derived slots are
   /// omitted (they re-derive from the placed ones), so the file carries only
@@ -4658,8 +3734,7 @@ class _SetupScreenState extends State<SetupScreen>
   }
 
   /// Write the settled orbit setup to [path], encrypted under the provisional
-  /// key — the orbit peer of `SetupController.saveVaultToFile`, and the reason
-  /// the screen does its own file I/O: it is the screen that owns the state.
+  /// key. The screen does its own file I/O: it owns the state.
   ///
   /// The write is **atomic** (temp file + rename). Phase 2 re-writes this same
   /// file on every graded card, and a half-written vault is an unopenable one.
@@ -4699,9 +3774,7 @@ class _SetupScreenState extends State<SetupScreen>
     }
   }
 
-  /// Restore a settled orbit setup from [vault] **into orbit mode** — never into
-  /// the legacy chain `memorise` session, so no [SetupController] state is
-  /// touched and the deprecated recall walk stays unreachable from a load.
+  /// Restore a settled orbit setup from [vault].
   ///
   /// The mirror of [_exportOrbitVault]: each `o_i` comes straight out of the
   /// file (stage 0's from σ), each stored point is cheap-decoded back to its
@@ -4874,26 +3947,12 @@ class _SetupScreenState extends State<SetupScreen>
   void _focusVaultPath() =>
       _showField(_Field.vault, _vaultPathFocus, 'setup file path');
 
-  /// Whether the provisional-key panel is on screen — the config screen (to open
-  /// a saved setup) or a settled setup, orbit or legacy chain (to write one).
-  /// Gates the F/W/O/T keys.
-  bool get _vaultPanelShown =>
-      _orbitSettled ||
-      _setup.phase == SetupPhase.idle ||
-      _setup.canExportVault ||
-      _setup.canExportResumable;
-
-  /// Write (save) the settled setup to the file path, encrypted under a fresh
-  /// app-generated 128-bit key, then open the key dialog (W). The key can be
-  /// overridden with the user's own entropy from inside that dialog.
-  ///
-  /// A settled **orbit** setup writes an [OrbitVault] off the screen state; the
-  /// legacy chain path stays on [SetupController] while it survives as the
-  /// porting reference. The orbit takes precedence — the two cannot both be
-  /// settled, since orbit placement never enters a chain session.
+  /// Write (save) the settled orbit setup to the file path as an
+  /// [OrbitVault], encrypted under a fresh app-generated 128-bit key, then
+  /// open the key dialog. The key can be overridden with the user's own
+  /// entropy from inside that dialog.
   Future<void> _writeSetup() async {
-    final bool orbit = _orbitSettled;
-    if (!orbit && !_setup.canExportVault && !_setup.canExportResumable) {
+    if (!_orbitSettled) {
       _sounds.play(UiSound.denyInput);
       _toast('Finish a setup first — there is nothing to write yet.');
       return;
@@ -4905,9 +3964,8 @@ class _SetupScreenState extends State<SetupScreen>
       return;
     }
     setState(() => _vaultBusy = true);
-    final ({String? error, Uint8List? key}) result = orbit
-        ? await _saveOrbitVaultToFile(path)
-        : await _setup.saveVaultToFile(path);
+    final ({String? error, Uint8List? key}) result =
+        await _saveOrbitVaultToFile(path);
     if (!mounted) return;
     setState(() => _vaultBusy = false);
     if (result.error != null || result.key == null) {
@@ -4916,7 +3974,7 @@ class _SetupScreenState extends State<SetupScreen>
       return;
     }
     _sounds.play(UiSound.exportOk);
-    await _showKeyDialog(path, result.key!, orbit: orbit);
+    await _showKeyDialog(path, result.key!);
   }
 
   /// Open (load) a saved setup from the file path (O): scan the QR (Q) or type
@@ -5087,12 +4145,11 @@ class _SetupScreenState extends State<SetupScreen>
   /// Decrypt the file at [path] with [keyBytes] and restore whichever setup it
   /// holds, returning null on success or a message on failure.
   ///
-  /// The payload's `kind` picks the branch: `'orbit'` restores the screen-owned
-  /// orbit setup ([_restoreOrbitVault]); an absent `kind` is a legacy 0.3.0
-  /// chain [SetupVault] and takes the unchanged [SetupController] path. Every
-  /// failure after the file is read reports the same [_vaultOpaqueError], so a
-  /// wrong key, a corrupt file and a chain/orbit mix-up are indistinguishable.
-  /// The caller owns and wipes [keyBytes].
+  /// Only an orbit setup (`kind: 'orbit'`) restores ([_restoreOrbitVault]).
+  /// A file that decrypts but holds anything else is a pre-orbit chain setup
+  /// and is refused as such ([_vaultChainError]); every other failure after
+  /// the file is read reports the same [_vaultOpaqueError]. The caller owns
+  /// and wipes [keyBytes].
   Future<String?> _openVaultFile(String path, Uint8List keyBytes) async {
     if (!SetupCrypto.isValidKeyLen(keyBytes.length)) return _vaultOpaqueError;
     Uint8List bytes;
@@ -5123,24 +4180,9 @@ class _SetupScreenState extends State<SetupScreen>
         vault.wipe();
       }
     }
-    SetupVault chain;
-    try {
-      chain = SetupVault.fromJson(payload);
-    } catch (_) {
-      return _vaultOpaqueError;
-    }
-    try {
-      if (chain.resume != null) {
-        _setup.restoreResumableVault(chain); // halted — restore + offer Resume
-      } else {
-        _setup.restoreVault(chain);
-      }
-      return null;
-    } catch (_) {
-      return _vaultOpaqueError;
-    } finally {
-      chain.wipe();
-    }
+    // It decrypted, so the key was right, but it holds no orbit: a pre-orbit
+    // chain setup, no longer supported.
+    return _vaultChainError;
   }
 
   /// After a write, present the provisional [keyBytes] for the file at [path]:
@@ -5153,8 +4195,7 @@ class _SetupScreenState extends State<SetupScreen>
   /// [orbit] says which writer the dialog's re-seals go back through, so the
   /// 128↔256 toggle and the own-key/scanned-key paths rewrite the same kind of
   /// vault the initial write produced.
-  Future<void> _showKeyDialog(String path, Uint8List keyBytes,
-      {required bool orbit}) async {
+  Future<void> _showKeyDialog(String path, Uint8List keyBytes) async {
     Uint8List key = keyBytes;
     int keyLen = key.length; // 16 (128-bit) or 32 (256-bit)
     qr.QrImage matrix = _keyMatrix(key);
@@ -5180,10 +4221,8 @@ class _SetupScreenState extends State<SetupScreen>
           // and redraw. Shared by the 128↔256 toggle and the own-key path.
           Future<bool> reseal({Uint8List? ownKey, required int newLen}) async {
             setLocal(() => busy = true);
-            final ({String? error, Uint8List? key}) r = orbit
-                ? await _saveOrbitVaultToFile(path,
-                    providedKey: ownKey, genLenBytes: newLen)
-                : await _setup.saveVaultToFile(path,
+            final ({String? error, Uint8List? key}) r =
+                await _saveOrbitVaultToFile(path,
                     providedKey: ownKey, genLenBytes: newLen);
             if (ownKey != null) _wipeBytes(ownKey);
             if (!ctx.mounted) return false;
@@ -5454,112 +4493,9 @@ class _SetupScreenState extends State<SetupScreen>
     return png.buffer.asUint8List();
   }
 
-  /// Common message tail for a point edit: what gets discarded above stage [k].
-  String _editTail(int k) {
-    final int last = _setup.nStages - 1;
-    return k < last ? ' and discard Stages ${k + 1}–$last' : '';
-  }
-
-  /// Change the displayed stage's point to fresh random entropy (the `N` edit).
-  Future<void> _changePointGenerated() async {
-    final int k = _setup.displayStageIndex;
-    final bool ok = await _consoleConfirm(
-      message: 'Replace Stage $k\'s point with new random entropy'
-          '${_editTail(k)}? This cannot be undone.',
-      confirmLabel: 'Replace',
-    );
-    if (!ok || !mounted || !_setup.canEditCurrentPoint) return;
-    _setup.changeCurrentPointGenerated();
-    _sounds.play(UiSound.changePoint);
-    _toast('Stage $k point regenerated.');
-  }
-
-  /// Arm the manual point edit (the `R` edit): the next canvas click sets the
-  /// new point for the displayed stage.
-  Future<void> _changePointManual() async {
-    final int k = _setup.displayStageIndex;
-    final bool ok = await _consoleConfirm(
-      message: 'Click a new point for Stage $k${_editTail(k)}? '
-          'This cannot be undone.',
-      confirmLabel: 'Pick new point',
-    );
-    if (!ok || !mounted || !_setup.canEditCurrentPoint) return;
-    setState(() => _editPointMode = true);
-    _sounds.play(UiSound.click);
-    _toast('Click the new point on Stage $k (Esc to cancel).');
-  }
-
-  /// Open the inline bit editor to replace the displayed stage's point by import
-  /// (the `I` edit): 3 words → 32 bits (plain I) or 8 hex digits (Alt+I). The
-  /// format toggle in the editor still lets the user switch after opening.
-  Future<void> _changePointImport({required bool hex}) async {
-    final int k = _setup.displayStageIndex;
-    final bool ok = await _consoleConfirm(
-      message: 'Replace Stage $k\'s point by import${_editTail(k)}? '
-          'This cannot be undone.',
-      confirmLabel: 'Import',
-    );
-    if (!ok || !mounted || !_setup.canEditCurrentPoint) return;
-    _pointImport.clear();
-    setState(() {
-      _pointImportFmt = hex ? _ImportFormat.hex : _ImportFormat.dice;
-      _pointImportStage = k;
-    });
-    _pointImportFocus.requestFocus();
-  }
-
-  void _applyPointImport() {
-    final List<int>? bits = _importedBits(points: 1);
-    if (bits == null) return;
-    final String? err = _setup.changeCurrentPointHex(_bitsToHex(bits));
-    Entropy.wipe(bits);
-    if (err != null) {
-      _sounds.play(UiSound.denyInput);
-      _toast(err);
-      return;
-    }
-    final int k = _setup.displayStageIndex;
-    _cancelPointImport();
-    _sounds.play(UiSound.changePoint);
-    _toast('Stage $k point changed.');
-  }
-
-  void _cancelPointImport() {
-    _pointImport.clear();
-    setState(() => _pointImportStage = null);
-    _focusViewer();
-  }
-
-  /// The inline editor shown while replacing a stage's point by import.
-  Widget _pointImportEditor() {
-    final int k = _pointImportStage!;
-    return _importEditorBody(
-      title: 'A new point for Stage $k${_editTail(k)}.',
-      points: 1,
-      onApply: _applyPointImport,
-      onCancel: _cancelPointImport,
-    );
-  }
-
-  /// The inline editor shown while importing the points for an expansion's new
-  /// stages: one point per added stage.
-  Widget _expandImportEditor() {
-    final int g = _expandImportTarget!;
-    final int firstNew = _setup.firstExpansionStage;
-    final int m = g - firstNew + 1;
-    return _importEditorBody(
-      title: '$m point${m == 1 ? '' : 's'} for new '
-          'Stage${m == 1 ? ' $g' : 's $firstNew–$g'}.',
-      points: m,
-      onApply: _applyExpandImport,
-      onCancel: _cancelExpandImport,
-    );
-  }
-
-  /// Shared inline import editor for [points] points: a Dragon Dice / hex
-  /// toggle, a masked field, and Apply/Cancel. Reused by the board import, the
-  /// single-point edit and the multi-point import expansion (mutually
-  /// exclusive, so they share [_pointImport] / [_pointImportFocus]).
+  /// The inline import editor for [points] points: a Dragon Dice / hex
+  /// toggle, a masked field labelled with [title], and Apply/Cancel (Enter /
+  /// Esc).
   Widget _importEditorBody({
     required String title,
     required int points,
@@ -5571,22 +4507,20 @@ class _SetupScreenState extends State<SetupScreen>
     final int hexDigits = points * _kHexDigitsPerPoint;
     final String text = _pointImport.text.trim();
     // Dice: the count so far and the bits it carries, or what is wrong.
-    String status = '';
+    String? status;
     String? diceError;
     if (!hex && text.isNotEmpty) {
       try {
         final int n = parseDiceRolls(text).length;
-        status = ' · $n of $rolls+ rolls, '
-            '≈${(n * kDiceBitsPerRoll).floor()} bits';
+        status = '$n of $rolls+ rolls, ≈${(n * kDiceBitsPerRoll).floor()} bits';
       } on FormatException {
         diceError = 'Rolls are whole numbers 1–$kDiceFaces.';
       }
     }
     return Column(
+      mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
-        Text('$title$status', style: Theme.of(context).textTheme.bodySmall),
-        const SizedBox(height: 8),
         SegmentedButton<_ImportFormat>(
           segments: <ButtonSegment<_ImportFormat>>[
             ButtonSegment<_ImportFormat>(
@@ -5626,9 +4560,10 @@ class _SetupScreenState extends State<SetupScreen>
             isDense: true,
             border: const OutlineInputBorder(),
             labelText: hex
-                ? '$hexDigits hex digits'
-                : 'd$kDiceFaces rolls, in order',
+                ? '$title — $hexDigits hex digits'
+                : '$title — d$kDiceFaces rolls, in order',
             hintText: hex ? 'A1B2C3D4' : '7 20 3 15 …',
+            helperText: hex ? null : status,
             errorText: hex ? null : diceError,
             suffixIcon: IconButton(
               tooltip: _importHidden ? 'Show' : 'Hide',
@@ -5668,208 +4603,6 @@ class _SetupScreenState extends State<SetupScreen>
 
   // --- Expansion (grow the setup with more point stages) ---------------------
 
-  /// Open the method picker (in the console) to grow the setup to [g] point
-  /// stages: New (random), Import, or Manual. No-op unless the setup can grow.
-  void _beginExpand(int g) {
-    if (!_setup.canExpand ||
-        g < _setup.firstExpansionStage ||
-        g > SetupController.maxPointStages) {
-      _sounds.play(UiSound.denyBlocked);
-      return;
-    }
-    // The expansion editors are mutually exclusive with the point-edit one.
-    if (_pointImportStage != null) _cancelPointImport();
-    setState(() {
-      _expandImportTarget = null;
-      _expandTarget = g;
-    });
-    _sounds.play(UiSound.navStage);
-  }
-
-  /// Expand with fresh random points for every new stage (the N method), behind
-  /// a console confirmation (each new stage costs a full derivation).
-  Future<void> _expandNew() async {
-    final int? g = _expandTarget;
-    if (g == null) return;
-    final int firstNew = _setup.firstExpansionStage;
-    final int m = g - firstNew + 1;
-    setState(() => _expandTarget = null);
-    final bool ok = await _consoleConfirm(
-      message: 'Add $m new stage${m == 1 ? '' : 's'} '
-          '(Stage${m == 1 ? ' $g' : 's $firstNew–$g'}) with fresh random '
-          'points? Each derives in turn (~the usual per-stage time).',
-      confirmLabel: 'Add',
-    );
-    if (!ok || !mounted || !_setup.canExpand) return;
-    _setup.expandGenerated(g);
-    _sounds.play(UiSound.confirm);
-    _toast('Deriving $m new stage${m == 1 ? '' : 's'} '
-        '(Stage${m == 1 ? ' $g' : 's $firstNew–$g'})…');
-  }
-
-  /// Switch from the picker to the inline import editor (the I method), in
-  /// [hex] or words.
-  void _expandImport({required bool hex}) {
-    final int? g = _expandTarget;
-    if (g == null) return;
-    _pointImport.clear();
-    setState(() {
-      _pointImportFmt = hex ? _ImportFormat.hex : _ImportFormat.dice;
-      _expandTarget = null;
-      _expandImportTarget = g;
-    });
-    _pointImportFocus.requestFocus();
-  }
-
-  void _applyExpandImport() {
-    final int g = _expandImportTarget!;
-    final int firstNew = _setup.firstExpansionStage;
-    final int m = g - firstNew + 1;
-    final List<int>? bits = _importedBits(points: m);
-    if (bits == null) return;
-    final String? err = _setup.expandImportedHex(g, _bitsToHex(bits));
-    Entropy.wipe(bits);
-    if (err != null) {
-      _sounds.play(UiSound.denyInput);
-      _toast(err);
-      return;
-    }
-    _cancelExpandImport();
-    _sounds.play(UiSound.confirm);
-    _toast('Deriving $m new stage${m == 1 ? '' : 's'} '
-        '(Stage${m == 1 ? ' $g' : 's $firstNew–$g'})…');
-  }
-
-  void _cancelExpandImport() {
-    _pointImport.clear();
-    setState(() => _expandImportTarget = null);
-    _focusViewer();
-  }
-
-  /// The console method picker shown while an expansion target is chosen.
-  Widget _expandPickerBlock() {
-    final int g = _expandTarget!;
-    final int firstNew = _setup.firstExpansionStage;
-    final int m = g - firstNew + 1;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        Text('Add $m new stage${m == 1 ? '' : 's'} '
-            '(Stage${m == 1 ? ' $g' : 's $firstNew–$g'}) — choose how to fill '
-            'the new point${m == 1 ? '' : 's'}:'),
-        const SizedBox(height: 8),
-        Wrap(
-          spacing: 8,
-          runSpacing: 4,
-          children: <Widget>[
-            _expandPickButton(
-                'System random (${_layout.keys[_Cmd.newPoint.slot]})',
-                _systemRandom),
-            _expandPickButton('Import (${_layout.keys[_Cmd.dice.slot]})',
-                () => _expandImport(hex: false)),
-            _expandPickButton(
-                'Manual (${_layout.keys[_Cmd.placeByClick.slot]})', _expandManual),
-            _expandPickButton('Cancel (Esc)', _cancelExpand),
-          ],
-        ),
-      ],
-    );
-  }
-
-  Widget _expandPickButton(String label, VoidCallback onTap) => TextButton(
-        style: TextButton.styleFrom(foregroundColor: _kConsoleFg),
-        onPressed: onTap,
-        child: Text(label),
-      );
-
-  void _cancelExpand() {
-    setState(() => _expandTarget = null);
-    _focusViewer();
-  }
-
-  /// Grow the setup by hand (the R method): derive each new stage in turn and
-  /// click its point on the fresh fractal. Confirms first, grows empty stages,
-  /// enables canvas selection, and derives the first new stage; each click then
-  /// advances to the next ([_onCanvasSelect]).
-  Future<void> _expandManual() async {
-    final int? g = _expandTarget;
-    if (g == null) return;
-    final int firstNew = _setup.firstExpansionStage;
-    final int m = g - firstNew + 1;
-    setState(() => _expandTarget = null);
-    final bool ok = await _consoleConfirm(
-      message: 'Add $m new stage${m == 1 ? '' : 's'} '
-          '(Stage${m == 1 ? ' $g' : 's $firstNew–$g'}) by hand? Each derives in '
-          'turn; click your chosen point on every new fractal.',
-      confirmLabel: 'Add',
-    );
-    if (!ok || !mounted || !_setup.canExpand) return;
-    _setup.beginManualExpansion(g);
-    setState(() {
-      _expandManualActive = true;
-      _expandManualTarget = g;
-      _selectMode = true; // enable canvas point selection on the new stages
-    });
-    _sounds.play(UiSound.confirm);
-    await _deriveNextStage(); // derive Stage firstNew; the user clicks its point
-  }
-
-  /// Leave manual-expansion mode (completed or cancelled), disabling selection.
-  void _endManualExpand() {
-    setState(() {
-      _expandManualActive = false;
-      _expandManualTarget = null;
-      _selectMode = false;
-    });
-  }
-
-  /// Truncation control: exclude the displayed stage and every deeper one.
-  /// The explanation lives in the console (focus _Field.truncate); the panel
-  /// keeps only the action button for a stable, compact layout.
-  Widget _truncateControl() {
-    final int k = _setup.displayStageIndex;
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: _track(
-        _Field.truncate,
-        OutlinedButton.icon(
-          onPressed: _truncate,
-          icon: const Icon(Icons.content_cut),
-          label: Text(
-              'Exclude Stage $k and deeper '
-              '(${_layout.keys[_Cmd.exclude.slot]})'),
-        ),
-      ),
-    );
-  }
-
-  /// Exclude the displayed stage and every deeper one. Bound to the Setup
-  /// board's Exclude and the truncate button; denies when the displayed stage cannot be
-  /// truncated (Stage 0, or a not-yet-settled / recall setup).
-  Future<void> _truncate() async {
-    if (!_setup.canTruncateFromDisplayed) {
-      _sounds.play(UiSound.deny);
-      return;
-    }
-    final int k = _setup.displayStageIndex;
-    final int last = _setup.nStages - 1;
-    final String kept =
-        k == 1 ? 'only the salt/pepper text' : 'Stages 0–${k - 1}';
-    final bool ok = await _consoleConfirm(
-      message: k == last
-          ? 'Exclude Stage $k? The setup keeps $kept. This cannot be undone.'
-          : 'Exclude Stages $k–$last? The setup keeps $kept. '
-              'This cannot be undone.',
-      confirmLabel: 'Exclude',
-    );
-    if (!ok || !mounted) return;
-    _setup.truncateFrom(k);
-    _sounds.play(UiSound.undo);
-    _toast(k - 1 >= 1
-        ? 'Excluded — setup now has ${k - 1} stage${k - 1 == 1 ? '' : 's'}.'
-        : 'Excluded down to the salt/pepper text (no point stages).');
-  }
-
   /// Exclude the current orbit stage and every deeper one (the `X` hotkey while
   /// building the orbit). Keeps Stages 0..k-1 and lands on the new terminal
   /// (k-1); Stage 0 (the σ root) cannot be excluded. The deeper `o_i`/`K_i` and
@@ -5901,17 +4634,6 @@ class _SetupScreenState extends State<SetupScreen>
     _recenter();
     _sounds.play(UiSound.undo);
     _toast('Excluded — the orbit now ends at Stage ${k - 1}.');
-  }
-
-  /// The blind BIP39 seed-phrase copy. Operates on whatever has been recalled so
-  /// far via [SetupController.exportMnemonic]; shown only where a decoded seed
-  /// exists (the recall partial export and the recall-complete panel).
-  Widget _bip39CopyButton() {
-    return OutlinedButton.icon(
-      onPressed: _copyMnemonic,
-      icon: const Icon(Icons.content_copy),
-      label: const Text('Copy seed phrase (BIP39)'),
-    );
   }
 
   /// The master-secret export affordances for the **currently displayed** stage:
@@ -5952,67 +4674,11 @@ class _SetupScreenState extends State<SetupScreen>
     );
   }
 
-  Future<void> _copyMnemonic() async {
-    final String? mnemonic = _setup.exportMnemonic();
-    if (mnemonic == null) {
-      _sounds.play(UiSound.deny);
-      return;
-    }
-    await Clipboard.setData(ClipboardData(text: mnemonic));
-    if (!mounted) return;
-    _sounds.play(UiSound.exportOk);
-    // Confirmation never echoes the secret itself.
-    _toast('Seed phrase copied — paste it into your wallet, then clear the '
-        'clipboard.');
-  }
+  /// Copy the active stage's key (Setup board): `K` the conventional
+  /// first-32-chars view, the full digest with [full].
+  Future<void> _copyMasterSecret({bool full = false}) =>
+      _copyOrbitMaster(full: full);
 
-  /// Export and copy the master secret for the focused stage. `K` copies the
-  /// conventional first-32-chars view; `Alt+K` ([full]) copies the entire digest
-  /// (all [MasterSecret.outputBytes] as hex).
-  Future<void> _copyMasterSecret({bool full = false}) async {
-    if (_exporting) return;
-    // On an orbit board the "master secret" is the cheap per-stage `K_i`
-    // (no Argon2id transcript pass); route to the orbit export.
-    if (_isBoardSlot) {
-      await _copyOrbitMaster(full: full);
-      return;
-    }
-    final int idx = _setup.displayStageIndex;
-    setState(() => _exporting = true);
-    // The Argon2id pass runs off the UI isolate, so this awaits; the finally
-    // clears the in-flight flag even if it fails, and we re-check `mounted`
-    // after the await before touching the clipboard or UI.
-    String? secret;
-    try {
-      secret = await _setup.exportMasterSecret(
-        stageIndex: idx,
-        label: _exportLabel.text,
-        full: full,
-      );
-    } finally {
-      if (mounted) setState(() => _exporting = false);
-    }
-    if (!mounted) return;
-    if (secret == null) {
-      _sounds.play(UiSound.deny);
-      return;
-    }
-    final int chars = secret.length;
-    await Clipboard.setData(ClipboardData(text: secret));
-    if (!mounted) return;
-    _sounds.play(UiSound.exportOk);
-    // Confirmation never echoes the secret itself.
-    _toast(full
-        ? 'Full key copied ($chars chars) — paste it, then clear the clipboard.'
-        : 'Key copied — paste it, then clear the clipboard.');
-  }
-
-  /// Copy the active orbit stage's master secret `K_i` to the clipboard, reusing
-  /// the same field, hotkeys and button as the legacy export. An empty export-salt
-  /// label copies `K_i` itself; a non-empty one copies the domain-separated
-  /// `H(K_i ‖ label)` (the demoted `[A-Z0-9-]` pepper — one setup, many keys).
-  /// `K` copies the conventional first-32-hex view; `Alt+K` ([full]) the whole
-  /// digest. Cheap `H` throughout — no Argon2id pass, so no deriving spinner.
   /// Entropy actually behind the exported key at [stage]: the placed points,
   /// `Σ r_j × 32` bits over stages `0..stage`. This is what an attacker must
   /// guess; the 512-bit state and the copied view can each *cap* what is
@@ -6045,6 +4711,11 @@ class _SetupScreenState extends State<SetupScreen>
         '($placed placed, $viewBits in this view; limited by $limit)';
   }
 
+  /// Copy the active stage's key to the clipboard, blind: `K_i^L =
+  /// TH(export-label, K_i ‖ L)` under the key label L (the empty one too, so
+  /// `K_i` itself is never handed out) — one setup, many keys. The
+  /// conventional first-32-hex view, or the whole digest with [full]. Cheap
+  /// hashes only, no Argon2id pass.
   Future<void> _copyOrbitMaster({bool full = false}) async {
     final Uint8List? ki = _activeK;
     if (ki == null) {
@@ -6126,14 +4797,11 @@ class _SetupScreenState extends State<SetupScreen>
   /// field stays focused.
   String _fieldHelp(_Field f) {
     switch (f) {
-      case _Field.stages:
-        return 'Number of stages: $_pointStages (0–4). 0 = Stage-0 text only; '
-            '4 = 12 words / 128 bits. ← → or drag to change.';
       case _Field.iterations:
         final String n = _iterationsField.text.trim();
         return 'Derivation steps per stage (D) = ${n.isEmpty ? '—' : n} (0…∞): '
             'the memory-hard passes each stage runs — the orbit advance '
-            'oᵢ₊₁ = H*(Kᵢ), and the legacy chain alike. Higher = longer, '
+            'oᵢ₊₁ = H*(Kᵢ). Higher = longer, '
             'stronger (hours to weeks); 0 = instant pass-through (dev only, not '
             'memory-hard).';
       case _Field.profile:
@@ -6142,25 +4810,16 @@ class _SetupScreenState extends State<SetupScreen>
         return 'Argon2 profile: ${_profileLabels[idx]} — memory per pass. '
             '← → or drag to change.';
       case _Field.exportLabel:
-        if (_isBoardSlot) {
-          return 'Key (master-secret export): this stage’s orbit key '
-              'Kᵢ = TH(tag, oᵢ ‖ Shᵢ), fixed once rᵢ fractals are placed and '
-              'domain-separated from the orbit advance — leaking it does not '
-              'expose the deeper stages. What you copy is Kᵢ salted by this '
-              'label. '
-              '${_exportEntropyNote(_activeStage, MasterSecret.displayChars * 4)}. '
-              'Paste into another wallet or use as a downstream pepper. The '
-              'optional salt versions the key (e.g. SIGNING-1, '
-              'uppercase/digits/hyphen). ${_hint(_Cmd.copyKey)} copies it — '
-              'blind, never shown.';
-        }
-        final int idx = _setup.displayStageIndex;
-        return 'Key (master-secret export): Argon2id over your setup so far '
-            '(stages 1–$idx). Paste into another wallet or use as a downstream '
-            'pepper. This optional salt versions the key (e.g. SIGNING-1, '
-            'uppercase/digits/hyphen). ${_hint(_Cmd.copyKey)} derives and copies '
-            'it — blind, '
-            'never shown.';
+        return 'Key (master-secret export): this stage’s orbit key '
+            'Kᵢ = TH(tag, oᵢ ‖ Shᵢ), fixed once rᵢ fractals are placed and '
+            'domain-separated from the orbit advance — leaking it does not '
+            'expose the deeper stages. What you copy is Kᵢ salted by this '
+            'label. '
+            '${_exportEntropyNote(_activeStage, MasterSecret.displayChars * 4)}. '
+            'Paste into another wallet or use as a downstream pepper. The '
+            'optional salt versions the key (e.g. SIGNING-1, '
+            'uppercase/digits/hyphen). ${_hint(_Cmd.copyKey)} copies it — '
+            'blind, never shown.';
       case _Field.hue:
         return 'Colour scheme: ${_hue.name}. ← → to cycle through the six hues.';
       case _Field.vault:
@@ -6169,14 +4828,6 @@ class _SetupScreenState extends State<SetupScreen>
             'it at graduation. Protect it with your own password (managed/deleted '
             'in a password manager) or an app-generated key shown as a small QR '
             'to print and keep OFFLINE. The file is useless without its secret.';
-      case _Field.truncate:
-        final int k = _setup.displayStageIndex;
-        final int last = _setup.nStages - 1;
-        return k == last
-            ? 'Shorten the setup by excluding this last stage (Stage $k), '
-                'keeping Stages 0–${k - 1}. Cannot be undone.'
-            : 'Shorten the setup: exclude Stage $k and every deeper stage '
-                '(Stages $k–$last), keeping Stages 0–${k - 1}. Cannot be undone.';
     }
   }
 
@@ -6188,23 +4839,22 @@ class _SetupScreenState extends State<SetupScreen>
     if (!p.completer.isCompleted) p.completer.complete(ok);
   }
 
-  /// Reset behind an inline console confirmation, so the Z hotkey (or a stray
+  /// Reset behind an inline console confirmation, so the Reset key (or a stray
   /// keypress) cannot discard a setup by accident.
   Future<void> _confirmReset() async {
     final bool ok = await _consoleConfirm(
-      message: 'Reset and discard the current setup? Un-memorised points and '
-          'any entered text will be lost.',
+      message: 'Reset and discard the current setup? σ, every placed point and '
+          'every stage reached will be lost.',
       confirmLabel: 'Reset',
     );
-    if (ok && mounted) _reset();
+    if (ok && mounted && !_busy) _reset();
   }
 
-  /// Halt a running derivation behind a console confirmation (the A hotkey).
-  /// Kills only the current Argon2 pass; every completed intermediary digest of
-  /// the working stage is kept, as are the stages already derived. No-op with a
-  /// deny cue when nothing is deriving.
+  /// Halt the running advance behind a console confirmation (Setup board).
+  /// Kills only the current pass; every pass completed is kept, and the same
+  /// key then resumes. No-op with a deny cue when nothing is deriving.
   Future<void> _abortDerivation() async {
-    if (!_busy && !_setup.isGenerating) {
+    if (!_busy) {
       _sounds.play(UiSound.deny);
       return;
     }
@@ -6215,36 +4865,30 @@ class _SetupScreenState extends State<SetupScreen>
       confirmLabel: 'Halt',
     );
     if (!ok || !mounted) return;
-    // The orbit advance runs in its own job; the legacy chain in the
-    // controller.
-    if (_advanceJob != null) {
-      _advanceJob!.cancel(); // the advance reports the halt itself
-    } else if (_busy || _setup.isGenerating) {
-      _setup.halt();
-      _toast('Halted — progress kept.');
-    }
+    _advanceJob?.cancel(); // the advance reports the halt itself
   }
 
   void _reset() {
     _sounds.play(UiSound.click);
     _resolvePrompt(false); // drop any pending console confirmation
-    _setup.reset();
     _brightness.reset();
     _viewport.viewport = _initialViewport;
     _exportLabel.clear();
+    _sigmaCtrl.clear();
     setState(() {
-      _selectMode = false;
-      _stage0Hidden = true;
+      _clearOrbitPlacements();
       _exportLabelRestricted = false;
+      _slotIndex = 0;
     });
-    _focusViewer(); // back on the config screen; hotkeys act on the viewer
+    _setOrbitStage(0);
+    _focusViewer(); // hotkeys act on the viewer
   }
 }
 
 
 /// A stage-0 board's canonical-island decoration: the island cells plus its
 /// bounding box (fractal coords), used to draw the square frame and to size the
-/// cross↔square switch. The orbit peer of SetupController's `_IslandDeco`.
+/// cross↔square switch.
 class _BoardDeco {
   const _BoardDeco({
     required this.cells,
@@ -6267,20 +4911,18 @@ class _BoardDeco {
   final int escapeCount;
 }
 
-/// How imported entropy is entered: BIP39 words, or blind uppercase hex (for
-/// users who trust an external randomness source over the device RNG).
+/// How a point's entropy is entered: Dragon Dice rolls, or blind uppercase hex
+/// (for users who trust an external randomness source over the device RNG).
 enum _ImportFormat { dice, hex }
 
 /// The input controls whose label + live value are conveyed in the console while
 /// focused (so the panel itself can stay label-free).
 enum _Field {
-  stages,
   iterations,
   profile,
   exportLabel,
   hue,
   vault,
-  truncate,
 }
 
 /// The command board's commands, each at its context and position (an index
@@ -6480,7 +5122,7 @@ class _ConsolePrompt {
 
 /// Maps the number-row and numpad digit keys to a stage index, so pressing a
 /// number focuses that stage (when no text field holds the keystroke). Valid
-/// stages are 0..4 ([SetupController.maxPointStages]); 5..9 are included so they
+/// stages are 0..4 ([OrbitProtocol.maxStage]); 5..9 are included so they
 /// produce the usual out-of-range cue rather than nothing.
 ///
 /// Not `const`: [LogicalKeyboardKey] has no primitive `==`, so it cannot be a
@@ -6516,7 +5158,7 @@ final Map<LogicalKeyboardKey, int> _digitKeys = <LogicalKeyboardKey, int>{
 ///
 /// States: **available/selected** (lit) · **deriving** (filling left→right) ·
 /// **pending** — requested but not derived (grey) · **ghost** — a slot outside
-/// the current setup (a hollow frame the chain can still grow into).
+/// the current setup (a hollow frame the orbit can still grow into).
 class _StageTab extends StatelessWidget {
   const _StageTab({
     required this.index,
@@ -6572,7 +5214,7 @@ class _StageTab extends StatelessWidget {
   /// (available / selected).
   Widget _restingFace(ColorScheme scheme) {
     if (!inSetup) {
-      // Ghost: a faint hollow slot — an open quest the chain can grow into.
+      // Ghost: a faint hollow slot — an open quest the orbit can grow into.
       return _box(
         bg: Colors.transparent,
         border: scheme.outlineVariant.withValues(alpha: 0.25),
@@ -6668,11 +5310,11 @@ class _LeftFractionClipper extends CustomClipper<Rect> {
 ///
 /// Rather than reimplement the rule, this delegates to the shared engine
 /// ([GreatWallCore.canonicalizeSaltPepper], backed by
-/// `bs_salt_pepper_canonicalize`) — the *same* canonicalisation that builds the
-/// chain seed, so the field shows exactly the bytes that will be hashed. The
-/// `[A-Z0-9-]` restriction (DESIGN.md "Strong text restrictions") exists so the
-/// text reproduces identically across devices; a stray case/accent/look-alike
-/// would silently fork the chain into an unrecoverable result.
+/// `bs_salt_pepper_canonicalize`) — the *same* canonicalisation the key label
+/// is hashed with, so the field shows exactly the bytes that will be hashed.
+/// The `[A-Z0-9-]` restriction (DESIGN.md "Strong text restrictions") exists
+/// so the text reproduces identically across devices; a stray
+/// case/accent/look-alike would silently change the exported key.
 ///
 /// [onResult] is called with whether the engine had to adjust the text, so the
 /// field can flag the user — the divergence is never silent.
@@ -6888,7 +5530,7 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
   @override
   void initState() {
     super.initState();
-    _stages = widget.initialStages.clamp(1, SetupController.maxPointStages);
+    _stages = widget.initialStages.clamp(1, OrbitProtocol.maxStage);
   }
 
   /// Recompute N from the single benchmark + the current target / scope / stages
@@ -7161,7 +5803,7 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                         ),
                         Text('$_stages', style: theme.textTheme.titleMedium),
                         IconButton(
-                          onPressed: _stages < SetupController.maxPointStages
+                          onPressed: _stages < OrbitProtocol.maxStage
                               ? () => setState(() {
                                     _stages++;
                                     _recompute();

@@ -34,6 +34,9 @@ class OrbitProtocol {
 
   final GreatWallCore core;
 
+  /// The deepest stage the app builds: stages run 0..4, one tab each.
+  static const int maxStage = 4;
+
   /// Discovery params for the per-board encode/decode. Defaults to the engine's
   /// canonical [GreatWallCore.encodeParams]; tests pass lighter params for speed
   /// (encode and decode MUST use the same — a mismatch changes the bijection).
