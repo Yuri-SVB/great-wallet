@@ -35,6 +35,7 @@ class BoardCommand {
     this.enabled = true,
     this.active = false,
     this.repeats = false,
+    this.cue,
   }) : assert(icon != null || glyph != null);
 
   /// Its name, shown on hover and in the log.
@@ -55,7 +56,32 @@ class BoardCommand {
 
   /// Runs again while its key is held (steps such as volume or brightness).
   final bool repeats;
+
+  /// Its sound-cue name, under `press.` and `hover.` (e.g. `setup.dice`);
+  /// null for none.
+  final String? cue;
+
+  /// This command with [cue] as its sound-cue name.
+  BoardCommand withCue(String cue) => BoardCommand(
+        name: name,
+        help: help,
+        run: run,
+        icon: icon,
+        glyph: glyph,
+        enabled: enabled,
+        active: active,
+        repeats: repeats,
+        cue: cue,
+      );
 }
+
+/// Sound-cue name prefixes: a control activated, and a control under the
+/// pointer or focus.
+const String kCuePress = 'press';
+const String kCueHover = 'hover';
+
+/// The cue name stem of context tab [c].
+String contextTabCue(CommandContext c) => 'tab.context.${c.name}';
 
 /// Size of a board button and the gap between buttons, in logical pixels.
 const double kBoardButtonWidth = 56;
@@ -74,6 +100,7 @@ class CommandBoard extends StatelessWidget {
     required this.layout,
     required this.onContext,
     required this.onExplain,
+    required this.onCue,
     required this.colour,
   });
 
@@ -86,6 +113,10 @@ class CommandBoard extends StatelessWidget {
   final KeyboardLayout layout;
   final ValueChanged<CommandContext> onContext;
   final ValueChanged<String?> onExplain;
+
+  /// Plays a sound cue by name: a button pressed or hovered, a tab hovered
+  /// (a tab's press is its context switch's to voice).
+  final ValueChanged<String> onCue;
 
   /// Foreground colour of icons and letters.
   final Color colour;
@@ -109,6 +140,7 @@ class CommandBoard extends StatelessWidget {
                   colour: colour,
                   onTap: () => onContext(c),
                   onExplain: onExplain,
+                  onHover: () => onCue('$kCueHover.${contextTabCue(c)}'),
                 ),
               ),
           ],
@@ -128,6 +160,7 @@ class CommandBoard extends StatelessWidget {
                       keyLabel: layout.keys[row * kBoardColumns + col],
                       colour: colour,
                       onExplain: onExplain,
+                      onCue: onCue,
                     ),
                   ),
               ],
@@ -151,6 +184,7 @@ class _Tab extends StatelessWidget {
     required this.colour,
     required this.onTap,
     required this.onExplain,
+    required this.onHover,
   });
 
   final CommandContext tab;
@@ -159,12 +193,14 @@ class _Tab extends StatelessWidget {
   final Color colour;
   final VoidCallback onTap;
   final ValueChanged<String?> onExplain;
+  final VoidCallback onHover;
 
   @override
   Widget build(BuildContext context) {
     final String text = '${tab.label} commands ($keyLabel).';
     return _Hover(
       onExplain: onExplain,
+      onHover: onHover,
       text: text,
       child: Material(
         color: selected ? colour.withValues(alpha: 0.18) : Colors.transparent,
@@ -174,7 +210,10 @@ class _Tab extends StatelessWidget {
         ),
         child: InkWell(
           onTap: onTap,
-          onFocusChange: (bool has) => onExplain(has ? text : null),
+          onFocusChange: (bool has) {
+            onExplain(has ? text : null);
+            if (has) onHover();
+          },
           child: SizedBox(
             width: kBoardButtonWidth,
             height: 26,
@@ -202,12 +241,14 @@ class _Button extends StatelessWidget {
     required this.keyLabel,
     required this.colour,
     required this.onExplain,
+    required this.onCue,
   });
 
   final BoardCommand? command;
   final String keyLabel;
   final Color colour;
   final ValueChanged<String?> onExplain;
+  final ValueChanged<String> onCue;
 
   @override
   Widget build(BuildContext context) {
@@ -242,16 +283,29 @@ class _Button extends StatelessWidget {
     );
     if (c == null) return Material(color: Colors.transparent, shape: shape, child: face);
     final String text = explainCommand(c, keyLabel);
+    void hover() {
+      if (c.cue != null) onCue('$kCueHover.${c.cue}');
+    }
+
     return _Hover(
       onExplain: onExplain,
+      onHover: hover,
       text: text,
       child: Material(
         color: c.active ? colour.withValues(alpha: 0.22) : Colors.transparent,
         shape: shape,
         child: InkWell(
-          onTap: c.enabled ? c.run : null,
+          onTap: c.enabled
+              ? () {
+                  if (c.cue != null) onCue('$kCuePress.${c.cue}');
+                  c.run();
+                }
+              : null,
           canRequestFocus: true,
-          onFocusChange: (bool has) => onExplain(has ? text : null),
+          onFocusChange: (bool has) {
+            onExplain(has ? text : null);
+            if (has) hover();
+          },
           child: Semantics(label: c.name, button: true, child: face),
         ),
       ),
@@ -259,17 +313,27 @@ class _Button extends StatelessWidget {
   }
 }
 
-/// Reports [text] while the pointer is over [child], and null when it leaves.
+/// Reports [text] while the pointer is over [child], and null when it leaves;
+/// [onHover] when it enters.
 class _Hover extends StatelessWidget {
-  const _Hover({required this.onExplain, required this.text, required this.child});
+  const _Hover({
+    required this.onExplain,
+    required this.onHover,
+    required this.text,
+    required this.child,
+  });
 
   final ValueChanged<String?> onExplain;
+  final VoidCallback onHover;
   final String text;
   final Widget child;
 
   @override
   Widget build(BuildContext context) => MouseRegion(
-        onEnter: (_) => onExplain(text),
+        onEnter: (_) {
+          onExplain(text);
+          onHover();
+        },
         onExit: (_) => onExplain(null),
         child: child,
       );

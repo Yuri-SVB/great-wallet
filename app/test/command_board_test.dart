@@ -31,6 +31,7 @@ void main() {
     KeyboardLayout layout = KeyboardLayout.qwerty,
     ValueChanged<String?>? onExplain,
     ValueChanged<CommandContext>? onContext,
+    ValueChanged<String>? onCue,
   }) =>
       MaterialApp(
         home: Scaffold(
@@ -41,6 +42,7 @@ void main() {
             colour: Colors.white,
             onContext: onContext ?? (_) {},
             onExplain: onExplain ?? (_) {},
+            onCue: onCue ?? (_) {},
           ),
         ),
       );
@@ -97,6 +99,43 @@ void main() {
     await mouse.moveTo(const Offset(1000, 1000));
     await tester.pump();
     expect(explained.last, isNull);
+  });
+
+  testWidgets('pressing and hovering a button voice its cues',
+      (WidgetTester tester) async {
+    final List<String> cues = <String>[];
+    final List<BoardCommand?> commands = List<BoardCommand?>.filled(12, null)
+      ..[0] = BoardCommand(
+        name: 'First',
+        help: 'Voiced.',
+        icon: Icons.save,
+        run: () {},
+      ).withCue('main.first')
+      ..[1] = BoardCommand(
+        name: 'Second',
+        help: 'Not now.',
+        icon: Icons.key,
+        enabled: false,
+        run: () {},
+      ).withCue('main.second');
+    await tester.pumpWidget(host(commands: commands, onCue: cues.add));
+    final TestGesture mouse =
+        await tester.createGesture(kind: PointerDeviceKind.mouse);
+    // Off the board, so the way in crosses nothing else.
+    await mouse.addPointer(location: const Offset(1000, 1000));
+    addTearDown(mouse.removePointer);
+    await mouse.moveTo(tester.getCenter(find.byIcon(Icons.save)));
+    await tester.pump();
+    expect(cues, <String>['$kCueHover.main.first']);
+    await tester.tap(find.byIcon(Icons.save));
+    expect(cues.last, '$kCuePress.main.first');
+    cues.clear();
+    await tester.tap(find.byIcon(Icons.key));
+    expect(cues, isNot(contains('$kCuePress.main.second')),
+        reason: 'a disabled button is not pressed');
+    await mouse.moveTo(tester.getCenter(find.byIcon(CommandContext.path.icon)));
+    await tester.pump();
+    expect(cues.last, '$kCueHover.${contextTabCue(CommandContext.path)}');
   });
 
   testWidgets('a tab switches context', (WidgetTester tester) async {

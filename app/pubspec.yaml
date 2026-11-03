@@ -47,6 +47,11 @@ dependencies:
   # lib/src/setup/setup_crypto.dart.
   cryptography: ^2.7.0
 
+  # The app's data folder, where the sound-cue folder lives by default (see
+  # lib/src/app/sound_cue_folder.dart). Already in the build through
+  # audioplayers; named here because the app uses it directly.
+  path_provider: ^2.1.0
+
   # QR module matrix for the provisional-key code. The 16-byte key is encoded in
   # byte mode (so it rides a v1 21x21 symbol), which qr_flutter's string-only API
   # can't express, so we build the matrix with the qr package and render both the

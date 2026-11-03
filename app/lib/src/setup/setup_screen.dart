@@ -14,6 +14,7 @@ import 'package:great_wall_ux/great_wall_ux.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:qr/qr.dart' as qr;
 
+import '../app/sound_cue_folder.dart';
 import '../command/command_board.dart';
 import '../command/keyboard_layout.dart';
 import '../command/zoom_flight.dart';
@@ -423,18 +424,79 @@ class _SetupScreenState extends State<SetupScreen>
     _viewport.addListener(_onBoardViewportChanged);
     _autoExposureWasOn = _brightness.autoExposure;
     _brightness.addListener(_onBrightnessChanged);
+    unawaited(_cueFolder.start());
   }
 
-  /// Announce auto brightness switching on or off — by `A`, or off by a manual
-  /// L / G adjustment (including L / G + scroll over the canvas, which the
-  /// canvas handles itself). The mode is announced; the values never are.
+  /// The folder the sound cues are swapped in at run time.
+  late final SoundCueFolder _cueFolder = SoundCueFolder(
+    apply: (SoundCueMap map, Map<String, String> files) =>
+        _sounds.applyCues(map, localFiles: files),
+    appDefaults: _kCueDefaults,
+    catalogue: _cueCatalogue(),
+    onLog: (String m) {
+      if (mounted) _toast(m);
+    },
+  );
+
+  /// This screen's own cue defaults, over the built-in ones: controls that
+  /// voiced a sound of their own before press cues keep it.
+  static const String _kCueDefaults = """
+# --- This app's defaults ----------------------------------------------------
+press.advance.halt        select.wav
+press.calibrate.scope     tick_soft.wav
+press.calibrate.target    tick_soft.wav
+""";
+
+  /// Every cue name this screen plays beyond the built-in families: each
+  /// board command's press and hover, the tabs', and [_Cue.all].
+  static List<String> _cueCatalogue() => <String>[
+        for (final _Cmd c in _Cmd.values) ...<String>[
+          '$kCuePress.${c.cue}',
+          '$kCueHover.${c.cue}',
+        ],
+        for (final CommandContext c in CommandContext.values) ...<String>[
+          '$kCuePress.${contextTabCue(c)}',
+          '$kCueHover.${contextTabCue(c)}',
+        ],
+        for (final String tab in <String>[_Cue.stageTab, _Cue.slotTab])
+          ...<String>['$kCuePress.$tab', '$kCueHover.$tab'],
+        ..._Cue.all,
+      ];
+
+  /// Play cue [name] (see [SoundCueMap]).
+  void _cue(String name) => _sounds.cue(name);
+
+  /// Show a dialog through [show], voicing its opening and closing as dialog
+  /// [id].
+  Future<T?> _dialog<T>(String id, Future<T?> Function() show) async {
+    _cue('${_Cue.dialogOpen}.$id');
+    try {
+      return await show();
+    } finally {
+      _cue('${_Cue.dialogClose}.$id');
+    }
+  }
+
+  /// [f], voicing the press of control [id] first; null stays null (a
+  /// disabled control).
+  VoidCallback? _press(String id, VoidCallback? f) => f == null
+      ? null
+      : () {
+          _cue('$kCuePress.$id');
+          f();
+        };
+
+  /// Announce auto brightness switching on or off — by the View board, or off
+  /// by a manual brightness or shade step. The mode is announced; the values
+  /// never are.
   void _onBrightnessChanged() {
     final bool on = _brightness.autoExposure;
     if (on == _autoExposureWasOn || !mounted) return;
     _autoExposureWasOn = on;
     _sounds.play(on ? UiSound.modeOn : UiSound.modeOff);
     _toast(on
-        ? 'Auto brightness ON — follows the view; L / G take back control.'
+        ? 'Auto brightness ON — follows the view; brighter / darker take '
+            'back control.'
         : 'Auto brightness off.');
   }
 
@@ -541,6 +603,7 @@ class _SetupScreenState extends State<SetupScreen>
     _viewport.dispose();
     _brightness.removeListener(_onBrightnessChanged);
     _brightness.dispose();
+    unawaited(_cueFolder.dispose());
     _sounds.dispose();
     _iterationsField.dispose();
     _exportLabel.dispose();
@@ -601,27 +664,26 @@ class _SetupScreenState extends State<SetupScreen>
   Map<ShortcutActivator, VoidCallback> get _globalShortcuts =>
       <ShortcutActivator, VoidCallback>{
         const SingleActivator(LogicalKeyboardKey.escape): _focusViewer,
-        const SingleActivator(LogicalKeyboardKey.f1): _togglePanel,
+        const SingleActivator(LogicalKeyboardKey.f1): () =>
+            _togglePanel(byKey: true),
         const SingleActivator(LogicalKeyboardKey.f2): () =>
-            _gotoMode('Setup', here: true),
+            _gotoMode('Setup', _Cue.f2, here: true),
         const SingleActivator(LogicalKeyboardKey.f3): () =>
-            _gotoMode('Train', here: false),
+            _gotoMode('Train', _Cue.f3, here: false),
         const SingleActivator(LogicalKeyboardKey.f4): () =>
-            _gotoMode('Accelerate', here: false),
+            _gotoMode('Accelerate', _Cue.f4, here: false),
         const SingleActivator(LogicalKeyboardKey.f5): () =>
-            _gotoMode('Inherit', here: false),
+            _gotoMode('Inherit', _Cue.f5, here: false),
       };
 
   /// Switch top-level mode (F2 Setup · F3 Train · F4 Accelerate · F5 Inherit).
   /// Only Setup exists in this app today; the others announce themselves so the
   /// keys (and muscle memory) are correct from the start.
-  void _gotoMode(String name, {required bool here}) {
-    if (here) {
-      _toast('$name (current mode).');
-    } else {
-      _sounds.play(UiSound.deny);
-      _toast('$name mode is not available yet.');
-    }
+  void _gotoMode(String name, String cue, {required bool here}) {
+    _cue(cue);
+    _toast(here
+        ? '$name (current mode).'
+        : '$name mode is not available yet.');
   }
 
   /// Return keyboard focus to the fractal viewer (and so out of any text field),
@@ -638,16 +700,20 @@ class _SetupScreenState extends State<SetupScreen>
 
   /// Collapse or restore the panels — the command board and the log, and the
   /// stage and slot tabs (F1).
-  void _togglePanel() {
+  void _togglePanel({bool byKey = false}) {
     final bool collapsing = !_chromeMinimized;
-    _sounds.play(collapsing ? UiSound.chromeDown : UiSound.chromeUp);
+    if (byKey) {
+      _cue(collapsing ? _Cue.f1Collapse : _Cue.f1Restore);
+    } else {
+      _sounds.play(collapsing ? UiSound.chromeDown : UiSound.chromeUp);
+    }
     setState(() => _chromeMinimized = collapsing);
   }
 
   /// Show the board's [c] context (Alt + its top-row key), restoring the panel
   /// if it was collapsed.
   void _setContext(CommandContext c) {
-    _sounds.play(UiSound.click);
+    _cue('$kCuePress.${contextTabCue(c)}');
     setState(() {
       _context = c;
       _chromeMinimized = false;
@@ -807,6 +873,8 @@ class _SetupScreenState extends State<SetupScreen>
                       progress: 0,
                       explanation: _slotExplanation(i),
                       onExplain: _explain,
+                      cue: '${_Cue.slotTab}.$i',
+                      onCue: _cue,
                       onTap: () => _selectSlot(i),
                     ),
                   ),
@@ -832,13 +900,13 @@ class _SetupScreenState extends State<SetupScreen>
   Future<void> _harvestFromDate() async {
     final DateTime now = DateTime.now();
     final DateTime today = DateTime(now.year, now.month, now.day);
-    final DateTime? picked = await showDatePicker(
+    final DateTime? picked = await _dialog(_Cue.harvestDate, () => showDatePicker(
       context: context,
       initialDate: _harvestedDate ?? today,
       firstDate: DateTime(2009, 1, 3), // Bitcoin genesis
       lastDate: today,
       helpText: 'Harvest σ from the timechain at a date',
-    );
+    ));
     if (picked == null) return;
     setState(() {
       _harvesting = true;
@@ -910,7 +978,8 @@ class _SetupScreenState extends State<SetupScreen>
               Row(
                 children: <Widget>[
                   OutlinedButton.icon(
-                    onPressed: _harvesting ? null : _harvestFromDate,
+                    onPressed:
+                        _press(_Cue.harvest, _harvesting ? null : _harvestFromDate),
                     icon: const Icon(Icons.calendar_month),
                     label: const Text('Harvest from date'),
                   ),
@@ -924,7 +993,7 @@ class _SetupScreenState extends State<SetupScreen>
                     Text('Fetching headers…', style: theme.textTheme.bodySmall),
                     const SizedBox(width: 12),
                     TextButton(
-                        onPressed: _cancelHarvest,
+                        onPressed: _press(_Cue.harvestCancel, _cancelHarvest),
                         child: const Text('Cancel')),
                   ],
                 ],
@@ -1045,6 +1114,8 @@ class _SetupScreenState extends State<SetupScreen>
                       progress: _advanceProgress,
                       explanation: _stageExplanation(i),
                       onExplain: _explain,
+                      cue: '${_Cue.stageTab}.$i',
+                      onCue: _cue,
                       onTap: i <= ceiling + 1 ? () => _selectStage(i) : null,
                     ),
                   ),
@@ -1094,6 +1165,7 @@ class _SetupScreenState extends State<SetupScreen>
         if (event is KeyDownEvent) _sounds.play(UiSound.denyBlocked);
         return KeyEventResult.handled;
       }
+      if (c.cue != null) _cue('$kCuePress.${c.cue}');
       c.run();
       return KeyEventResult.handled;
     }
@@ -1115,7 +1187,7 @@ class _SetupScreenState extends State<SetupScreen>
     final List<BoardCommand?> out =
         List<BoardCommand?>.filled(kBoardKeys.length, null);
     for (final _Cmd c in _Cmd.values) {
-      if (c.context == _context) out[c.slot] = _command(c);
+      if (c.context == _context) out[c.slot] = _command(c).withCue(c.cue);
     }
     return out;
   }
@@ -1159,7 +1231,6 @@ class _SetupScreenState extends State<SetupScreen>
       _sounds.play(UiSound.denyBlocked);
       return;
     }
-    _sounds.play(UiSound.click);
     _setRoute(key, (
       rho: nextRho,
       exponent: nextExponent,
@@ -1170,7 +1241,6 @@ class _SetupScreenState extends State<SetupScreen>
   /// Step the colour scheme through the six hues.
   void _stepHue(int dir) {
     const List<HueOffset> order = HueOffset.values;
-    _sounds.play(UiSound.click);
     setState(() => _hue = order[(_hue.index + dir) % order.length]);
   }
 
@@ -1187,7 +1257,6 @@ class _SetupScreenState extends State<SetupScreen>
               'build sets the default; a change lasts this session.',
           icon: Icons.keyboard,
           run: () {
-            _sounds.play(UiSound.click);
             setState(() => _layout = _layout.next);
             _toast('Keyboard layout: ${_layout.label}.');
           },
@@ -1528,7 +1597,6 @@ class _SetupScreenState extends State<SetupScreen>
   /// Reveal or hide the imported dice rolls or hex (Main board).
   void _toggleSensitiveVisibility() {
     final bool reveal = _importHidden;
-    _sounds.play(UiSound.click);
     setState(() => _importHidden = !reveal);
     _toast(reveal ? 'Sensitive text revealed.' : 'Sensitive text hidden.');
   }
@@ -2641,7 +2709,6 @@ class _SetupScreenState extends State<SetupScreen>
   /// [_changePointManual]: the next canvas click sets slot [_slotIndex]'s point.
   void _armBoardManual() {
     setState(() => _editPointMode = true);
-    _sounds.play(UiSound.click);
     _toast('Click the point for slot $_slotIndex (Esc to cancel).');
   }
 
@@ -3091,7 +3158,8 @@ class _SetupScreenState extends State<SetupScreen>
   }) {
     final Completer<bool> completer = Completer<bool>();
     _resolvePrompt(false); // decline any already-pending prompt first
-    _sounds.play(UiSound.warn); // a destructive confirmation is being raised
+    // A confirmation is being raised: the disclaimer's, or an ordinary one.
+    _cue(warning ? _Cue.alertWarning : _Cue.alertConfirm);
     setState(() {
       _chromeMinimized = false; // make sure the prompt is visible
       _prompt = _ConsolePrompt(
@@ -3144,12 +3212,12 @@ class _SetupScreenState extends State<SetupScreen>
             ),
             const SizedBox(height: 8),
             TextButton(
-              onPressed: _advanceJob == null
-                  ? null
-                  : () {
-                      _sounds.play(UiSound.select);
-                      _advanceJob?.cancel();
-                    },
+              onPressed: _press(
+                _Cue.advanceHalt,
+                _advanceJob == null
+                    ? null
+                    : () => _advanceJob?.cancel(),
+              ),
               child: const Text('Halt'),
             ),
           ],
@@ -3225,7 +3293,10 @@ class _SetupScreenState extends State<SetupScreen>
           tooltip: 'Restore (F1)',
           color: _kConsoleFg,
           icon: const Icon(Icons.keyboard_arrow_up),
-          onPressed: () => setState(() => _chromeMinimized = false),
+          onPressed: _press(
+            _Cue.panelRestore,
+            () => setState(() => _chromeMinimized = false),
+          ),
         ),
       ],
     );
@@ -3259,6 +3330,7 @@ class _SetupScreenState extends State<SetupScreen>
               colour: _kConsoleFg,
               onContext: _setContext,
               onExplain: _explain,
+              onCue: _cue,
             ),
           ),
           VerticalDivider(
@@ -3297,7 +3369,7 @@ class _SetupScreenState extends State<SetupScreen>
               tooltip: 'Collapse (F1)',
               color: _kConsoleFg,
               icon: const Icon(Icons.keyboard_arrow_down),
-              onPressed: _togglePanel,
+              onPressed: _press(_Cue.panelCollapse, _togglePanel),
             ),
           ],
         ),
@@ -3399,7 +3471,8 @@ class _SetupScreenState extends State<SetupScreen>
             children: <Widget>[
               TextButton(
                 style: TextButton.styleFrom(foregroundColor: _kConsoleFg),
-                onPressed: () => _resolvePrompt(false),
+                onPressed:
+                    _press(_Cue.promptCancel, () => _resolvePrompt(false)),
                 child: Text(p.cancelLabel),
               ),
               const SizedBox(width: 8),
@@ -3408,7 +3481,8 @@ class _SetupScreenState extends State<SetupScreen>
                   backgroundColor: _kConsoleFg,
                   foregroundColor: _kConsoleBg,
                 ),
-                onPressed: () => _resolvePrompt(true),
+                onPressed:
+                    _press(_Cue.promptConfirm, () => _resolvePrompt(true)),
                 child: Text(p.confirmLabel),
               ),
             ],
@@ -3448,7 +3522,7 @@ class _SetupScreenState extends State<SetupScreen>
             value: _hue,
             focusNode: _hueFocus,
             onChanged: (HueOffset h) {
-              _sounds.play(UiSound.click);
+              _cue('$kCuePress.${_Cue.hueWheel}');
               setState(() => _hue = h);
             },
           ),
@@ -3536,7 +3610,7 @@ class _SetupScreenState extends State<SetupScreen>
     if (_busy) return;
     final int profileIdx =
         _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
-    final int? n = await showDialog<int>(
+    final int? n = await _dialog(_Cue.calibrate, () => showDialog<int>(
       context: context,
       barrierDismissible: false,
       builder: (BuildContext _) => _CalibrationDialog(
@@ -3546,7 +3620,7 @@ class _SetupScreenState extends State<SetupScreen>
         profileLabel: _profileLabels[profileIdx],
         initialStages: _pointStages,
       ),
-    );
+    ));
     if (!mounted || n == null) return;
     setState(() {
       _iterations = n;
@@ -3992,7 +4066,7 @@ class _SetupScreenState extends State<SetupScreen>
     final FocusNode hexFocus = FocusNode(debugLabel: 'open-hex');
     Uint8List? keyBytes;
 
-    await showDialog<void>(
+    await _dialog(_Cue.openFile, () => showDialog<void>(
       context: context,
       builder: (BuildContext ctx) {
         void loadHex() {
@@ -4061,16 +4135,16 @@ class _SetupScreenState extends State<SetupScreen>
               actions: <Widget>[
                 if (canScan)
                   TextButton.icon(
-                    onPressed: scan,
+                    onPressed: _press(_Cue.openScan, scan),
                     icon: const Icon(Icons.qr_code_scanner),
                     label: const Text('Scan (Q)'),
                   ),
                 TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
+                  onPressed: _press(_Cue.openCancel, () => Navigator.of(ctx).pop()),
                   child: const Text('Cancel'),
                 ),
                 FilledButton(
-                  onPressed: loadHex,
+                  onPressed: _press(_Cue.openLoad, loadHex),
                   child: const Text('Load'),
                 ),
               ],
@@ -4078,7 +4152,7 @@ class _SetupScreenState extends State<SetupScreen>
           ),
         );
       },
-    );
+    ));
     hexInput.dispose();
     hexFocus.dispose();
     if (!mounted || keyBytes == null) return;
@@ -4096,7 +4170,7 @@ class _SetupScreenState extends State<SetupScreen>
   /// bytes from the QR's byte segment, or null if cancelled.
   Future<Uint8List?> _scanWithMobileScanner() async {
     Uint8List? keyBytes;
-    await showDialog<void>(
+    await _dialog(_Cue.scan, () => showDialog<void>(
       context: context,
       builder: (BuildContext ctx) => AlertDialog(
         title: const Text('Scan provisional key'),
@@ -4115,12 +4189,12 @@ class _SetupScreenState extends State<SetupScreen>
         ),
         actions: <Widget>[
           TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
+            onPressed: _press(_Cue.scanCancel, () => Navigator.of(ctx).pop()),
             child: const Text('Cancel'),
           ),
         ],
       ),
-    );
+    ));
     return keyBytes;
   }
 
@@ -4206,7 +4280,7 @@ class _SetupScreenState extends State<SetupScreen>
     final TextEditingController hexInput = TextEditingController();
     final FocusNode hexFocus = FocusNode(debugLabel: 'write-hex');
 
-    await showDialog<void>(
+    await _dialog(_Cue.key, () => showDialog<void>(
       context: context,
       builder: (BuildContext ctx) => StatefulBuilder(
         builder: (BuildContext ctx, void Function(void Function()) setLocal) {
@@ -4392,23 +4466,24 @@ class _SetupScreenState extends State<SetupScreen>
                 ),
                 actions: <Widget>[
                   TextButton.icon(
-                    onPressed: busy ? null : onShowQr,
+                    onPressed: _press(_Cue.keyQr, busy ? null : onShowQr),
                     icon: const Icon(Icons.qr_code_2),
                     label: Text(showQr ? 'Switch bits (Q)' : 'Show QR (Q)'),
                   ),
                   TextButton.icon(
-                    onPressed: busy ? null : onCopy,
+                    onPressed: _press(_Cue.keyCopy, busy ? null : onCopy),
                     icon: const Icon(Icons.copy),
                     label: const Text('Copy key (Alt+Q)'),
                   ),
                   if (canScan)
                     TextButton.icon(
-                      onPressed: busy ? null : scanOwnKey,
+                      onPressed:
+                          _press(_Cue.keyOwn, busy ? null : scanOwnKey),
                       icon: const Icon(Icons.qr_code_scanner),
                       label: const Text('Scan to reuse (I)'),
                     ),
                   TextButton(
-                    onPressed: () => Navigator.of(ctx).pop(),
+                    onPressed: _press(_Cue.keyClose, () => Navigator.of(ctx).pop()),
                     child: const Text('Done'),
                   ),
                 ],
@@ -4417,7 +4492,7 @@ class _SetupScreenState extends State<SetupScreen>
           );
         },
       ),
-    );
+    ));
     hexInput.dispose();
     hexFocus.dispose();
     _wipeBytes(key); // recorded or abandoned — drop our copy
@@ -4532,6 +4607,7 @@ class _SetupScreenState extends State<SetupScreen>
           showSelectedIcon: false,
           style: const ButtonStyle(visualDensity: VisualDensity.compact),
           onSelectionChanged: (Set<_ImportFormat> s) {
+            _cue('$kCuePress.${_Cue.importFormat}');
             setState(() {
               _pointImportFmt = s.first;
               _pointImport.clear();
@@ -4570,7 +4646,10 @@ class _SetupScreenState extends State<SetupScreen>
               icon: Icon(
                 _importHidden ? Icons.visibility : Icons.visibility_off,
               ),
-              onPressed: () => setState(() => _importHidden = !_importHidden),
+              onPressed: _press(
+                _Cue.importReveal,
+                () => setState(() => _importHidden = !_importHidden),
+              ),
             ),
           ),
           onChanged: (_) {
@@ -4585,14 +4664,14 @@ class _SetupScreenState extends State<SetupScreen>
             FilledButton(
               style: FilledButton.styleFrom(
                   visualDensity: VisualDensity.compact),
-              onPressed: onApply,
+              onPressed: _press(_Cue.importApply, onApply),
               child: const Text('Apply'),
             ),
             const SizedBox(width: 8),
             OutlinedButton(
               style: OutlinedButton.styleFrom(
                   visualDensity: VisualDensity.compact),
-              onPressed: onCancel,
+              onPressed: _press(_Cue.importCancel, onCancel),
               child: const Text('Cancel'),
             ),
           ],
@@ -4757,6 +4836,7 @@ class _SetupScreenState extends State<SetupScreen>
   /// bottom panel, then log it.
   void _warnOnConsole(String message) {
     if (!mounted) return;
+    _cue(_Cue.alertLog);
     setState(() => _chromeMinimized = false);
     _toast(message);
   }
@@ -4869,7 +4949,6 @@ class _SetupScreenState extends State<SetupScreen>
   }
 
   void _reset() {
-    _sounds.play(UiSound.click);
     _resolvePrompt(false); // drop any pending console confirmation
     _brightness.reset();
     _viewport.viewport = _initialViewport;
@@ -4974,6 +5053,133 @@ enum _Cmd {
   const _Cmd(this.context, this.slot);
   final CommandContext context;
   final int slot;
+
+  /// Its sound-cue name stem, e.g. `setup.dice` (under `press.` / `hover.`).
+  String get cue => '${context.name}.$name';
+}
+
+/// The sound-cue names this screen plays besides the board's (see
+/// [SoundCueMap]): every name falls back to its dotted parent, so a line for
+/// `press.key` in the cue map covers all the key dialog's buttons.
+abstract final class _Cue {
+  // Tabs, under `press.` / `hover.`, then the stage or slot number.
+  static const String stageTab = 'tab.stage';
+  static const String slotTab = 'tab.slot';
+
+  // Function keys.
+  static const String f1Collapse = 'key.f1.collapse';
+  static const String f1Restore = 'key.f1.restore';
+  static const String f2 = 'key.f2';
+  static const String f3 = 'key.f3';
+  static const String f4 = 'key.f4';
+  static const String f5 = 'key.f5';
+
+  // Alerts: a confirmation raised, the disclaimer's, a warning in the log.
+  static const String alertConfirm = 'alert.confirm';
+  static const String alertWarning = 'alert.warning';
+  static const String alertLog = 'alert.log';
+
+  // Dialogs, under `dialog.open.` / `dialog.close.`.
+  static const String dialogOpen = 'dialog.open';
+  static const String dialogClose = 'dialog.close';
+  static const String calibrate = 'calibrate';
+  static const String calibrateLeave = 'calibrate.leave';
+  static const String openFile = 'open';
+  static const String scan = 'scan';
+  static const String key = 'key';
+  static const String harvestDate = 'harvest.date';
+  static const List<String> dialogs = <String>[
+    calibrate,
+    calibrateLeave,
+    openFile,
+    scan,
+    key,
+    harvestDate,
+  ];
+
+  // Buttons outside the board, under `press.`.
+  static const String harvest = 'salt.harvest';
+  static const String harvestCancel = 'salt.cancel';
+  static const String advanceHalt = 'advance.halt';
+  static const String panelCollapse = 'panel.collapse';
+  static const String panelRestore = 'panel.restore';
+  static const String promptCancel = 'prompt.cancel';
+  static const String promptConfirm = 'prompt.confirm';
+  static const String hueWheel = 'view.hueWheel';
+  static const String importFormat = 'import.format';
+  static const String importReveal = 'import.reveal';
+  static const String importApply = 'import.apply';
+  static const String importCancel = 'import.cancel';
+  static const String openScan = 'open.scan';
+  static const String openCancel = 'open.cancel';
+  static const String openLoad = 'open.load';
+  static const String scanCancel = 'scan.cancel';
+  static const String keyQr = 'key.qr';
+  static const String keyCopy = 'key.copy';
+  static const String keyOwn = 'key.own';
+  static const String keyClose = 'key.close';
+  static const String calibrateClose = 'calibrate.close';
+  static const String calibrateBench = 'calibrate.bench';
+  static const String calibrateScope = 'calibrate.scope';
+  static const String calibrateStagesDown = 'calibrate.stages.down';
+  static const String calibrateStagesUp = 'calibrate.stages.up';
+  static const String calibrateTarget = 'calibrate.target';
+  static const String calibratePassesDown = 'calibrate.passes.down';
+  static const String calibratePassesUp = 'calibrate.passes.up';
+  static const String calibrateApply = 'calibrate.apply';
+  static const String calibrateStay = 'calibrate.leave.stay';
+  static const String calibrateLeaveOk = 'calibrate.leave.ok';
+  static const List<String> buttons = <String>[
+    harvest,
+    harvestCancel,
+    advanceHalt,
+    panelCollapse,
+    panelRestore,
+    promptCancel,
+    promptConfirm,
+    hueWheel,
+    importFormat,
+    importReveal,
+    importApply,
+    importCancel,
+    openScan,
+    openCancel,
+    openLoad,
+    scanCancel,
+    keyQr,
+    keyCopy,
+    keyOwn,
+    keyClose,
+    calibrateClose,
+    calibrateBench,
+    calibrateScope,
+    calibrateStagesDown,
+    calibrateStagesUp,
+    calibrateTarget,
+    calibratePassesDown,
+    calibratePassesUp,
+    calibrateApply,
+    calibrateStay,
+    calibrateLeaveOk,
+  ];
+
+  /// Every name above, in full, for the cue map's catalogue.
+  static List<String> get all => <String>[
+        f1Collapse,
+        f1Restore,
+        f2,
+        f3,
+        f4,
+        f5,
+        alertConfirm,
+        alertWarning,
+        alertLog,
+        for (final String d in dialogs) ...<String>[
+          '$dialogOpen.$d',
+          '$dialogClose.$d',
+        ],
+        for (final String b in buttons) '$kCuePress.$b',
+      ];
 }
 
 /// A compact, focusable colour wheel: six hue sectors, no rotate buttons (←/→
@@ -5169,10 +5375,17 @@ class _StageTab extends StatelessWidget {
     required this.progress,
     required this.explanation,
     required this.onExplain,
+    required this.cue,
+    required this.onCue,
     required this.onTap,
   });
 
   final int index;
+
+  /// Its sound-cue name stem, e.g. `tab.slot.3` (under `press.` / `hover.`),
+  /// played through [onCue].
+  final String cue;
+  final ValueChanged<String> onCue;
 
   /// What the tab is and what pressing it does: reported through [onExplain]
   /// while it has the pointer or focus (shown in the log), null when it
@@ -5198,12 +5411,24 @@ class _StageTab extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final ColorScheme scheme = Theme.of(context).colorScheme;
+    final VoidCallback? tap = onTap;
     return MouseRegion(
-      onEnter: (_) => onExplain(explanation),
+      onEnter: (_) {
+        onExplain(explanation);
+        onCue('$kCueHover.$cue');
+      },
       onExit: (_) => onExplain(null),
       child: InkWell(
-        onTap: onTap,
-        onFocusChange: (bool has) => onExplain(has ? explanation : null),
+        onTap: tap == null
+            ? null
+            : () {
+                onCue('$kCuePress.$cue');
+                tap();
+              },
+        onFocusChange: (bool has) {
+          onExplain(has ? explanation : null);
+          if (has) onCue('$kCueHover.$cue');
+        },
         borderRadius: BorderRadius.circular(6),
         child: deriving ? _derivingFace(scheme) : _restingFace(scheme),
       ),
@@ -5613,6 +5838,7 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
   void _cancelBench() => _benchJob?.cancel();
 
   Future<bool> _confirmClose() async {
+    widget.sounds.cue('${_Cue.dialogOpen}.${_Cue.calibrateLeave}');
     final bool? ok = await showDialog<bool>(
       context: context,
       builder: (BuildContext ctx) => AlertDialog(
@@ -5621,16 +5847,25 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
             'The benchmark result is discarded unless you Apply it first.'),
         actions: <Widget>[
           TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
+              onPressed: _press(_Cue.calibrateStay, () => Navigator.pop(ctx, false)),
               child: const Text('Cancel')),
           FilledButton(
-              onPressed: () => Navigator.pop(ctx, true),
+              onPressed: _press(_Cue.calibrateLeaveOk, () => Navigator.pop(ctx, true)),
               child: const Text('Close')),
         ],
       ),
     );
+    widget.sounds.cue('${_Cue.dialogClose}.${_Cue.calibrateLeave}');
     return ok ?? false;
   }
+
+  /// [f], voicing the press of control [id] first; null stays null.
+  VoidCallback? _press(String id, VoidCallback? f) => f == null
+      ? null
+      : () {
+          widget.sounds.cue('$kCuePress.$id');
+          f();
+        };
 
   /// Esc / Cancel / ✕: while a benchmark runs this stops it (stay in the
   /// dialog); otherwise it closes the dialog after confirming.
@@ -5699,7 +5934,7 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                         ),
                         IconButton(
                           tooltip: _benching ? 'Stop (Esc)' : 'Close (Esc)',
-                          onPressed: _attemptClose,
+                          onPressed: _press(_Cue.calibrateClose, _attemptClose),
                           icon: const Icon(Icons.close),
                         ),
                       ],
@@ -5714,7 +5949,7 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                       children: <Widget>[
                         // Run ↔ Stop: a benchmark in progress is cancellable.
                         OutlinedButton.icon(
-                          onPressed: _benching ? _cancelBench : _bench,
+                          onPressed: _press(_Cue.calibrateBench, _benching ? _cancelBench : _bench),
                           icon: Icon(_benching ? Icons.stop : Icons.speed,
                               size: 18),
                           label: Text(_benching
@@ -5784,7 +6019,7 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                       selected: <_CalibScope>{_scope},
                       onSelectionChanged: (Set<_CalibScope> sel) => setState(() {
                         _scope = sel.first;
-                        widget.sounds.play(UiSound.tickSoft);
+                        widget.sounds.cue('$kCuePress.${_Cue.calibrateScope}');
                         _recompute();
                       }),
                     ),
@@ -5793,22 +6028,22 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                       children: <Widget>[
                         Text('Stages: ', style: theme.textTheme.bodyMedium),
                         IconButton(
-                          onPressed: _stages > 1
+                          onPressed: _press(_Cue.calibrateStagesDown, _stages > 1
                               ? () => setState(() {
                                     _stages--;
                                     _recompute();
                                   })
-                              : null,
+                              : null),
                           icon: const Icon(Icons.remove_circle_outline),
                         ),
                         Text('$_stages', style: theme.textTheme.titleMedium),
                         IconButton(
-                          onPressed: _stages < OrbitProtocol.maxStage
+                          onPressed: _press(_Cue.calibrateStagesUp, _stages < OrbitProtocol.maxStage
                               ? () => setState(() {
                                     _stages++;
                                     _recompute();
                                   })
-                              : null,
+                              : null),
                           icon: const Icon(Icons.add_circle_outline),
                         ),
                       ],
@@ -5854,7 +6089,8 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                                 onSelectionChanged: (Set<double> sel) =>
                                     setState(() {
                                   _margin = sel.first;
-                                  widget.sounds.play(UiSound.tickSoft);
+                                  widget.sounds
+                                      .cue('$kCuePress.${_Cue.calibrateTarget}');
                                   _recompute();
                                 }),
                               ),
@@ -5869,17 +6105,17 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                                 child: Text('Benchmark passes',
                                     style: theme.textTheme.bodyMedium)),
                             IconButton(
-                              onPressed: (_benching || _passes <= 1)
+                              onPressed: _press(_Cue.calibratePassesDown, (_benching || _passes <= 1)
                                   ? null
-                                  : () => setState(() => _passes--),
+                                  : () => setState(() => _passes--)),
                               icon: const Icon(Icons.remove_circle_outline),
                             ),
                             Text('$_passes',
                                 style: theme.textTheme.titleMedium),
                             IconButton(
-                              onPressed: (_benching || _passes >= 7)
+                              onPressed: _press(_Cue.calibratePassesUp, (_benching || _passes >= 7)
                                   ? null
-                                  : () => setState(() => _passes++),
+                                  : () => setState(() => _passes++)),
                               icon: const Icon(Icons.add_circle_outline),
                             ),
                           ],
@@ -5909,14 +6145,14 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                       mainAxisAlignment: MainAxisAlignment.end,
                       children: <Widget>[
                         TextButton(
-                          onPressed: _attemptClose,
+                          onPressed: _press(_Cue.calibrateClose, _attemptClose),
                           child: Text(_benching ? 'Stop' : 'Cancel'),
                         ),
                         const SizedBox(width: 8),
                         FilledButton(
-                          onPressed: (_benching || n == null)
+                          onPressed: _press(_Cue.calibrateApply, (_benching || n == null)
                               ? null
-                              : () => Navigator.of(context).pop(n),
+                              : () => Navigator.of(context).pop(n)),
                           child: const Text('Apply N'),
                         ),
                       ],
