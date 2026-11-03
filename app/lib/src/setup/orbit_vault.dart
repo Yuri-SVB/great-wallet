@@ -13,10 +13,8 @@ import '../ffi/core_bindings.dart' show Argon2Profile, kOrbitPointLen;
 /// recomputed from `o_i`), then `Sh_i` and `K_i` are recomputed on the screen;
 /// the expensive Argon2 advance `o_i = H*(u_{i-1})` is skipped entirely.
 ///
-/// This is the orbit peer of the legacy chain [SetupVault]. It captures the
-/// **screen-owned** orbit state (`σ` / `_orbitO` / `_boardPoints`), not a
-/// [SetupController] chain session, so restoring it does **not** enter the
-/// legacy `memorise` phase.
+/// It captures the **screen-owned** orbit state (`σ` / `_orbitO` /
+/// `_boardPoints`).
 ///
 /// A settled orbit is the common case; a halted, mid-advance one also rides
 /// here, via the optional [resume] checkpoint (Role 1 of
@@ -60,9 +58,8 @@ class OrbitVault {
   /// must be rebuilt and re-memorised.
   static const int minSupportedVersion = 3;
 
-  /// Payload discriminator so an orbit open of a legacy *chain* vault (or vice
-  /// versa) fails cleanly on parse rather than misreading fields. Chain
-  /// [SetupVault] payloads carry no `kind`.
+  /// Payload discriminator: a file without it (a pre-orbit chain setup) is
+  /// refused rather than misread.
   static const String kind = 'orbit';
 
   /// The JSON key [kind] rides under — named so the load path can branch on the
@@ -85,7 +82,7 @@ class OrbitVault {
 
   /// A **halted** memory-hard advance's checkpoint, or null for a fully settled
   /// setup. Lets a reopened file continue the advance from the pass it reached
-  /// instead of restarting it — the orbit peer of [SetupVault]'s `resume`.
+  /// instead of restarting it.
   OrbitVaultResume? resume;
 
   /// The CPNF deck (celestial-peace-nf-core): which maps are memorised, their

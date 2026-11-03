@@ -134,8 +134,15 @@ class GreatWallCore {
             params: params,
           ));
 
-  /// Engine algorithm version (e.g. `"0.1.0"`).
+  /// Engine algorithm version (e.g. `"0.3.0"`): the renderer and encoder's
+  /// output.
   String get engineVersion => bindings.engineVersion();
+
+  /// Protocol version (e.g. `"0.5.0"`): what a setup derives.
+  String get protocolVersion => bindings.protocolVersion();
+
+  /// Landmark path finder version (e.g. `"0.2.0"`).
+  String get landmarkPathVersion => bindings.landmarkPathVersion();
 
   /// Canonicalise a Stage-0 salt/pepper string through the engine (uppercase
   /// ASCII, keep only `A-Z0-9-`). Single source of truth shared with

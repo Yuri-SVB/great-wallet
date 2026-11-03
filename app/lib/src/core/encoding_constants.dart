@@ -47,7 +47,7 @@ class EncodingConstants {
   /// fractal (`entropy_bits / BITS_PER_POINT`). The text Stage 0 is separate and
   /// not counted here. The inverse — entropy width for a chosen stage count — is
   /// simply `pointStages × bitsPerPoint`; the Setup flow lets the user pick any
-  /// count in `1..SetupController.maxPointStages` (every value is a valid setup),
+  /// count in `1..OrbitProtocol.maxStage` (every value is a valid setup),
   /// rather than a fixed mini/default/large preset.
   static int nStagesFor(int entropyBits) => entropyBits ~/ bitsPerPoint;
 
