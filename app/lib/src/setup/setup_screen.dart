@@ -847,7 +847,6 @@ class _SetupScreenState extends State<SetupScreen>
 
   @override
   Widget build(BuildContext context) {
-    final bool hasResult = _setup.phase == SetupPhase.memorise;
     return CallbackShortcuts(
       bindings: _globalShortcuts,
       child: Focus(
@@ -886,13 +885,6 @@ class _SetupScreenState extends State<SetupScreen>
                                       : _canvas())),
                         ),
                         if (_busy) Positioned.fill(child: _progressOverlay()),
-                        if (_routePanel() case final Widget panel)
-                          Positioned(
-                            top: 0,
-                            bottom: 0,
-                            right: 12,
-                            child: Center(child: panel),
-                          ),
                         if (_selectMode && !_setup.isTextStage)
                           Positioned(
                             top: 56,
@@ -949,7 +941,6 @@ class _SetupScreenState extends State<SetupScreen>
                     ),
                   ),
                 ),
-                SizedBox(width: 260, child: _controlPanel(hasResult)),
               ],
             ),
           ),
@@ -3516,14 +3507,16 @@ class _SetupScreenState extends State<SetupScreen>
         if (_orbitK[stage] != null && stage == _maxStage) ...<Widget>[
           const SizedBox(height: 6),
           Text(
-            'Deepest stage — its K is the wallet master key (copy with K).',
+            'Deepest stage — its K is the wallet master key (copy: '
+            '${_hint(_Cmd.copyKey)}).',
             style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
           ),
         ],
         if (stage >= 1) ...<Widget>[
           const SizedBox(height: 6),
           Text(
-            'X excludes Stage $stage and every stage below it.',
+            '${_hint(_Cmd.exclude)} excludes Stage $stage and every stage below '
+            'it.',
             style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
           ),
         ],
@@ -3964,8 +3957,9 @@ class _SetupScreenState extends State<SetupScreen>
       _kPanelPadding * 2;
   static const double _kPanelPadding = 8;
 
-  /// The expanded bottom panel: the command board flush left and, to its
-  /// right, the log — an inline prompt, focus help, then the recent lines.
+  /// The expanded bottom panel: the command board flush left, the context's
+  /// pane ([_contextPane]), and the log — an inline prompt, focus help, then
+  /// the recent lines.
   /// While a board button or tab has the pointer or focus, its explanation
   /// takes the log's place; the log returns when it leaves.
   Widget _consoleExpanded() {
@@ -3991,6 +3985,13 @@ class _SetupScreenState extends State<SetupScreen>
             width: 1,
             color: _kConsoleAccent.withValues(alpha: 0.25),
           ),
+          if (_contextPane() case final Widget pane) ...<Widget>[
+            SizedBox(width: _kPaneWidth, child: pane),
+            VerticalDivider(
+              width: 1,
+              color: _kConsoleAccent.withValues(alpha: 0.25),
+            ),
+          ],
           Expanded(child: _logArea()),
         ],
       ),
@@ -4138,11 +4139,11 @@ class _SetupScreenState extends State<SetupScreen>
     );
   }
 
-  Widget _controlPanel(bool hasResult) {
-    return Padding(
-      padding: const EdgeInsets.all(16),
-      child: ListView(
-        children: <Widget>[
+  /// The Setup board's pane: the slot's status and key export, the setup
+  /// fields, editors and notices — what the right panel carried.
+  List<Widget> _setupPane() {
+    final bool hasResult = _setup.phase == SetupPhase.memorise;
+    return <Widget>[
 
           // Orbit board status (role + placed/derived + the hotkeys that set the
           // point). Point entry reuses the existing mechanisms — there are no
@@ -4266,27 +4267,30 @@ class _SetupScreenState extends State<SetupScreen>
             _bip39CopyButton(),
           ],
 
-          // Provisional-key save / load: an encrypted on-disk copy of the setup
-          // for the consolidation window. Save needs a settled setup — an orbit
-          // one, or a legacy chain one (halted chains save as resumable); Load
-          // is offered on the config screen too (to restore one).
-          if (_vaultPanelShown) ...<Widget>[
-            const Divider(height: 32),
-            _vaultControls(),
-          ],
+    ];
+  }
 
-          const Divider(height: 32),
+  /// Width of a board context's pane, between the board and the log.
+  static const double _kPaneWidth = 380;
 
-          OutlinedButton.icon(
-            onPressed: _busy ? null : _reset,
-            icon: const Icon(Icons.refresh),
-            label: const Text('Reset'),
+  /// The board context's pane, between the board and the log: what the right
+  /// panel used to carry, shown with its context only — Main the setup file,
+  /// Setup the setup itself, Path the route, View the colour. Null for none.
+  Widget? _contextPane() {
+    final List<Widget> children = switch (_context) {
+      CommandContext.main => <Widget>[
+          if (_vaultPanelShown) _vaultControls(),
+          const SizedBox(height: 8),
+          Text(
+            'engine ${widget.core.engineVersion}',
+            style: Theme.of(context).textTheme.bodySmall,
           ),
-
-          const Divider(height: 32),
-          // Colour wheel: focus with C, cycle hues with ← →. The scheme name is
-          // shown in the console (focus _Field.hue), not labelled here. No rotate
-          // buttons — the arrows replace them.
+        ],
+      CommandContext.setup => _setupPane(),
+      CommandContext.path => <Widget>[
+          if (_routePanel() case final Widget panel) panel,
+        ],
+      CommandContext.view => <Widget>[
           Center(
             child: _track(
               _Field.hue,
@@ -4300,13 +4304,14 @@ class _SetupScreenState extends State<SetupScreen>
               ),
             ),
           ),
-          const SizedBox(height: 16),
-          Text(
-            'engine ${widget.core.engineVersion}',
-            style: Theme.of(context).textTheme.bodySmall,
-            textAlign: TextAlign.center,
-          ),
         ],
+    };
+    if (children.isEmpty) return null;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: children,
       ),
     );
   }
