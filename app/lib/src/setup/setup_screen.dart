@@ -13,6 +13,8 @@ import 'package:great_wall_ux/great_wall_ux.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:qr/qr.dart' as qr;
 
+import '../command/command_board.dart';
+import '../command/keyboard_layout.dart';
 import '../core/bip39.dart';
 import '../core/encoding_constants.dart';
 import '../core/entropy.dart';
@@ -285,11 +287,19 @@ class _SetupScreenState extends State<SetupScreen> {
   /// (label + live value) so the panel itself can stay label-free.
   _Field? _focusedField;
 
-  /// Whether the hotkey manual is shown in the console. On at launch.
-  bool _manualVisible = true;
+  /// The command board's keyboard layout: the build's default
+  /// ([KeyboardLayout.buildDefault]), switchable for the session.
+  KeyboardLayout _layout = KeyboardLayout.buildDefault;
 
-  /// Whether the console is collapsed to a thin status line (the `M` hotkey /
-  /// the console's button). Independent of the stage-tab bar.
+  /// The command board's context (Alt + a top-row board key).
+  CommandContext _context = CommandContext.main;
+
+  /// The explanation of the board button or tab under the pointer or focus,
+  /// shown in the log in place of its text; null when none is.
+  String? _explaining;
+
+  /// Whether the bottom panel (command board and log) is collapsed to a thin
+  /// status line (F1). Independent of the stage-tab bar.
   bool _chromeMinimized = false;
 
   /// Whether the stage-tab bar is hidden (the `9` hotkey). Independent of the
@@ -752,11 +762,12 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// Global shortcuts that fire even while a text field has focus (text fields
   /// do not consume these keys, so they bubble up to here): Esc leaves a field
-  /// for the viewer, F1 is the manual, and F2–F5 switch top-level mode.
+  /// for the viewer, F1 collapses or restores the bottom panel, and F2–F5
+  /// switch top-level mode.
   Map<ShortcutActivator, VoidCallback> get _globalShortcuts =>
       <ShortcutActivator, VoidCallback>{
         const SingleActivator(LogicalKeyboardKey.escape): _focusViewer,
-        const SingleActivator(LogicalKeyboardKey.f1): _toggleManual,
+        const SingleActivator(LogicalKeyboardKey.f1): _togglePanel,
         const SingleActivator(LogicalKeyboardKey.f2): () =>
             _gotoMode('Setup', here: true),
         const SingleActivator(LogicalKeyboardKey.f3): () =>
@@ -798,13 +809,22 @@ class _SetupScreenState extends State<SetupScreen> {
     _hotkeys.requestFocus();
   }
 
-  /// Toggle the hotkey manual, restoring the console if it was minimized so the
-  /// manual is actually visible. Bound to H and F1.
-  void _toggleManual() {
+  /// Collapse or restore the bottom panel — the command board and the log
+  /// (F1).
+  void _togglePanel() {
+    final bool collapsing = !_chromeMinimized;
+    _sounds.play(collapsing ? UiSound.chromeDown : UiSound.chromeUp);
+    setState(() => _chromeMinimized = collapsing);
+  }
+
+  /// Show the board's [c] context (Alt + its top-row key), restoring the panel
+  /// if it was collapsed.
+  void _setContext(CommandContext c) {
     _sounds.play(UiSound.click);
     setState(() {
-      _manualVisible = !_manualVisible;
-      if (_manualVisible) _chromeMinimized = false;
+      _context = c;
+      _chromeMinimized = false;
+      _explaining = null;
     });
   }
 
@@ -869,10 +889,11 @@ class _SetupScreenState extends State<SetupScreen> {
                         // Deep render reminder: explains the lag while the high
                         // escape-count cap is active, and how to turn it off.
                         if (_deepRender && !_setup.isTextStage)
-                          const Positioned(
+                          Positioned(
                             top: 56,
                             right: 12,
-                            child: _Badge('Deep render · Alt+L to exit'),
+                            child: _Badge(
+                                'Deep render · ${_hint(_Cmd.deepRender)} to exit'),
                           ),
                         // Stage tabs hover over the top of the viewer with a
                         // transparent background, so they never squeeze the
@@ -1334,242 +1355,42 @@ class _SetupScreenState extends State<SetupScreen> {
     // return to the viewer (handled globally below).
     if (_textInputHasFocus) return KeyEventResult.ignored;
     final HardwareKeyboard kb = HardwareKeyboard.instance;
-    // V + ↑/↓ — sound volume. A held-key chord (not a Scheme-A single key), so
-    // it is handled before the key-down-only guard below and may auto-repeat
-    // while the arrow is held, ramping the level. Level 0 is silence == muted.
-    if (kb.isLogicalKeyPressed(LogicalKeyboardKey.keyV)) {
-      if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
-        _changeVolume(up: true);
-        return KeyEventResult.handled;
-      }
-      if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
-        _changeVolume(up: false);
-        return KeyEventResult.handled;
-      }
-    }
-    // L / G + ↑/↓ — brightness offset / slope, the keyboard counterparts of
-    // L / G + scroll over the canvas. Held-key chords like V's (auto-repeat
-    // while the arrow is held); tacit, so nothing is displayed. ↑ brightens
-    // the lit band (L) or spreads its falloff over more counts (G).
-    final double arrow = event.logicalKey == LogicalKeyboardKey.arrowUp
-        ? 1.0
-        : event.logicalKey == LogicalKeyboardKey.arrowDown
-            ? -1.0
-            : 0.0;
-    if (arrow != 0.0 && kb.isLogicalKeyPressed(LogicalKeyboardKey.keyL)) {
-      _brightness.adjustBySteps(arrow);
-      return KeyEventResult.handled;
-    }
-    if (arrow != 0.0 && kb.isLogicalKeyPressed(LogicalKeyboardKey.keyG)) {
-      _brightness.adjustSlopeBySteps(arrow);
-      return KeyEventResult.handled;
-    }
-    // Scheme A: all hotkeys are single, unmodified keys, active when the viewer
-    // (not a text field) has focus, fired once per press. If a modifier is held,
-    // bail so OS combos are left alone.
-    if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    // Alt hotkeys — exceptional actions that take Alt by design; handled before
-    // the modifier bail just below. Each is the rare/advanced counterpart of a
-    // plain key: Alt+L deep render (vs the fast default), Alt+K the full export
-    // digest (vs K's conventional first 32 chars).
-    if (kb.isAltPressed && !kb.isControlPressed && !kb.isMetaPressed) {
-      if (event.logicalKey == LogicalKeyboardKey.keyL) {
-        _toggleDeepRender();
-        return KeyEventResult.handled;
-      }
-      if (event.logicalKey == LogicalKeyboardKey.keyK) {
-        if (!_busy) _copyMasterSecret(full: true);
-        return KeyEventResult.handled;
-      }
-      // Alt+E — the landmark path of the board's point (vs plain E, which
-      // highlights the canonical islands in view).
-      if (event.logicalKey == LogicalKeyboardKey.keyE) {
-        _toggleLandmarkPath();
-        return KeyEventResult.handled;
-      }
-      // Alt+I — the hex counterpart of plain I (BIP39 words): on an editable
-      // point (a chain stage or an orbit board slot) it opens the point-import
-      // editor in hex.
-      if (event.logicalKey == LogicalKeyboardKey.keyI) {
-        if (_expandTarget != null) {
-          _expandImport(hex: true);
-        } else if (_placeableBoardSlot) {
-          _beginBoardImport(_slotIndex, hex: true);
-        } else if (_setup.canEditCurrentPoint) {
-          _changePointImport(hex: true);
+    if (kb.isControlPressed || kb.isMetaPressed) return KeyEventResult.ignored;
+    // The board's keys, by position (kBoardKeys): the same on every layout.
+    final int board = kBoardKeys.indexOf(event.physicalKey);
+    if (kb.isAltPressed) {
+      if (event is! KeyDownEvent) return KeyEventResult.ignored;
+      // Alt + a top-row board key: switch the board's context.
+      for (final CommandContext c in CommandContext.values) {
+        if (board == c.key) {
+          _setContext(c);
+          return KeyEventResult.handled;
         }
-        return KeyEventResult.handled;
       }
-      // Alt+V — reveal / hide the obscured sensitive text fields together (the
-      // visibility counterpart of V's volume control).
-      if (event.logicalKey == LogicalKeyboardKey.keyV) {
-        _toggleSensitiveVisibility();
-        return KeyEventResult.handled;
-      }
-      // Alt+D — open the spacious Argon2 calibration dialog (vs plain D, which
-      // focuses the raw derivation-steps field).
-      if (event.logicalKey == LogicalKeyboardKey.keyD) {
-        _openCalibrationDialog();
-        return KeyEventResult.handled;
-      }
-      // Alt+digit — select that **stage** (the upper/main tabs). Stage selection
-      // moved to Alt so plain digits can drive the secondary slot tabs.
+      // Alt + digit: select that stage (the upper tabs).
       final int? altStage = _digitKeys[event.logicalKey];
       if (altStage != null) {
         _selectStage(altStage);
         return KeyEventResult.handled;
       }
-    }
-    if (kb.isAltPressed || kb.isControlPressed || kb.isMetaPressed) {
       return KeyEventResult.ignored;
     }
-    // H — halt an in-progress derivation, behind a console confirmation (keeps
-    // the work done so far). The hotkey manual lives on F1 only now.
-    if (event.logicalKey == LogicalKeyboardKey.keyH) {
-      _abortDerivation();
-      return KeyEventResult.handled;
-    }
-    // M — collapse / restore the console (independent of the stage bar).
-    if (event.logicalKey == LogicalKeyboardKey.keyM) {
-      final bool minimizing = !_chromeMinimized;
-      _sounds.play(minimizing ? UiSound.chromeDown : UiSound.chromeUp);
-      setState(() => _chromeMinimized = minimizing);
-      return KeyEventResult.handled;
-    }
-    // 9 — show / hide the stage-tab bar (independent of the console).
-    if (event.logicalKey == LogicalKeyboardKey.digit9 ||
-        event.logicalKey == LogicalKeyboardKey.numpad9) {
-      final bool hiding = !_stageBarHidden;
-      _sounds.play(hiding ? UiSound.chromeDown : UiSound.chromeUp);
-      setState(() => _stageBarHidden = hiding);
-      return KeyEventResult.handled;
-    }
-    // X — exclude the displayed stage and every stage above it (truncate). In
-    // the orbit build this drops the current orbit stage and every deeper one.
-    if (event.logicalKey == LogicalKeyboardKey.keyX) {
-      if (_hasSession) {
-        _truncate();
-      } else {
-        _truncateOrbit();
-      }
-      return KeyEventResult.handled;
-    }
-    // E — enumerate the canonical leaf areas under the current view and
-    // highlight each one's canonical island (flat white). Heavy one-shot
-    // (memoized decode grid + per-leaf discovery); no-op while a derivation is
-    // busy.
-    if (event.logicalKey == LogicalKeyboardKey.keyE) {
-      if (!_busy) {
-        unawaited(_isBoardSlot ? _boardEnumerateIslands() : _enumerateIslands());
-      }
-      return KeyEventResult.handled;
-    }
-    // C — focus the colour wheel (then ← → cycle hues).
-    if (event.logicalKey == LogicalKeyboardKey.keyC) {
-      _focusField(_hueFocus, 'colour wheel');
-      return KeyEventResult.handled;
-    }
-    // N / I / R — on an editable point (a chain stage or an orbit board slot)
-    // they change that point: N = new random, R = manual click, I = blind
-    // import (which shares the inline bit editor).
-    if (event.logicalKey == LogicalKeyboardKey.keyN) {
-      if (_expandTarget != null) {
-        _expandNew();
-      } else if (_placeableBoardSlot) {
-        _generatePrimary(_slotIndex);
-      } else if (_setup.canEditCurrentPoint) {
-        _changePointGenerated();
-      }
-      return KeyEventResult.handled;
-    }
-    if (event.logicalKey == LogicalKeyboardKey.keyI) {
-      if (_expandTarget != null) {
-        _expandImport(hex: false);
-      } else if (_placeableBoardSlot) {
-        _beginBoardImport(_slotIndex, hex: false);
-      } else if (_setup.canEditCurrentPoint) {
-        _changePointImport(hex: false);
-      }
-      return KeyEventResult.handled;
-    }
-    if (event.logicalKey == LogicalKeyboardKey.keyR) {
-      if (_expandTarget != null) {
-        _expandManual();
+    // A board key runs the context's command at that position; holding it
+    // repeats only the commands that step a value.
+    if (board >= 0) {
+      final BoardCommand? c = _board()[board];
+      if (c == null || (event is KeyRepeatEvent && !c.repeats)) {
         return KeyEventResult.handled;
       }
-      // At a placeable orbit board slot (any non-derived fractal), R arms a
-      // manual point placement (the same click-to-place mechanism as a chain
-      // point edit).
-      if (_placeableBoardSlot) {
-        _armBoardManual();
-      } else if (_setup.canEditCurrentPoint) {
-        _changePointManual();
-      }
-      return KeyEventResult.handled;
-    }
-    // Field focus (uniform coverage): S salt/export · P profile · D derivation
-    // steps. The salt (config screen) and export-label (live setup) fields never
-    // coexist, so pick by session state rather than a focus node's context
-    // (which could be stale): a live setup means the export label.
-    if (event.logicalKey == LogicalKeyboardKey.keyS) {
-      // The export-salt field is shown either in a live setup or on a stage-0
-      // board once K_i is derived; the config-screen salt/pepper otherwise.
-      if (_hasSession || (_isBoardSlot && _activeK != null)) {
-        _focusField(_exportLabelFocus, 'export salt');
-      } else {
-        _focusField(_stage0Focus, 'salt / pepper');
-      }
-      return KeyEventResult.handled;
-    }
-    if (event.logicalKey == LogicalKeyboardKey.keyP) {
-      _focusField(_profileFocus, 'Argon2 profile');
-      return KeyEventResult.handled;
-    }
-    if (event.logicalKey == LogicalKeyboardKey.keyD) {
-      _focusField(_iterationsFocus, 'derivation steps');
-      return KeyEventResult.handled;
-    }
-    // A — auto brightness: offset and slope follow each view's escape counts
-    // (great-wall-ux auto exposure, the demo film's rule), eased. Any L / G
-    // adjustment turns it off. (A's old "abort" duty is on H.)
-    if (event.logicalKey == LogicalKeyboardKey.keyA) {
-      _brightness.toggleAutoExposure();
-      return KeyEventResult.handled;
-    }
-    // Z — reset, behind a console confirmation so a stray keypress cannot wipe a
-    // setup.
-    if (event.logicalKey == LogicalKeyboardKey.keyZ) {
-      _confirmReset();
-      return KeyEventResult.handled;
-    }
-    // K — derive and copy the exported master secret ("the key") for the stage
-    // under focus.
-    if (event.logicalKey == LogicalKeyboardKey.keyK) {
-      if (!_busy) _copyMasterSecret();
-      return KeyEventResult.handled;
-    }
-    // Provisional-key panel (when shown): F focus file path · W write/save ·
-    // O open setup file · T blank template. W/O/T no-op while a vault pass runs.
-    if (_vaultPanelShown) {
-      if (event.logicalKey == LogicalKeyboardKey.keyF) {
-        _focusVaultPath();
+      if (!c.enabled) {
+        if (event is KeyDownEvent) _sounds.play(UiSound.denyBlocked);
         return KeyEventResult.handled;
       }
-      if (event.logicalKey == LogicalKeyboardKey.keyW) {
-        if (!_vaultBusy) _writeSetup();
-        return KeyEventResult.handled;
-      }
-      if (event.logicalKey == LogicalKeyboardKey.keyO) {
-        if (!_vaultBusy) _openSetup();
-        return KeyEventResult.handled;
-      }
-      if (event.logicalKey == LogicalKeyboardKey.keyT) {
-        if (!_vaultBusy) _exportBlankTemplate();
-        return KeyEventResult.handled;
-      }
+      c.run();
+      return KeyEventResult.handled;
     }
-    // 0–6 — select that **secondary slot** within the active stage. (Stage
-    // selection is Alt+digit; the `9` bar toggle is handled above.)
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    // 0–6 — select that secondary slot within the active stage.
     final int? digit = _digitKeys[event.logicalKey];
     if (digit != null) {
       _selectSlot(digit);
@@ -1578,9 +1399,426 @@ class _SetupScreenState extends State<SetupScreen> {
     return KeyEventResult.ignored;
   }
 
-  /// Alt+V — reveal or hide the obscured sensitive text fields (the salt/pepper
-  /// and the import phrase/hex) together: if any is hidden, reveal all; if all
-  /// are shown, hide all. The counterpart of V's volume control.
+  // --- Command board ----------------------------------------------------------
+
+  /// The current context's board: each command at its position, null where
+  /// a position is empty.
+  List<BoardCommand?> _board() {
+    final List<BoardCommand?> out =
+        List<BoardCommand?>.filled(kBoardKeys.length, null);
+    for (final _Cmd c in _Cmd.values) {
+      if (c.context == _context) out[c.slot] = _command(c);
+    }
+    return out;
+  }
+
+  /// The keys of [cmds] (all of one context) with their names, for a hint
+  /// line: e.g. `Setup board (Alt+W): F place by click · A new random point`.
+  String _keys(List<_Cmd> cmds) {
+    final CommandContext ctx = cmds.first.context;
+    return '${ctx.label} board (Alt+${_layout.keys[ctx.key]}): '
+        '${cmds.map((_Cmd c) => '${_layout.keys[c.slot]} ${_command(c).name.toLowerCase()}').join(' · ')}';
+  }
+
+  /// How to reach [c]: its context's Alt key, then its key, on this layout.
+  String _hint(_Cmd c) =>
+      '${c.context.label} board (Alt+${_layout.keys[c.context.key]}) › '
+      '${_layout.keys[c.slot]}';
+
+  /// The landmark route of the active map can be adjusted: its path is shown.
+  bool get _routeReady =>
+      _showPath &&
+      _isBoardSlot &&
+      _slotIndex >= 1 &&
+      _paths[(_activeStage, _slotIndex)] != null;
+
+  /// Step the active map's route: ρ and the exponent by index into the
+  /// engine's choices, the visible stops by one, each within its range.
+  void _stepRoute({int rho = 0, int exponent = 0, int visible = 0}) {
+    final (int, int) key = (_activeStage, _slotIndex);
+    final _ShownPath? shown = _paths[key];
+    if (shown == null) return;
+    final _Route r = _routeOf(key);
+    final int before = shown.path.stops.length - 1;
+    final int nextRho = (r.rho + rho)
+        .clamp(0, widget.core.landmarkRhoChoices.length - 1);
+    final int nextExponent = (r.exponent + exponent)
+        .clamp(0, widget.core.landmarkExponentChoices.length - 1);
+    final int nextVisible = ((r.visible ?? before) + visible).clamp(0, before);
+    if (nextRho == r.rho &&
+        nextExponent == r.exponent &&
+        nextVisible == (r.visible ?? before)) {
+      _sounds.play(UiSound.denyBlocked);
+      return;
+    }
+    _sounds.play(UiSound.click);
+    _setRoute(key, (
+      rho: nextRho,
+      exponent: nextExponent,
+      visible: nextVisible == before ? null : nextVisible,
+    ));
+  }
+
+  /// Step the colour scheme through the six hues.
+  void _stepHue(int dir) {
+    const List<HueOffset> order = HueOffset.values;
+    _sounds.play(UiSound.click);
+    setState(() => _hue = order[(_hue.index + dir) % order.length]);
+  }
+
+  /// The command [c]: what it shows, whether it is available now, and what it
+  /// does — the actions of the former letter hotkeys, by board.
+  BoardCommand _command(_Cmd c) {
+    switch (c) {
+      case _Cmd.layout:
+        return BoardCommand(
+          name: 'Keyboard layout: ${_layout.label}',
+          help: 'Switches the letters printed on the board '
+              '(${KeyboardLayout.values.map((KeyboardLayout l) => l.label).join(', ')}). '
+              'The keys stay where they are; only their letters change. The '
+              'build sets the default; a change lasts this session.',
+          icon: Icons.keyboard,
+          run: () {
+            _sounds.play(UiSound.click);
+            setState(() => _layout = _layout.next);
+            _toast('Keyboard layout: ${_layout.label}.');
+          },
+        );
+      case _Cmd.save:
+        return BoardCommand(
+          name: 'Save setup',
+          help: 'Encrypts this setup to the file path under a provisional key '
+              '(a QR, a password manager or your own key): a crutch for the '
+              'memorisation window, deleted at graduation.',
+          icon: Icons.save,
+          enabled: _vaultPanelShown && !_vaultBusy,
+          run: _writeSetup,
+        );
+      case _Cmd.open:
+        return BoardCommand(
+          name: 'Open setup',
+          help: 'Opens an encrypted setup file with its provisional key (scan '
+              'the QR or type the key).',
+          icon: Icons.folder_open,
+          enabled: _vaultPanelShown && !_vaultBusy,
+          run: _openSetup,
+        );
+      case _Cmd.templates:
+        return BoardCommand(
+          name: 'Blank QR templates',
+          help: 'Saves the 128- and 256-bit QR skeletons, to print and colour '
+              'in by hand with the key.',
+          icon: Icons.qr_code_2,
+          enabled: _vaultPanelShown && !_vaultBusy,
+          run: _exportBlankTemplate,
+        );
+      case _Cmd.volumeDown:
+      case _Cmd.volumeUp:
+        final bool up = c == _Cmd.volumeUp;
+        return BoardCommand(
+          name: up ? 'Volume up' : 'Volume down',
+          help: 'Steps the sound cues ${up ? 'up' : 'down'} a level; level 0 '
+              'is silence. Hold to keep stepping.',
+          icon: up ? Icons.volume_up : Icons.volume_down,
+          repeats: true,
+          run: () => _changeVolume(up: up),
+        );
+      case _Cmd.secrets:
+        return BoardCommand(
+          name: 'Show or hide secrets',
+          help: 'Reveals or hides the sensitive text fields — the salt and the '
+              'import phrase or hex — together.',
+          icon: Icons.visibility,
+          active: !_stage0Hidden && !_mnemonicHidden,
+          run: _toggleSensitiveVisibility,
+        );
+      case _Cmd.filePath:
+        return BoardCommand(
+          name: 'File path',
+          help: 'Focuses the setup file path: where save and open look.',
+          icon: Icons.description,
+          enabled: _vaultPanelShown,
+          run: _focusVaultPath,
+        );
+      case _Cmd.reset:
+        return BoardCommand(
+          name: 'Reset',
+          help: 'Clears the setup, after asking.',
+          icon: Icons.restart_alt,
+          run: _confirmReset,
+        );
+      case _Cmd.stageBar:
+        return BoardCommand(
+          name: 'Stage bar',
+          help: 'Shows or hides the stage and slot tabs over the map.',
+          icon: Icons.tab,
+          active: !_stageBarHidden,
+          run: () {
+            final bool hiding = !_stageBarHidden;
+            _sounds.play(hiding ? UiSound.chromeDown : UiSound.chromeUp);
+            setState(() => _stageBarHidden = hiding);
+          },
+        );
+      case _Cmd.salt:
+        final bool label = _hasSession || (_isBoardSlot && _activeK != null);
+        return BoardCommand(
+          name: label ? 'Key label' : 'Salt',
+          help: label
+              ? 'Focuses the key’s label: an optional salt that versions the '
+                  'exported key (e.g. SIGNING-1).'
+              : 'Focuses the stage-0 salt / pepper.',
+          icon: Icons.label_outline,
+          run: () => label
+              ? _focusField(_exportLabelFocus, 'export salt')
+              : _focusField(_stage0Focus, 'salt / pepper'),
+        );
+      case _Cmd.profile:
+        return BoardCommand(
+          name: 'Profile',
+          help: 'Focuses the Argon2 memory profile (← → to change).',
+          icon: Icons.memory,
+          run: () => _focusField(_profileFocus, 'Argon2 profile'),
+        );
+      case _Cmd.steps:
+        return BoardCommand(
+          name: 'Steps D',
+          help: 'Focuses the derivation steps per stage: the memory-hard passes '
+              'each stage runs.',
+          icon: Icons.repeat,
+          run: () => _focusField(_iterationsFocus, 'derivation steps'),
+        );
+      case _Cmd.calibrate:
+        return BoardCommand(
+          name: 'Calibrate',
+          help: 'Opens the calibration: pick a target time, get the steps D for '
+              'this device.',
+          icon: Icons.speed,
+          run: _openCalibrationDialog,
+        );
+      case _Cmd.newPoint:
+      case _Cmd.importWords:
+      case _Cmd.importHex:
+      case _Cmd.placeByClick:
+        final bool editable = _expandTarget != null ||
+            _placeableBoardSlot ||
+            _setup.canEditCurrentPoint;
+        return switch (c) {
+          _Cmd.newPoint => BoardCommand(
+              name: 'New random point',
+              help: 'Places a fresh random point on this map.',
+              icon: Icons.casino,
+              enabled: editable,
+              run: () {
+                if (_expandTarget != null) {
+                  _expandNew();
+                } else if (_placeableBoardSlot) {
+                  _generatePrimary(_slotIndex);
+                } else if (_setup.canEditCurrentPoint) {
+                  _changePointGenerated();
+                }
+              },
+            ),
+          _Cmd.importWords || _Cmd.importHex => BoardCommand(
+              name: c == _Cmd.importHex ? 'Import hex' : 'Import words',
+              help: c == _Cmd.importHex
+                  ? 'Imports this map’s point from hex (8 digits a point).'
+                  : 'Imports this map’s point from BIP39 words (3 a point).',
+              icon: c == _Cmd.importHex ? Icons.tag : Icons.abc,
+              enabled: editable,
+              run: () {
+                final bool hex = c == _Cmd.importHex;
+                if (_expandTarget != null) {
+                  _expandImport(hex: hex);
+                } else if (_placeableBoardSlot) {
+                  _beginBoardImport(_slotIndex, hex: hex);
+                } else if (_setup.canEditCurrentPoint) {
+                  _changePointImport(hex: hex);
+                }
+              },
+            ),
+          _ => BoardCommand(
+              name: 'Place by click',
+              help: 'Arms a click: your next click on the map places its point.',
+              icon: Icons.ads_click,
+              enabled: editable,
+              run: () {
+                if (_expandTarget != null) {
+                  _expandManual();
+                } else if (_placeableBoardSlot) {
+                  _armBoardManual();
+                } else if (_setup.canEditCurrentPoint) {
+                  _changePointManual();
+                }
+              },
+            ),
+        };
+      case _Cmd.exclude:
+        return BoardCommand(
+          name: 'Exclude stage',
+          help: 'Drops this stage and every deeper one, after asking.',
+          icon: Icons.content_cut,
+          run: () => _hasSession ? _truncate() : _truncateOrbit(),
+        );
+      case _Cmd.halt:
+        return BoardCommand(
+          name: 'Halt',
+          help: 'Halts the running derivation, after asking; its progress is '
+              'kept.',
+          icon: Icons.pause,
+          enabled: _busy || _setup.isGenerating,
+          run: _abortDerivation,
+        );
+      case _Cmd.copyKey:
+      case _Cmd.copyDigest:
+        final bool full = c == _Cmd.copyDigest;
+        return BoardCommand(
+          name: full ? 'Copy full digest' : 'Copy key',
+          help: full
+              ? 'Copies the full export digest, not just its first 32 '
+                  'characters.'
+              : 'Derives and copies this stage’s key, blind: never shown.',
+          icon: full ? Icons.fingerprint : Icons.key,
+          enabled: !_busy,
+          run: () => _copyMasterSecret(full: full),
+        );
+      case _Cmd.prevStop:
+      case _Cmd.nextStop:
+      case _Cmd.numbers:
+      case _Cmd.lines:
+      case _Cmd.framePath:
+        return BoardCommand(
+          name: switch (c) {
+            _Cmd.prevStop => 'Previous stop',
+            _Cmd.nextStop => 'Next stop',
+            _Cmd.numbers => 'Stop numbers',
+            _Cmd.lines => 'Stop lines',
+            _ => 'Frame the path',
+          },
+          help: 'Coming next on this branch.',
+          icon: switch (c) {
+            _Cmd.prevStop => Icons.skip_previous,
+            _Cmd.nextStop => Icons.skip_next,
+            _Cmd.numbers => Icons.format_list_numbered,
+            _Cmd.lines => Icons.timeline,
+            _ => Icons.fit_screen,
+          },
+          enabled: false,
+          run: () {},
+        );
+      case _Cmd.rhoZoom:
+      case _Cmd.rhoPan:
+        final bool zoom = c == _Cmd.rhoZoom;
+        return BoardCommand(
+          name: zoom ? 'ρ toward zoom' : 'ρ toward pan',
+          help: zoom
+              ? 'Makes zooming cheaper than panning: a route with fewer stops.'
+              : 'Makes panning cheaper than zooming: a route with more stops.',
+          icon: zoom ? Icons.zoom_in : Icons.pan_tool,
+          enabled: _routeReady,
+          run: () => _stepRoute(rho: zoom ? 1 : -1),
+        );
+      case _Cmd.exponentDown:
+      case _Cmd.exponentUp:
+        final bool up = c == _Cmd.exponentUp;
+        return BoardCommand(
+          name: up ? 'Exponent up' : 'Exponent down',
+          help: up
+              ? 'Penalises long hops more: shorter hops, more stops.'
+              : 'Tolerates longer hops: fewer stops.',
+          glyph: (Color colour) => HopGlyph(spread: !up, colour: colour),
+          enabled: _routeReady,
+          run: () => _stepRoute(exponent: up ? 1 : -1),
+        );
+      case _Cmd.path:
+        return BoardCommand(
+          name: 'Landmark path',
+          help: 'Shows or hides the landmark path of this map’s point: its '
+              'features outlined, joined by a line, numbered.',
+          icon: Icons.route,
+          active: _showPath,
+          run: _toggleLandmarkPath,
+        );
+      case _Cmd.stopsDown:
+      case _Cmd.stopsUp:
+        final bool up = c == _Cmd.stopsUp;
+        return BoardCommand(
+          name: up ? 'More stops shown' : 'Fewer stops shown',
+          help: up
+              ? 'Shows one more stop before the leaf.'
+              : 'Hides the shallowest stop shown. With none left the map is '
+                  'unaided, and its review is graded.',
+          icon: up ? Icons.layers : Icons.layers_clear,
+          enabled: _routeReady,
+          repeats: true,
+          run: () => _stepRoute(visible: up ? 1 : -1),
+        );
+      case _Cmd.islands:
+        return BoardCommand(
+          name: 'Reveal islands',
+          help: 'Highlights the canonical islands in view (zoom in if there are '
+              'too many).',
+          icon: Icons.diamond,
+          enabled: !_busy,
+          run: () => unawaited(
+              _isBoardSlot ? _boardEnumerateIslands() : _enumerateIslands()),
+        );
+      case _Cmd.deepRender:
+        return BoardCommand(
+          name: 'Deep render',
+          help: 'Renders up to the encoder’s escape cap, revealing leaves in '
+              'escape-count voids (slower).',
+          icon: Icons.blur_on,
+          active: _deepRender,
+          run: _toggleDeepRender,
+        );
+      case _Cmd.autoBrightness:
+        return BoardCommand(
+          name: 'Auto brightness',
+          help: 'Brightness and slope follow each view; a manual step turns it '
+              'off.',
+          icon: Icons.brightness_auto,
+          active: _brightness.autoExposure,
+          run: _brightness.toggleAutoExposure,
+        );
+      case _Cmd.brightnessDown:
+      case _Cmd.brightnessUp:
+        final bool up = c == _Cmd.brightnessUp;
+        return BoardCommand(
+          name: up ? 'Brighter' : 'Darker',
+          help: 'Moves the lit band ${up ? 'up' : 'down'}. Hold to keep '
+              'stepping.',
+          icon: up ? Icons.brightness_high : Icons.brightness_low,
+          repeats: true,
+          run: () => _brightness.adjustBySteps(up ? 1.0 : -1.0),
+        );
+      case _Cmd.slopeDown:
+      case _Cmd.slopeUp:
+        final bool up = c == _Cmd.slopeUp;
+        return BoardCommand(
+          name: up ? 'More shades' : 'Fewer shades',
+          help: 'Spreads the brightness falloff over ${up ? 'more' : 'fewer'} '
+              'escape counts. Hold to keep stepping.',
+          icon: up ? Icons.gradient : Icons.contrast,
+          repeats: true,
+          run: () => _brightness.adjustSlopeBySteps(up ? 1.0 : -1.0),
+        );
+      case _Cmd.hueDown:
+      case _Cmd.hueUp:
+        final bool up = c == _Cmd.hueUp;
+        return BoardCommand(
+          name: up ? 'Next hue' : 'Previous hue',
+          help: 'Cycles the colour scheme through its six hues (now: '
+              '${_hue.name}).',
+          icon: up ? Icons.rotate_right : Icons.rotate_left,
+          repeats: true,
+          run: () => _stepHue(up ? 1 : -1),
+        );
+    }
+  }
+
+  /// Reveal or hide the obscured sensitive text fields (the salt/pepper and the
+  /// import phrase/hex) together: if any is hidden, reveal all; if all are
+  /// shown, hide all (Main board).
   void _toggleSensitiveVisibility() {
     final bool reveal = _stage0Hidden || _mnemonicHidden;
     _sounds.play(UiSound.click);
@@ -1591,7 +1829,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _toast(reveal ? 'Sensitive text revealed.' : 'Sensitive text hidden.');
   }
 
-  /// Step the UI sound-cue volume one level (bound to `V` + ↑/↓). Plays a cue at
+  /// Step the UI sound-cue volume one level (Main board). Plays a cue at
   /// the new level as feedback — silent at level 0, which *is* the cue that the
   /// app is now muted — and notes the level in the console.
   void _changeVolume({required bool up}) {
@@ -1601,12 +1839,12 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   /// Current render escape-count cap: the fast default, or the engine's encode
-  /// cap when deep render (Alt+L) is on.
+  /// cap when deep render (View board) is on.
   int get _renderMaxIter => _deepRender
       ? widget.core.encodeParams.maxIter
       : EncodingConstants.renderMaxIterFast;
 
-  /// Toggle deep render mode (Alt+L). Raises/lowers the canvas escape-count cap
+  /// Toggle deep render mode (View board). Raises/lowers the canvas escape-count cap
   /// so the rendered boundary matches the encoder in high escape-count voids;
   /// laggy while on (see the on-canvas marker).
   void _toggleDeepRender() {
@@ -1618,7 +1856,7 @@ class _SetupScreenState extends State<SetupScreen> {
         : 'Deep render off — ${EncodingConstants.renderMaxIterFast} iterations.');
   }
 
-  /// Toggle the landmark path on the active board (Alt+E). The mode is
+  /// Toggle the landmark path on the active map (Path board). The mode is
   /// announced; the path never is.
   void _toggleLandmarkPath() {
     setState(() => _showPath = !_showPath);
@@ -3105,8 +3343,8 @@ class _SetupScreenState extends State<SetupScreen> {
     } else {
       body = Text(
         placed
-            ? 'Point placed. R new click · N regenerate · I import (words/hex).'
-            : 'R to place (click a leaf) · N random · I import (words/hex). '
+            ? 'Point placed. ${_keys(<_Cmd>[_Cmd.placeByClick, _Cmd.newPoint, _Cmd.importWords])}.'
+            : '${_keys(<_Cmd>[_Cmd.placeByClick, _Cmd.newPoint, _Cmd.importWords])}. '
                 'rᵢ=$r is the minimum — place any $r fractals; the rest derive.',
         style: theme.textTheme.bodySmall,
       );
@@ -3492,37 +3730,6 @@ class _SetupScreenState extends State<SetupScreen> {
 
   // --- Console ----------------------------------------------------------------
 
-  /// The hotkey manual, shown in the console (on by default at launch, toggled
-  /// with `H`). Lists every shortcut the setup screen handles.
-  static const List<String> _manualLines = <String>[
-    'F1 manual · F2 Setup · F3 Train · F4 Accelerate · F5 Inherit',
-    'Esc  return to the fractal (leave a text field) · Tab cycles fields',
-    'M  console   9  stage bar   Z  reset (asks first)',
-    'Alt+0–4  go to that stage (recenters); press again to zoom to its point',
-    '0–6  select the secondary slot (0 = salt · 1–6 = fractals)',
-    'Fractals are equal: rᵢ is the minimum — place any rᵢ, the rest derive',
-    'Simplest: fill fractals in order & remember which ones you learn',
-    'N / I / R  on a point: N new random · I import · R manual click',
-    'I import = BIP39 words · Alt+I import = hex (config & point edit alike)',
-    'Click/press a ghost slot past the last stage to grow the setup (N/I/R)',
-    'S salt / export salt · P profile · D derivation steps · C colour',
-    'Alt+D  calibrate derivation time (dialog: target time → steps N)',
-    'K  copy the master secret ("the key")    H  halt derivation (keeps progress)',
-    'X  exclude this stage & above (shorten the setup)',
-    'E  highlight canonical islands in view (white) · zoom in if too many',
-    'Vault: F file path · W write/save · O open file · T blank templates',
-    'In Write: Q QR · Alt+Q copy · press again to switch 128/256-bit · I scan QR to reuse key · Alt+I own key',
-    'In Open: Q scan QR · Alt+Q type key (32 or 64 hex) · Esc cancel',
-    'V+↑/↓  sound volume (level 0 = muted) · Alt+V reveal/hide sensitive text',
-    'Alt+K  copy the full export digest (not just the first 32 chars)',
-    'Alt+L  deep render — reveal leaves in escape-count voids (slower)',
-    'Alt+E  landmark path of the board\'s point — line, numbered stops, highlights;'
-        ' the panel on the right sets the route and the visible stops',
-    'L+scroll or L+↑/↓  brightness · G+scroll or G+↑/↓  slope (↑ more shades)',
-    'A  auto brightness — offset & slope follow the view (L / G take over)',
-    'scroll zoom · drag pan (over the canvas)',
-  ];
-
   /// Console palette: "Gunmetal" — a cool, near-neutral blue-grey, translucent
   /// over the canvas so the fractal faintly bleeds through. The slight blue cast
   /// (channels offset a few levels from pure grey) reads as a *material* rather
@@ -3565,7 +3772,7 @@ class _SetupScreenState extends State<SetupScreen> {
     final String status = _prompt != null
         ? _prompt!.message
         : _expandTarget != null
-            ? 'Add stages — N new · I import · Esc cancel.'
+            ? 'Add stages — ${_keys(<_Cmd>[_Cmd.newPoint, _Cmd.importWords])} · Esc cancel.'
             : _derivationStatus() ??
             focusHelp ??
             (_inMemoriseStudy ? _memoriseHelp : null) ??
@@ -3604,7 +3811,7 @@ class _SetupScreenState extends State<SetupScreen> {
           child: Text(status, maxLines: 1, overflow: TextOverflow.ellipsis),
         ),
         IconButton(
-          tooltip: 'Restore console (M)',
+          tooltip: 'Restore (F1)',
           color: _kConsoleFg,
           icon: const Icon(Icons.keyboard_arrow_up),
           onPressed: () => setState(() => _chromeMinimized = false),
@@ -3613,11 +3820,52 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// The expanded console: header, optional inline prompt, focus help, the
-  /// recent log, and the optional hotkey manual.
+  /// Height of the expanded bottom panel: the command board's tabs and three
+  /// rows, with their padding.
+  static const double _kPanelHeight = 30 +
+      kBoardGap +
+      kBoardRows * (kBoardButtonHeight + kBoardGap) +
+      _kPanelPadding * 2;
+  static const double _kPanelPadding = 8;
+
+  /// The expanded bottom panel: the command board flush left and, to its
+  /// right, the log — an inline prompt, focus help, then the recent lines.
+  /// While a board button or tab has the pointer or focus, its explanation
+  /// takes the log's place; the log returns when it leaves.
   Widget _consoleExpanded() {
+    return SizedBox(
+      height: _kPanelHeight,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Padding(
+            padding: const EdgeInsets.all(_kPanelPadding),
+            child: CommandBoard(
+              active: _context,
+              commands: _board(),
+              layout: _layout,
+              colour: _kConsoleFg,
+              onContext: _setContext,
+              onExplain: (String? text) {
+                if (text != _explaining) setState(() => _explaining = text);
+              },
+            ),
+          ),
+          VerticalDivider(
+            width: 1,
+            color: _kConsoleAccent.withValues(alpha: 0.25),
+          ),
+          Expanded(child: _logArea()),
+        ],
+      ),
+    );
+  }
+
+  /// The log side of the bottom panel.
+  Widget _logArea() {
+    const EdgeInsets pad = EdgeInsets.fromLTRB(12, 8, 12, 0);
+    final String? explaining = _explaining;
     return Column(
-      mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
         // Header.
@@ -3626,125 +3874,88 @@ class _SetupScreenState extends State<SetupScreen> {
             const SizedBox(width: 12),
             const Icon(Icons.terminal),
             const SizedBox(width: 8),
-            Text('Console',
+            Text('Log',
                 style: _termStyle.copyWith(
                     color: _kConsoleAccent, fontWeight: FontWeight.bold)),
             const Spacer(),
             IconButton(
-              tooltip: _manualVisible ? 'Hide manual (F1)' : 'Show manual (F1)',
-              color: _kConsoleFg,
-              icon: Icon(_manualVisible ? Icons.help : Icons.help_outline),
-              onPressed: () => setState(() => _manualVisible = !_manualVisible),
-            ),
-            IconButton(
-              tooltip: 'Minimize console & tabs (M)',
+              tooltip: 'Collapse (F1)',
               color: _kConsoleFg,
               icon: const Icon(Icons.keyboard_arrow_down),
-              onPressed: () => setState(() => _chromeMinimized = true),
+              onPressed: _togglePanel,
             ),
           ],
         ),
         Divider(height: 1, color: _kConsoleAccent.withValues(alpha: 0.25)),
-        // Live region — pinned above the scroll so a confirmation prompt or the
-        // focused-field help is always visible (never scrolled behind the
-        // manual).
+        // A confirmation prompt stays pinned, even over an explanation.
         if (_prompt != null)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            child: _consolePromptBlock(),
-          ),
-        if (_prompt == null && _expandTarget != null)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            child: _expandPickerBlock(),
-          ),
-        if (_prompt == null &&
-            _expandTarget == null &&
-            _setup.derivingStageIndex != null)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            child: _derivationBlock(),
-          ),
-        if (_prompt == null &&
-            _expandTarget == null &&
-            _setup.derivingStageIndex == null &&
-            _focusedField != null)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                const Icon(Icons.info_outline, size: 14),
-                const SizedBox(width: 6),
-                Expanded(child: Text(_fieldHelp(_focusedField!))),
-              ],
-            ),
-          ),
-        // Memorise guidance — relocated here from the control panel so the panel
-        // stays stable. Shown only when nothing more urgent is.
-        if (_prompt == null &&
-            _expandTarget == null &&
-            _setup.derivingStageIndex == null &&
-            _focusedField == null &&
-            _inMemoriseStudy)
-          const Padding(
-            padding: EdgeInsets.fromLTRB(12, 8, 12, 0),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Icon(Icons.menu_book, size: 14),
-                SizedBox(width: 6),
-                Expanded(child: Text(_memoriseHelp)),
-              ],
-            ),
-          ),
-        ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 200),
-          child: SingleChildScrollView(
-            reverse: true,
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[
-                for (final String line in _consoleLog) Text('› $line'),
-                if (_manualVisible) ...<Widget>[
-                  const SizedBox(height: 8),
-                  Text('Hotkeys',
-                      style: _termStyle.copyWith(
-                          color: _kConsoleAccent, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 4),
-                  _manualColumns(),
+          Padding(padding: pad, child: _consolePromptBlock()),
+        if (explaining != null)
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  const Icon(Icons.info_outline, size: 14),
+                  const SizedBox(width: 6),
+                  Expanded(child: Text(explaining)),
                 ],
-              ],
+              ),
+            ),
+          )
+        else ...<Widget>[
+          if (_prompt == null && _expandTarget != null)
+            Padding(padding: pad, child: _expandPickerBlock()),
+          if (_prompt == null &&
+              _expandTarget == null &&
+              _setup.derivingStageIndex != null)
+            Padding(padding: pad, child: _derivationBlock()),
+          if (_prompt == null &&
+              _expandTarget == null &&
+              _setup.derivingStageIndex == null &&
+              _focusedField != null)
+            Padding(
+              padding: pad,
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  const Icon(Icons.info_outline, size: 14),
+                  const SizedBox(width: 6),
+                  Expanded(child: Text(_fieldHelp(_focusedField!))),
+                ],
+              ),
+            ),
+          // Memorise guidance, shown only when nothing more urgent is.
+          if (_prompt == null &&
+              _expandTarget == null &&
+              _setup.derivingStageIndex == null &&
+              _focusedField == null &&
+              _inMemoriseStudy)
+            const Padding(
+              padding: pad,
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Icon(Icons.menu_book, size: 14),
+                  SizedBox(width: 6),
+                  Expanded(child: Text(_memoriseHelp)),
+                ],
+              ),
+            ),
+          Expanded(
+            child: SingleChildScrollView(
+              reverse: true,
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  for (final String line in _consoleLog) Text('› $line'),
+                ],
+              ),
             ),
           ),
-        ),
-      ],
-    );
-  }
-
-  /// The hotkey manual laid out in two columns. The lines are short and the
-  /// console is wide, so a single column wasted the horizontal space and ran
-  /// tall enough to scroll; splitting in half roughly halves the height and
-  /// fits comfortably without scrolling.
-  Widget _manualColumns() {
-    final int half = (_manualLines.length + 1) ~/ 2;
-    Widget column(Iterable<String> lines) => Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            for (final String line in lines)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 3),
-                child: Text(line),
-              ),
-          ],
-        );
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        Expanded(child: column(_manualLines.take(half))),
-        const SizedBox(width: 20),
-        Expanded(child: column(_manualLines.skip(half))),
+        ],
       ],
     );
   }
@@ -4011,7 +4222,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// time a given N takes drifts with hardware; N itself is exact and
   /// reproducible — see docs §"time is a perishable label on a durable
   /// parameter".)
-  /// Open the spacious Argon2 calibration dialog (Alt+D). It benchmarks on this
+  /// Open the spacious Argon2 calibration dialog (Setup board). It benchmarks on this
   /// device, solves the iteration count N for a chosen target time, and — on
   /// Apply — returns N, which we write into the derivation-steps field. Exit is
   /// Esc + confirm (handled inside the dialog).
@@ -4045,7 +4256,7 @@ class _SetupScreenState extends State<SetupScreen> {
       child: OutlinedButton.icon(
         onPressed: (_busy || _hasSession) ? null : _openCalibrationDialog,
         icon: const Icon(Icons.timer_outlined, size: 18),
-        label: const Text('Calibrate derivation time…  (Alt+D)'),
+        label: const Text('Calibrate derivation time…'),
       ),
     );
   }
@@ -5094,7 +5305,7 @@ class _SetupScreenState extends State<SetupScreen> {
                         const SizedBox(height: 8),
                         Text(
                           'Q — show the QR to hand-copy onto a printed blank '
-                          'template (T).  Alt+Q — copy the key for a password '
+                          'template (Main board).  Alt+Q — copy the key for a password '
                           'manager (blind).  Press Q or Alt+Q again to switch to '
                           '${otherLen() * 8}-bit (a fresh key, overwriting the '
                           'file).  '
@@ -5817,7 +6028,7 @@ class _SetupScreenState extends State<SetupScreen> {
     final String limit = usable == placed
         ? 'your placed points'
         : usable == viewBits
-            ? 'this view — Alt+K copies all $stateBits bits'
+            ? 'this view — ${_hint(_Cmd.copyDigest)} copies all $stateBits bits'
             : 'the orbit state';
     return '$usable bits usable at stage $stage '
         '($placed placed, $viewBits in this view; limited by $limit)';
@@ -5860,14 +6071,11 @@ class _SetupScreenState extends State<SetupScreen> {
     });
   }
 
-  /// Surface a warning on the console and make sure it is seen: expand the
-  /// console and hide the hotkey manual so the message leads, then log it.
+  /// Surface a warning on the console and make sure it is seen: restore the
+  /// bottom panel, then log it.
   void _warnOnConsole(String message) {
     if (!mounted) return;
-    setState(() {
-      _chromeMinimized = false; // expand the console
-      _manualVisible = false; // hide the hotkeys menu so the warning leads
-    });
+    setState(() => _chromeMinimized = false);
     _toast(message);
   }
 
@@ -5963,13 +6171,15 @@ class _SetupScreenState extends State<SetupScreen> {
               '${_exportEntropyNote(_activeStage, MasterSecret.displayChars * 4)}. '
               'Paste into another wallet or use as a downstream pepper. The '
               'optional salt versions the key (e.g. SIGNING-1, '
-              'uppercase/digits/hyphen). Press K to copy — blind, never shown.';
+              'uppercase/digits/hyphen). ${_hint(_Cmd.copyKey)} copies it — '
+              'blind, never shown.';
         }
         final int idx = _setup.displayStageIndex;
         return 'Key (master-secret export): Argon2id over your setup so far '
             '(stages 1–$idx). Paste into another wallet or use as a downstream '
             'pepper. This optional salt versions the key (e.g. SIGNING-1, '
-            'uppercase/digits/hyphen). Press K to derive and copy — blind, '
+            'uppercase/digits/hyphen). ${_hint(_Cmd.copyKey)} derives and copies '
+            'it — blind, '
             'never shown.';
       case _Field.hue:
         return 'Colour scheme: ${_hue.name}. ← → to cycle through the six hues.';
@@ -6092,6 +6302,58 @@ enum _Field {
   truncate,
 }
 
+/// The command board's commands, each at its context and position (an index
+/// into [kBoardKeys]: rows top to bottom, left to right).
+enum _Cmd {
+  layout(CommandContext.main, 0),
+  save(CommandContext.main, 1),
+  open(CommandContext.main, 2),
+  templates(CommandContext.main, 3),
+  volumeDown(CommandContext.main, 4),
+  volumeUp(CommandContext.main, 5),
+  secrets(CommandContext.main, 6),
+  filePath(CommandContext.main, 7),
+  reset(CommandContext.main, 8),
+  stageBar(CommandContext.main, 9),
+  salt(CommandContext.setup, 0),
+  profile(CommandContext.setup, 1),
+  steps(CommandContext.setup, 2),
+  calibrate(CommandContext.setup, 3),
+  newPoint(CommandContext.setup, 4),
+  importWords(CommandContext.setup, 5),
+  importHex(CommandContext.setup, 6),
+  placeByClick(CommandContext.setup, 7),
+  exclude(CommandContext.setup, 8),
+  halt(CommandContext.setup, 9),
+  copyKey(CommandContext.setup, 10),
+  copyDigest(CommandContext.setup, 11),
+  prevStop(CommandContext.path, 0),
+  nextStop(CommandContext.path, 1),
+  rhoZoom(CommandContext.path, 2),
+  rhoPan(CommandContext.path, 3),
+  numbers(CommandContext.path, 4),
+  lines(CommandContext.path, 5),
+  exponentDown(CommandContext.path, 6),
+  exponentUp(CommandContext.path, 7),
+  path(CommandContext.path, 8),
+  framePath(CommandContext.path, 9),
+  stopsDown(CommandContext.path, 10),
+  stopsUp(CommandContext.path, 11),
+  islands(CommandContext.view, 0),
+  deepRender(CommandContext.view, 1),
+  autoBrightness(CommandContext.view, 2),
+  brightnessDown(CommandContext.view, 4),
+  brightnessUp(CommandContext.view, 5),
+  slopeDown(CommandContext.view, 6),
+  slopeUp(CommandContext.view, 7),
+  hueDown(CommandContext.view, 8),
+  hueUp(CommandContext.view, 9);
+
+  const _Cmd(this.context, this.slot);
+  final CommandContext context;
+  final int slot;
+}
+
 /// A compact, focusable colour wheel: six hue sectors, no rotate buttons (←/→
 /// cycle while focused) and no inline name (it is shown in the console). Tapping
 /// a sector selects it and focuses the wheel.
@@ -6115,15 +6377,6 @@ class _HueWheelControl extends StatelessWidget {
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    // Let the held-key chords (V + ↑/↓ volume, L / G + ↑/↓ brightness offset /
-    // slope) bubble up to the screen handler instead of cycling the hue, so
-    // they work the same while the wheel holds focus.
-    final HardwareKeyboard kb = HardwareKeyboard.instance;
-    if (kb.isLogicalKeyPressed(LogicalKeyboardKey.keyV) ||
-        kb.isLogicalKeyPressed(LogicalKeyboardKey.keyL) ||
-        kb.isLogicalKeyPressed(LogicalKeyboardKey.keyG)) {
-      return KeyEventResult.ignored;
-    }
     final LogicalKeyboardKey k = event.logicalKey;
     if (k == LogicalKeyboardKey.arrowRight || k == LogicalKeyboardKey.arrowUp) {
       _step(1);
