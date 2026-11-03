@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import 'keyboard_layout.dart';
@@ -336,4 +338,72 @@ class _HopPainter extends CustomPainter {
   @override
   bool shouldRepaint(_HopPainter old) =>
       old.spread != spread || old.colour != colour;
+}
+
+/// A d20 seen face-on (Dragon Dice): a hexagon outline with the facing
+/// triangle inside and the edges from its corners to the outline.
+class D20Glyph extends StatelessWidget {
+  const D20Glyph({super.key, required this.colour});
+
+  final Color colour;
+
+  @override
+  Widget build(BuildContext context) => CustomPaint(
+        size: const Size.square(_D20Painter.size),
+        painter: _D20Painter(colour: colour),
+      );
+}
+
+class _D20Painter extends CustomPainter {
+  _D20Painter({required this.colour});
+
+  final Color colour;
+
+  /// Side of the glyph's square and its stroke width, in logical pixels.
+  static const double size = 24;
+  static const double _stroke = 1.6;
+
+  /// The inner triangle's corner distance from the centre, as a fraction of
+  /// the hexagon's.
+  static const double _inner = 0.5;
+
+  /// Corners of a hexagon and of a triangle.
+  static const int _hexCorners = 6;
+  static const int _triCorners = 3;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Paint p = Paint()
+      ..color = colour
+      ..strokeWidth = _stroke
+      ..style = PaintingStyle.stroke
+      ..strokeJoin = StrokeJoin.round;
+    final Offset c = size.center(Offset.zero);
+    final double r = size.shortestSide / 2 - _stroke;
+    // Pointy-top hexagon: corner k at angle -90° + 60°·k.
+    Offset corner(double radius, int k, int n) {
+      final double a = -math.pi / 2 + 2 * math.pi * k / n;
+      return c + Offset(math.cos(a), math.sin(a)) * radius;
+    }
+
+    final List<Offset> hex = <Offset>[
+      for (int k = 0; k < _hexCorners; k++) corner(r, k, _hexCorners),
+    ];
+    final List<Offset> tri = <Offset>[
+      for (int k = 0; k < _triCorners; k++) corner(r * _inner, k, _triCorners),
+    ];
+    canvas.drawPath(Path()..addPolygon(hex, true), p);
+    canvas.drawPath(Path()..addPolygon(tri, true), p);
+    // Each triangle corner meets the hexagon corner it points at (every
+    // other one), and both neighbours of the corners between.
+    for (int k = 0; k < _triCorners; k++) {
+      final int h = 2 * k;
+      canvas.drawLine(tri[k], hex[h], p);
+      canvas.drawLine(tri[k], hex[(h + 1) % _hexCorners], p);
+      canvas.drawLine(tri[k], hex[(h + _hexCorners - 1) % _hexCorners], p);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_D20Painter old) => old.colour != colour;
 }

@@ -109,15 +109,18 @@ void main() {
     expect(picked, CommandContext.path);
   });
 
-  testWidgets('the exponent glyphs paint', (WidgetTester tester) async {
+  testWidgets('the drawn glyphs paint', (WidgetTester tester) async {
     await tester.pumpWidget(const MaterialApp(
       home: Row(
         children: <Widget>[
           HopGlyph(spread: true, colour: Colors.white),
           HopGlyph(spread: false, colour: Colors.white),
+          D20Glyph(colour: Colors.white),
         ],
       ),
     ));
     expect(find.byType(HopGlyph), findsNWidgets(2));
+    expect(find.byType(D20Glyph), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 }
