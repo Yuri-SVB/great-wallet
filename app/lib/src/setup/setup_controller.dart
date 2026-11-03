@@ -263,8 +263,8 @@ class SetupController extends ChangeNotifier {
       !_isRecallSession &&
       (_entropyBits != null || _expandPlan != null);
 
-  /// Whether the displayed stage can be truncated from (it and every stage above
-  /// it deleted): a settled generated/imported setup (memorise, not deriving or
+  /// Whether the displayed stage can be truncated from (it and every deeper
+  /// stage it deleted): a settled generated/imported setup (memorise, not deriving or
   /// generating) showing a point stage (≥ 1). Recall reconstructs a fixed setup,
   /// so it is not editable this way.
   bool get canTruncateFromDisplayed =>
@@ -1478,9 +1478,9 @@ class SetupController extends ChangeNotifier {
   }
 
   /// Replace stage [k]'s point with [chunk] (one 32-bit point), re-encoding it on
-  /// k's existing fractal. The stages above k were hashed from the old point, so
-  /// they are dropped and the setup shrinks to k stages (their slots become
-  /// ghosts to re-expand). Caller owns [chunk]; this copies what it keeps.
+  /// k's existing fractal. The stages deeper than k were hashed from the old
+  /// point, so they are dropped and the setup shrinks to k stages (their slots
+  /// become ghosts to re-expand). Caller owns [chunk]; this copies what it keeps.
   void _setStagePoint(int k, List<int> chunk) {
     final StageReservoirs res = _reservoirs[k]!;
     final List<EncodedPoint> pts =
@@ -1679,7 +1679,7 @@ class SetupController extends ChangeNotifier {
     _recalledEntropyBits = null;
   }
 
-  /// Truncate the setup: delete stage [k] and every stage above it, leaving a
+  /// Truncate the setup: delete stage [k] and every deeper stage, leaving a
   /// setup of stages `0..k-1`. The kept prefix is fully derived, so the entropy
   /// root and any halt stash (which belong to the removed tail) are wiped. The
   /// display lands on the new last stage. No-op unless

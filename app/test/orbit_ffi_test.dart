@@ -44,6 +44,19 @@ void main() {
     }
   });
 
+  test('the engine publishes three versions, protocol apart from engine', () {
+    final GreatWallCoreBindings? b = bindings;
+    if (b == null) {
+      markTestSkipped('engine unavailable — $openError');
+      return;
+    }
+    final RegExp semver = RegExp(r'^\d+\.\d+\.\d+$');
+    expect(b.protocolVersion(), matches(semver));
+    expect(b.engineVersion(), matches(semver));
+    expect(b.landmarkPathVersion(), matches(semver));
+    expect(b.protocolVersion(), isNot(b.engineVersion()));
+  });
+
   group('orbit_root (o_0 = H(sigma) = SHA-512)', () {
     test("matches package:crypto SHA-512 for b'abc'", () {
       final GreatWallCoreBindings? b = bindings;
