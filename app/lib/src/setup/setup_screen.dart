@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/material.dart';
 import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
     show CardKind, Cues, Deck, MemCard, buildDeck;
+import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:flutter/services.dart';
 import 'package:great_wall_ux/great_wall_ux.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
@@ -15,6 +16,7 @@ import 'package:qr/qr.dart' as qr;
 
 import '../command/command_board.dart';
 import '../command/keyboard_layout.dart';
+import '../command/zoom_flight.dart';
 import '../core/bip39.dart';
 import '../core/encoding_constants.dart';
 import '../core/entropy.dart';
@@ -49,7 +51,8 @@ class SetupScreen extends StatefulWidget {
   State<SetupScreen> createState() => _SetupScreenState();
 }
 
-class _SetupScreenState extends State<SetupScreen> {
+class _SetupScreenState extends State<SetupScreen>
+    with TickerProviderStateMixin {
   late final SetupController _setup = SetupController(widget.core);
 
   final PanZoomController _viewport =
@@ -297,6 +300,19 @@ class _SetupScreenState extends State<SetupScreen> {
   /// The explanation of the board button or tab under the pointer or focus,
   /// shown in the log in place of its text; null when none is.
   String? _explaining;
+
+  /// Whether the landmark path's numbered markers and its line are drawn
+  /// (Path board).
+  bool _showNumbers = true;
+  bool _showLines = true;
+
+  /// The stop last flown to (Path board's previous / next): its index among
+  /// the shown stops of that map's path, as then shown. Stale once the map,
+  /// the path or its visible stops change, and then the cycle starts over.
+  ({(int, int) key, LandmarkPath path, int? visible, int index})? _stopAt;
+
+  /// The running flight between views, if any.
+  Ticker? _flight;
 
   /// Whether the bottom panel (command board and log) is collapsed to a thin
   /// status line (F1). Independent of the stage-tab bar.
@@ -677,6 +693,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
   @override
   void dispose() {
+    _stopFlight();
     // Release any awaiter blocked on an unanswered console prompt.
     if (_prompt != null && !_prompt!.completer.isCompleted) {
       _prompt!.completer.complete(false);
@@ -846,7 +863,11 @@ class _SetupScreenState extends State<SetupScreen> {
                   // Clicking anywhere on the canvas returns keyboard focus to the
                   // hotkey handler; the Listener is passive.
                   child: Listener(
-                    onPointerDown: (_) => _hotkeys.requestFocus(),
+                    onPointerDown: (_) {
+                      _stopFlight();
+                      _hotkeys.requestFocus();
+                    },
+                    onPointerSignal: (_) => _stopFlight(),
                     child: Stack(
                       children: <Widget>[
                         // Slot #0 is the salt (Namtso σ at stage 0; retirement
@@ -1683,27 +1704,51 @@ class _SetupScreenState extends State<SetupScreen> {
         );
       case _Cmd.prevStop:
       case _Cmd.nextStop:
+        final bool next = c == _Cmd.nextStop;
+        return BoardCommand(
+          name: next ? 'Next stop' : 'Previous stop',
+          help: 'Flies to the ${next ? 'next' : 'previous'} stop shown, '
+              'wrapping around: zooming out, across and back in along the '
+              'shortest way, the way the path’s hops are measured.',
+          icon: next ? Icons.skip_next : Icons.skip_previous,
+          enabled: _routeReady,
+          run: () => _cycleStop(next ? 1 : -1),
+        );
       case _Cmd.numbers:
+        return BoardCommand(
+          name: 'Stop numbers',
+          help: 'Shows or hides the stops’ numbered markers.',
+          icon: Icons.format_list_numbered,
+          active: _showNumbers,
+          run: () {
+            _sounds.play(_showNumbers ? UiSound.modeOff : UiSound.modeOn);
+            setState(() => _showNumbers = !_showNumbers);
+          },
+        );
       case _Cmd.lines:
+        return BoardCommand(
+          name: 'Stop lines',
+          help: 'Shows or hides the line from stop to stop.',
+          icon: Icons.timeline,
+          active: _showLines,
+          run: () {
+            _sounds.play(_showLines ? UiSound.modeOff : UiSound.modeOn);
+            setState(() => _showLines = !_showLines);
+          },
+        );
       case _Cmd.framePath:
         return BoardCommand(
-          name: switch (c) {
-            _Cmd.prevStop => 'Previous stop',
-            _Cmd.nextStop => 'Next stop',
-            _Cmd.numbers => 'Stop numbers',
-            _Cmd.lines => 'Stop lines',
-            _ => 'Frame the path',
+          name: 'Frame the path',
+          help: 'Flies to the view holding every stop shown.',
+          icon: Icons.fit_screen,
+          enabled: _routeReady,
+          run: () {
+            final (int, int) key = (_activeStage, _slotIndex);
+            final _ShownPath? shown = _paths[key];
+            if (shown == null) return;
+            _sounds.play(UiSound.navZoom);
+            _frame(_visibleOf(shown.path, _routeOf(key).visible));
           },
-          help: 'Coming next on this branch.',
-          icon: switch (c) {
-            _Cmd.prevStop => Icons.skip_previous,
-            _Cmd.nextStop => Icons.skip_next,
-            _Cmd.numbers => Icons.format_list_numbered,
-            _Cmd.lines => Icons.timeline,
-            _ => Icons.fit_screen,
-          },
-          enabled: false,
-          run: () {},
         );
       case _Cmd.rhoZoom:
       case _Cmd.rhoPan:
@@ -2015,7 +2060,100 @@ class _SetupScreenState extends State<SetupScreen> {
     if (!current && !_pathsPending.contains(key)) {
       unawaited(_computePath(key, slot));
     }
-    return shown?.overlay;
+    final CanvasPath? overlay = shown?.overlay;
+    if (overlay == null) return null;
+    // The same stops (so their traced outlines are kept), drawn as set.
+    return CanvasPath(
+      stops: overlay.stops,
+      showNumbers: _showNumbers,
+      showLine: _showLines,
+    );
+  }
+
+  /// The stops of [path] drawn with [visible] stops before the leaf (null:
+  /// all), the shallowest hidden first.
+  static List<LandmarkFeature> _visibleOf(LandmarkPath path, int? visible) {
+    final int before = path.stops.length - 1;
+    final int shown = visible == null ? before : visible.clamp(0, before);
+    return path.stops.skip(before - shown).toList();
+  }
+
+  /// How much larger than the framed stops a frame is, and the fewest cells
+  /// of a stop it spans: a stop fills about a third of the view.
+  static const double _kFrameMargin = 3.0;
+  static const double _kFrameMinCells = 8.0;
+
+  /// Fly to the view framing [stops] (their bounding boxes together).
+  void _frame(List<LandmarkFeature> stops) {
+    double reMin = double.infinity, reMax = -double.infinity;
+    double imMin = double.infinity, imMax = -double.infinity;
+    double cell = 0;
+    for (final LandmarkFeature f in stops) {
+      reMin = math.min(reMin, fixedToDouble(f.bboxReMin));
+      reMax = math.max(reMax, fixedToDouble(f.bboxReMax));
+      imMin = math.min(imMin, fixedToDouble(f.bboxImMin));
+      imMax = math.max(imMax, fixedToDouble(f.bboxImMax));
+      cell = math.max(cell, fixedToDouble(f.cellRaw));
+    }
+    final double span = math.max(reMax - reMin, imMax - imMin);
+    final double half =
+        math.max(span * _kFrameMargin, cell * _kFrameMinCells) / 2;
+    _flyTo((reMin + reMax) / 2, (imMin + imMax) / 2, half);
+  }
+
+  /// Fly the view smoothly to centre `(re, im)` at half-extent [half]
+  /// ([ZoomFlight]). Any pointer input on the map stops it.
+  void _flyTo(double re, double im, double half) {
+    _stopFlight();
+    final FractalViewport from = _viewport.viewport;
+    final ZoomFlight f = ZoomFlight(
+      re0: from.centreRe,
+      im0: from.centreIm,
+      w0: 2 * from.halfExtent,
+      re1: re,
+      im1: im,
+      w1: 2 * half,
+    );
+    final int total = f.duration.inMicroseconds;
+    final Ticker t = createTicker((Duration elapsed) {
+      final double progress = elapsed.inMicroseconds / total;
+      final ({double re, double im, double w}) v = f.at(progress);
+      _viewport.viewport = _viewport.viewport
+          .copyWith(centreRe: v.re, centreIm: v.im, halfExtent: v.w / 2);
+      if (progress >= 1) {
+        WidgetsBinding.instance.addPostFrameCallback((_) => _stopFlight());
+      }
+    });
+    _flight = t;
+    t.start();
+  }
+
+  void _stopFlight() {
+    _flight?.dispose();
+    _flight = null;
+  }
+
+  /// Fly to the next (or, with [dir] -1, the previous) stop shown on the
+  /// active map's path, wrapping around; the first press goes to the first
+  /// stop (or the last).
+  void _cycleStop(int dir) {
+    final (int, int) key = (_activeStage, _slotIndex);
+    final _ShownPath? shown = _paths[key];
+    if (shown == null) return;
+    final int? visible = _routeOf(key).visible;
+    final List<LandmarkFeature> stops = _visibleOf(shown.path, visible);
+    final int n = stops.length;
+    final ({(int, int) key, LandmarkPath path, int? visible, int index})? at =
+        _stopAt;
+    final bool fresh = at == null ||
+        at.key != key ||
+        !identical(at.path, shown.path) ||
+        at.visible != visible;
+    final int index =
+        fresh ? (dir > 0 ? 0 : n - 1) : (at.index + dir) % n;
+    _stopAt = (key: key, path: shown.path, visible: visible, index: index);
+    _sounds.play(UiSound.navZoom);
+    _frame(<LandmarkFeature>[stops[index]]);
   }
 
   /// Search [slot]'s landmark path for [key]'s route off the UI isolate,
@@ -2081,11 +2219,9 @@ class _SetupScreenState extends State<SetupScreen> {
   /// before the leaf are drawn, the shallowest hidden first. The cells are
   /// shared, so wiping the path blanks the overlay too.
   CanvasPath _canvasPathOf(LandmarkPath path, int? visible) {
-    final int before = path.stops.length - 1;
-    final int shown = visible == null ? before : visible.clamp(0, before);
     return CanvasPath(
       stops: <CanvasPathStop>[
-        for (final LandmarkFeature f in path.stops.skip(before - shown))
+        for (final LandmarkFeature f in _visibleOf(path, visible))
           CanvasPathStop(
             re: fixedToDouble(f.barycentreRe),
             im: fixedToDouble(f.barycentreIm),
