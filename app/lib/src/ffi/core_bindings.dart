@@ -236,6 +236,10 @@ class GreatWallCoreBindings {
         _lib.lookupFunction<_EngineVersionC, _EngineVersionDart>(
       'bs_engine_version',
     );
+    _protocolVersion =
+        _lib.lookupFunction<_EngineVersionC, _EngineVersionDart>(
+      'bs_protocol_version',
+    );
   }
 
   /// Open the engine library and bind its symbols. Verifies the fixed-point
@@ -312,6 +316,7 @@ class GreatWallCoreBindings {
   late final _BitsPerPointDart _bitsPerPoint;
   late final _GetPrecisionDart _getPrecision;
   late final _EngineVersionDart _engineVersion;
+  late final _EngineVersionDart _protocolVersion;
 
   // -------------------------------------------------------------------------
   // Metadata
@@ -334,11 +339,18 @@ class GreatWallCoreBindings {
   /// The engine algorithm version string (e.g. `"0.1.0"`). A mismatch between
   /// the version the app was tested against and the linked engine is a signal
   /// that encodings may not be reproducible.
-  String engineVersion() {
+  String engineVersion() => _version(_engineVersion);
+
+  /// The protocol version the engine implements (e.g. `"0.5.0"`): what a
+  /// setup derives. Distinct from [engineVersion].
+  String protocolVersion() => _version(_protocolVersion);
+
+  /// A version string from one of the engine's version getters.
+  static String _version(_EngineVersionDart getter) {
     const int bufLen = 32;
     final Pointer<Uint8> buf = calloc<Uint8>(bufLen);
     try {
-      final int len = _engineVersion(buf, bufLen);
+      final int len = getter(buf, bufLen);
       final int n = len < bufLen ? len : bufLen - 1;
       return String.fromCharCodes(buf.asTypedList(n));
     } finally {

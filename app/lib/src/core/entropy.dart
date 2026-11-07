@@ -9,8 +9,7 @@ import 'dart:typed_data';
 /// re-implemented here (SCOPE.md: "Key derivation, BIP39, BIP32 ... never
 /// handled in the UX layer"; it belongs to the engine/app boundary, surfaced
 /// over FFI in a later pass). This file covers only the bit plumbing the Setup
-/// orchestration needs to assemble each chain link's Argon2 input (Stage-0
-/// salt/pepper followed by the preceding points) and the per-stage chunks.
+/// orchestration needs: the points' 32-bit chunks.
 class Entropy {
   Entropy._();
 

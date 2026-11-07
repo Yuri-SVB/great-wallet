@@ -22,3 +22,6 @@
 [submodule "mountain-dynasty"]
 	path = mountain-dynasty
 	url = git@github.com:Yuri-SVB/mountain-dynasty.git
+[submodule "dragon-dice"]
+	path = dragon-dice
+	url = git@github.com:Yuri-SVB/dragon-dice.git
