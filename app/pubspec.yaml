@@ -25,6 +25,11 @@ dependencies:
   great_wall_ux:
     path: ../great-wall-ux
 
+  # Dragon Dice: entropy from real dice, with its wizard (a map's point by
+  # dice rolls). A flat submodule pinned by this app, like great-wall-ux.
+  dragon_dice_ui:
+    path: ../dragon-dice/ui
+
   # The memory engine: the deck of memorised maps, its SM-2 schedule and the
   # maps' landmark cues. Pure Dart; a flat submodule pinned by this app, like
   # great-wall-ux.

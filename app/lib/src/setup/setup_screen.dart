@@ -6,6 +6,8 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart'
     show defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:flutter/material.dart';
+import 'package:dragon_dice_ui/dragon_dice_ui.dart'
+    show DiceCue, DiceRolls, DragonDiceWizard, digestBits;
 import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
     show CardKind, Cues, Deck, MemCard, buildDeck;
 import 'package:flutter/scheduler.dart' show Ticker;
@@ -18,7 +20,6 @@ import '../app/sound_cue_folder.dart';
 import '../command/command_board.dart';
 import '../command/keyboard_layout.dart';
 import '../command/zoom_flight.dart';
-import '../core/dragon_dice.dart';
 import '../core/encoding_constants.dart';
 import '../core/entropy.dart';
 import '../core/great_wall_core.dart';
@@ -130,7 +131,6 @@ class _SetupScreenState extends State<SetupScreen>
   /// (the `R` edit): the next canvas click sets the new point. Esc cancels.
   bool _editPointMode = false;
 
-  _ImportFormat _pointImportFmt = _ImportFormat.dice;
   final TextEditingController _pointImport = TextEditingController();
   final FocusNode _pointImportFocus = FocusNode(debugLabel: 'point-import');
 
@@ -461,6 +461,7 @@ press.calibrate.target    tick_soft.wav
         for (final String tab in <String>[_Cue.stageTab, _Cue.slotTab])
           ...<String>['$kCuePress.$tab', '$kCueHover.$tab'],
         ..._Cue.all,
+        ...DiceCue.all,
       ];
 
   /// Play cue [name] (see [SoundCueMap]).
@@ -1377,17 +1378,19 @@ press.calibrate.target    tick_soft.wav
               help: c == _Cmd.importHex
                   ? 'Imports this map’s point from hex '
                       '($_kHexDigitsPerPoint digits a point).'
-                  : 'Enters this map’s point from rolls of a d$kDiceFaces '
-                      '(at least $kDiceRollsPerPoint a point), hashed into its '
-                      '${EncodingConstants.bitsPerPoint} bits: entropy you '
-                      'make and can check, not the device’s.',
+                  : 'Opens the Dragon Dice wizard: roll real dice until they '
+                      'carry this map’s ${EncodingConstants.bitsPerPoint} '
+                      'bits: entropy you make and can check, not the '
+                      'device’s. Its advanced mode estimates how likely biased '
+                      'dice fall short.',
               icon: c == _Cmd.importHex ? Icons.tag : null,
               glyph: c == _Cmd.importHex
                   ? null
                   : (Color colour) => D20Glyph(colour: colour),
               enabled: editable,
-              run: () =>
-                  _beginBoardImport(_slotIndex, hex: c == _Cmd.importHex),
+              run: c == _Cmd.importHex
+                  ? () => _beginBoardImport(_slotIndex)
+                  : () => unawaited(_rollDice()),
             ),
           _ => BoardCommand(
               name: 'Place by click',
@@ -2750,28 +2753,17 @@ press.calibrate.target    tick_soft.wav
     _sounds.play(UiSound.selectPoint);
   }
 
-  /// The bits of [points] points from the import editor: dice rolls (hashed,
-  /// see [diceToBits]) or hex digits (exactly 8 a point). Null, with the
-  /// reason told, when the input does not give them; the caller owns and
-  /// wipes the bits.
-  List<int>? _importedBits({required int points}) {
-    final String text = _pointImport.text.trim();
+  /// The point's bits from the import editor's hex (exactly
+  /// [_kHexDigitsPerPoint] digits). Null, with the reason told, when the
+  /// input does not give them; the caller owns and wipes the bits.
+  List<int>? _importedBits() {
     try {
-      if (_pointImportFmt == _ImportFormat.dice) {
-        final List<int> rolls = parseDiceRolls(text);
-        if (rolls.length < points * kDiceRollsPerPoint) {
-          throw FormatException(
-              'Roll at least ${points * kDiceRollsPerPoint} times.');
-        }
-        final List<int> bits = diceToBits(rolls, points: points);
-        rolls.fillRange(0, rolls.length, 0);
-        return bits;
-      }
-      final List<int> bits = Entropy.hexToBits(text.toUpperCase());
-      if (bits.length != points * EncodingConstants.bitsPerPoint) {
+      final List<int> bits =
+          Entropy.hexToBits(_pointImport.text.trim().toUpperCase());
+      if (bits.length != EncodingConstants.bitsPerPoint) {
         Entropy.wipe(bits);
-        throw FormatException(
-            'Enter ${points * _kHexDigitsPerPoint} hex digits.');
+        throw const FormatException(
+            'Enter $_kHexDigitsPerPoint hex digits.');
       }
       return bits;
     } on FormatException catch (e) {
@@ -2784,19 +2776,72 @@ press.calibrate.target    tick_soft.wav
   /// Hex digits in a point: 4 bits a digit.
   static const int _kHexDigitsPerPoint = EncodingConstants.bitsPerPoint ~/ 4;
 
-  /// Open the shared inline import editor for slot [slot]'s point — the board
-  /// peer of [_changePointImport] (`I` / `Alt+I`), reusing [_importEditorBody].
-  void _beginBoardImport(int slot, {required bool hex}) {
+  /// Open the inline hex editor for slot [slot]'s point.
+  void _beginBoardImport(int slot) {
     _pointImport.clear();
-    setState(() {
-      _pointImportFmt = hex ? _ImportFormat.hex : _ImportFormat.dice;
-      _boardImportSlot = slot;
-    });
+    setState(() => _boardImportSlot = slot);
     _pointImportFocus.requestFocus();
   }
 
-  /// Apply the inline import to the pending board slot: dice rolls or 8 hex →
-  /// 32 bits, encoded to a board point.
+  /// Width and height of the Dragon Dice wizard's dialog, in logical pixels.
+  static const double _kDiceWizardWidth = 960;
+  static const double _kDiceWizardHeight = 620;
+
+  /// Enter slot [_slotIndex]'s point with the Dragon Dice wizard: rolls of
+  /// real dice until they carry the point's bits; the point is the first
+  /// bits of their digest (dragon-dice/doc/FORMAT.md).
+  Future<void> _rollDice() async {
+    final int slot = _slotIndex;
+    final ({int o, int p, int q})? prm = _boardPrm(slot);
+    if (prm == null) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Set σ in slot 0 first.');
+      return;
+    }
+    DiceRolls? rolled;
+    await _dialog(
+      _Cue.dice,
+      () => showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (BuildContext ctx) => Dialog(
+          child: SizedBox(
+            width: _kDiceWizardWidth,
+            height: _kDiceWizardHeight,
+            child: DragonDiceWizard(
+              targetBits: EncodingConstants.bitsPerPoint.toDouble(),
+              purpose: 'Slot $slot’s point',
+              onCue: _cue,
+              onDone: (DiceRolls r) {
+                rolled = r;
+                Navigator.of(ctx).pop();
+              },
+              onCancel: () => Navigator.of(ctx).pop(),
+            ),
+          ),
+        ),
+      ),
+    );
+    final DiceRolls? r = rolled;
+    if (r == null) return;
+    final Uint8List digest = r.digest();
+    r.wipe();
+    final List<int> bits = digestBits(digest, EncodingConstants.bitsPerPoint);
+    digest.fillRange(0, digest.length, 0);
+    if (!mounted) {
+      Entropy.wipe(bits);
+      return;
+    }
+    final EncodedPoint pt = widget.core
+        .encodeStage(List<int>.of(bits), o: prm.o, p: prm.p, q: prm.q)
+        .first;
+    _setPrimary(slot, bits, (reRaw: pt.reRaw, imRaw: pt.imRaw));
+    Entropy.wipe(bits);
+    _sounds.play(UiSound.selectPoint);
+  }
+
+  /// Apply the inline import to the pending board slot: 8 hex → 32 bits,
+  /// encoded to a board point.
   void _applyBoardImport() {
     final int slot = _boardImportSlot!;
     final ({int o, int p, int q})? prm = _boardPrm(slot);
@@ -2805,7 +2850,7 @@ press.calibrate.target    tick_soft.wav
       _toast('Set σ in slot 0 first.');
       return;
     }
-    final List<int>? bits = _importedBits(points: 1);
+    final List<int>? bits = _importedBits();
     if (bits == null) return;
     final EncodedPoint pt = widget.core
         .encodeStage(List<int>.of(bits), o: prm.o, p: prm.p, q: prm.q)
@@ -2827,7 +2872,6 @@ press.calibrate.target    tick_soft.wav
     final int slot = _boardImportSlot!;
     return _importEditorBody(
       title: 'Slot $slot',
-      points: 1,
       onApply: _applyBoardImport,
       onCancel: _cancelBoardImport,
     );
@@ -4568,53 +4612,17 @@ press.calibrate.target    tick_soft.wav
     return png.buffer.asUint8List();
   }
 
-  /// The inline import editor for [points] points: a Dragon Dice / hex
-  /// toggle, a masked field labelled with [title], and Apply/Cancel (Enter /
-  /// Esc).
+  /// The inline hex editor for a point: a masked field labelled with
+  /// [title], and Apply/Cancel (Enter / Esc).
   Widget _importEditorBody({
     required String title,
-    required int points,
     required VoidCallback onApply,
     required VoidCallback onCancel,
   }) {
-    final bool hex = _pointImportFmt == _ImportFormat.hex;
-    final int rolls = points * kDiceRollsPerPoint;
-    final int hexDigits = points * _kHexDigitsPerPoint;
-    final String text = _pointImport.text.trim();
-    // Dice: the count so far and the bits it carries, or what is wrong.
-    String? status;
-    String? diceError;
-    if (!hex && text.isNotEmpty) {
-      try {
-        final int n = parseDiceRolls(text).length;
-        status = '$n of $rolls+ rolls, ≈${(n * kDiceBitsPerRoll).floor()} bits';
-      } on FormatException {
-        diceError = 'Rolls are whole numbers 1–$kDiceFaces.';
-      }
-    }
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
-        SegmentedButton<_ImportFormat>(
-          segments: <ButtonSegment<_ImportFormat>>[
-            ButtonSegment<_ImportFormat>(
-                value: _ImportFormat.dice, label: Text('Dragon Dice · $rolls+')),
-            ButtonSegment<_ImportFormat>(
-                value: _ImportFormat.hex, label: Text('$hexDigits hex')),
-          ],
-          selected: <_ImportFormat>{_pointImportFmt},
-          showSelectedIcon: false,
-          style: const ButtonStyle(visualDensity: VisualDensity.compact),
-          onSelectionChanged: (Set<_ImportFormat> s) {
-            _cue('$kCuePress.${_Cue.importFormat}');
-            setState(() {
-              _pointImportFmt = s.first;
-              _pointImport.clear();
-            });
-          },
-        ),
-        const SizedBox(height: 8),
         TextField(
           controller: _pointImport,
           focusNode: _pointImportFocus,
@@ -4623,24 +4631,17 @@ press.calibrate.target    tick_soft.wav
           autocorrect: false,
           enableSuggestions: false,
           inputFormatters: <TextInputFormatter>[
-            if (hex) ...<TextInputFormatter>[
-              FilteringTextInputFormatter.allow(RegExp(r'[0-9a-fA-F ]')),
-              TextInputFormatter.withFunction(
-                (TextEditingValue o, TextEditingValue n) =>
-                    n.copyWith(text: n.text.toUpperCase()),
-              ),
-            ] else
-              FilteringTextInputFormatter.allow(RegExp(r'[0-9 ,]')),
+            FilteringTextInputFormatter.allow(RegExp(r'[0-9a-fA-F ]')),
+            TextInputFormatter.withFunction(
+              (TextEditingValue o, TextEditingValue n) =>
+                  n.copyWith(text: n.text.toUpperCase()),
+            ),
           ],
           decoration: InputDecoration(
             isDense: true,
             border: const OutlineInputBorder(),
-            labelText: hex
-                ? '$title — $hexDigits hex digits'
-                : '$title — d$kDiceFaces rolls, in order',
-            hintText: hex ? 'A1B2C3D4' : '7 20 3 15 …',
-            helperText: hex ? null : status,
-            errorText: hex ? null : diceError,
+            labelText: '$title — $_kHexDigitsPerPoint hex digits',
+            hintText: 'A1B2C3D4',
             suffixIcon: IconButton(
               tooltip: _importHidden ? 'Show' : 'Hide',
               icon: Icon(
@@ -4990,9 +4991,6 @@ class _BoardDeco {
   final int escapeCount;
 }
 
-/// How a point's entropy is entered: Dragon Dice rolls, or blind uppercase hex
-/// (for users who trust an external randomness source over the device RNG).
-enum _ImportFormat { dice, hex }
 
 /// The input controls whose label + live value are conveyed in the console while
 /// focused (so the panel itself can stay label-free).
@@ -5086,6 +5084,7 @@ abstract final class _Cue {
   static const String calibrateLeave = 'calibrate.leave';
   static const String openFile = 'open';
   static const String scan = 'scan';
+  static const String dice = 'dice';
   static const String key = 'key';
   static const String harvestDate = 'harvest.date';
   static const List<String> dialogs = <String>[
@@ -5094,6 +5093,7 @@ abstract final class _Cue {
     openFile,
     scan,
     key,
+    dice,
     harvestDate,
   ];
 
@@ -5106,7 +5106,6 @@ abstract final class _Cue {
   static const String promptCancel = 'prompt.cancel';
   static const String promptConfirm = 'prompt.confirm';
   static const String hueWheel = 'view.hueWheel';
-  static const String importFormat = 'import.format';
   static const String importReveal = 'import.reveal';
   static const String importApply = 'import.apply';
   static const String importCancel = 'import.cancel';
@@ -5138,7 +5137,6 @@ abstract final class _Cue {
     promptCancel,
     promptConfirm,
     hueWheel,
-    importFormat,
     importReveal,
     importApply,
     importCancel,
