@@ -1379,10 +1379,13 @@ press.calibrate.target    tick_soft.wav
                   ? 'Imports this map’s point from hex '
                       '($_kHexDigitsPerPoint digits a point).'
                   : 'Opens the Dragon Dice wizard: roll real dice until they '
-                      'carry this map’s ${EncodingConstants.bitsPerPoint} '
-                      'bits: entropy you make and can check, not the '
-                      'device’s. Its advanced mode estimates how likely biased '
-                      'dice fall short.',
+                      'carry $_kDiceTargetBits bits for this map’s '
+                      '${EncodingConstants.bitsPerPoint}-bit point '
+                      '($_kDiceMarginBits to spare, for cutting the digest): '
+                      'entropy you make and can check, not the device’s. It '
+                      'can mix in the mouse, the camera and the system’s '
+                      'randomness; its advanced mode estimates how likely '
+                      'biased dice fall short.',
               icon: c == _Cmd.importHex ? Icons.tag : null,
               glyph: c == _Cmd.importHex
                   ? null
@@ -2787,9 +2790,19 @@ press.calibrate.target    tick_soft.wav
   static const double _kDiceWizardWidth = 960;
   static const double _kDiceWizardHeight = 620;
 
+  /// Bits the dice must carry beyond a point's: cutting the digest to 32
+  /// bits loses some of what the rolls carry, and 32-bit outputs can be
+  /// tabulated (dragon-dice/doc/FORMAT.md, "From the digest").
+  static const int _kDiceMarginBits = 8;
+
+  /// What the Dragon Dice wizard asks of the rolls for one point.
+  static const int _kDiceTargetBits =
+      EncodingConstants.bitsPerPoint + _kDiceMarginBits;
+
   /// Enter slot [_slotIndex]'s point with the Dragon Dice wizard: rolls of
-  /// real dice until they carry the point's bits; the point is the first
-  /// bits of their digest (dragon-dice/doc/FORMAT.md).
+  /// real dice (and any sources mixed in) until they carry
+  /// [_kDiceTargetBits]; the point is the first 32 bits of their digest
+  /// (dragon-dice/doc/FORMAT.md).
   Future<void> _rollDice() async {
     final int slot = _slotIndex;
     final ({int o, int p, int q})? prm = _boardPrm(slot);
@@ -2809,8 +2822,9 @@ press.calibrate.target    tick_soft.wav
             width: _kDiceWizardWidth,
             height: _kDiceWizardHeight,
             child: DragonDiceWizard(
-              targetBits: EncodingConstants.bitsPerPoint.toDouble(),
+              targetBits: _kDiceTargetBits.toDouble(),
               purpose: 'Slot $slot’s point',
+              systemRandomByDefault: true,
               onCue: _cue,
               onDone: (DiceRolls r) {
                 rolled = r;
