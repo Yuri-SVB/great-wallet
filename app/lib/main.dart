@@ -2,16 +2,25 @@ import 'package:flutter/material.dart';
 import 'package:great_wall_ux/great_wall_ux.dart';
 
 import 'great_wallet.dart';
+import 'src/setup/launch_args.dart';
 
-void main() {
-  runApp(const GreatWalletApp());
+/// `great_wallet [setup file]` — with `flutter run`, the path goes after `-a`
+/// (`flutter run -d linux -a /path/to/setup.gw`). It is where Save and Open
+/// start; started at login with it, the app is the review reminder.
+void main(List<String> args) {
+  final LaunchArgs launch = LaunchArgs.parse(args);
+  runApp(GreatWalletApp(initialPath: launch.path, notice: launch.notice));
 }
 
 /// Root widget. Opens the great-wall-core engine once and hands it to the
 /// mode shell. If the engine `cdylib` is missing, an actionable error screen
 /// is shown instead of a crash.
 class GreatWalletApp extends StatefulWidget {
-  const GreatWalletApp({super.key});
+  const GreatWalletApp({super.key, this.initialPath, this.notice});
+
+  /// The setup file path from the launch, and its line for the log.
+  final String? initialPath;
+  final String? notice;
 
   @override
   State<GreatWalletApp> createState() => _GreatWalletAppState();
@@ -40,7 +49,11 @@ class _GreatWalletAppState extends State<GreatWalletApp> {
       // the canvas surface rather than the default Material face.
       theme: GreatWallTypography.themed(ThemeData.dark(useMaterial3: true)),
       home: _core != null
-          ? ModeShell(core: _core!)
+          ? ModeShell(
+              core: _core!,
+              initialPath: widget.initialPath,
+              notice: widget.notice,
+            )
           : _EngineMissing(error: _openError),
     );
   }

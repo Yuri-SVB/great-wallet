@@ -43,6 +43,7 @@ import '../core/orbit_protocol.dart';
 import '../core/stage_params.dart';
 import '../ffi/core_bindings.dart';
 import '../ffi/fixed.dart';
+import 'cover_writes.dart';
 import 'desktop_qr_scanner.dart';
 import 'orbit_vault.dart';
 import 'setup_crypto.dart';
@@ -61,9 +62,17 @@ class SetupScreen extends StatefulWidget {
     required this.core,
     this.training = false,
     this.onTrainingChanged,
+    this.initialPath,
+    this.notice,
   });
 
   final GreatWallCore core;
+
+  /// The setup file path Save and Open start from (the launch argument).
+  final String? initialPath;
+
+  /// A line for the log once the screen is up (the launch's path).
+  final String? notice;
 
   /// Train mode (F3): the open setup's maps are recalled and graded rather
   /// than set up (CPNF, celestial-peace-nf-core). Setup mode (F2) otherwise.
@@ -473,6 +482,34 @@ class _SetupScreenState extends State<SetupScreen>
     _autoExposureWasOn = _brightness.autoExposure;
     _brightness.addListener(_onBrightnessChanged);
     unawaited(_cueFolder.start());
+    _vaultPath.text = widget.initialPath ?? '';
+    _coverWrites.start();
+    final String? notice = widget.notice;
+    if (notice != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _toast(notice);
+      });
+    }
+  }
+
+  /// Rewrites of the setup file at random times while the app runs, so its
+  /// file times do not tell when a training session saved it.
+  late final CoverWrites _coverWrites = CoverWrites(write: () async {
+    final String path = _vaultPath.text.trim();
+    if (path.isEmpty || _vaultBusy) return;
+    await _fileLocked(() => rewriteSame(path));
+  });
+
+  /// The last write to the setup file in flight: saves and cover writes run
+  /// one after another, so a cover write never puts back the bytes a save has
+  /// just replaced.
+  Future<void> _fileChain = Future<void>.value();
+
+  /// Run [f] once every earlier write to the setup file is done.
+  Future<T> _fileLocked<T>(Future<T> Function() f) {
+    final Future<T> run = _fileChain.then((_) => f());
+    _fileChain = run.then((_) {}, onError: (Object _) {});
+    return run;
   }
 
   /// The folder the sound cues are swapped in at run time.
@@ -653,6 +690,7 @@ press.calibrate.target    tick_soft.wav
     _brightness.removeListener(_onBrightnessChanged);
     _brightness.dispose();
     unawaited(_cueFolder.dispose());
+    _coverWrites.stop();
     _sounds.dispose();
     _iterationsField.dispose();
     _exportLabel.dispose();
@@ -4504,8 +4542,10 @@ press.calibrate.target    tick_soft.wav
         providedKey: providedKey,
         genLenBytes: genLenBytes,
       );
-      await tmp.writeAsBytes(sealed.fileBytes, flush: true);
-      await tmp.rename(path);
+      await _fileLocked(() async {
+        await tmp.writeAsBytes(sealed.fileBytes, flush: true);
+        await tmp.rename(path);
+      });
       _deck = vault.deck; // what the file now holds
       _deckDirty = false;
       return (error: null, key: sealed.key);

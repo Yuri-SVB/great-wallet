@@ -20,9 +20,19 @@ enum WalletMode {
 
 /// Top-level navigation shell that switches between the four modes.
 class ModeShell extends StatefulWidget {
-  const ModeShell({super.key, required this.core});
+  const ModeShell({
+    super.key,
+    required this.core,
+    this.initialPath,
+    this.notice,
+  });
 
   final GreatWallCore core;
+
+  /// The setup file path from the launch, and its line for the log
+  /// ([SetupScreen.initialPath], [SetupScreen.notice]).
+  final String? initialPath;
+  final String? notice;
 
   @override
   State<ModeShell> createState() => _ModeShellState();
@@ -79,6 +89,8 @@ class _ModeShellState extends State<ModeShell> {
             child: SetupScreen(
               core: widget.core,
               training: _training,
+              initialPath: widget.initialPath,
+              notice: widget.notice,
               onTrainingChanged: (bool t) =>
                   _select(t ? WalletMode.train : WalletMode.setup),
             ),

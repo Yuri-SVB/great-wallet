@@ -118,6 +118,22 @@ flutter create --platforms=linux --org org.greatwall --project-name great_wallet
 flutter run -d linux                 # or macos / windows
 ```
 
+### A setup file, and reminders at login
+
+The app takes a setup file path, which Save and Open start from:
+
+```bash
+flutter run -d linux -a /path/to/setup.gw            # arguments go after -a
+build/linux/x64/release/bundle/great_wallet /path/to/setup.gw
+```
+
+Run the second line at login (on Linux, an autostart entry in
+`~/.config/autostart/`): the app opening is the reminder, and what is due shows
+once the key opens the file. The file holds nothing in the clear — not even a
+review date — so a leaked copy cannot tell when it will next be opened. The
+Linux and Windows runners that `flutter create` generates pass the arguments
+on; the macOS runner does not by default.
+
 Only the Dart sources and project metadata are committed; the generated
 platform runners (`linux/`, `macos/`, `windows/`, `build/`, `.dart_tool/`) are
 produced by `flutter create` / `flutter pub get` and are git-ignored. The
