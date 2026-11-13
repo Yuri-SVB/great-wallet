@@ -2328,9 +2328,12 @@ press.calibrate.target    tick_soft.wav
       return;
     }
     // Forward into the immediate next stage: run the memory-hard advance
-    // o_{index} = H*(u_{index-1}) from the (now complete) preceding stage.
+    // o_{index} = H*(u_{index-1}) from the (now complete) preceding stage, or
+    // continue it from where it was halted.
     if (index == _orbitReachableCeiling + 1) {
-      unawaited(_advanceOrbitInto(index));
+      unawaited(_canResumeAdvance
+          ? _resumeOrbitAdvance()
+          : _advanceOrbitInto(index));
       return;
     }
     _sounds.play(UiSound.denyBlocked);
@@ -2463,7 +2466,8 @@ press.calibrate.target    tick_soft.wav
       setState(() {});
       _toast(done > 0
           ? 'Advance into Stage $target halted after $done/$steps passes — '
-              'kept. Resume (${_hint(_Cmd.halt)}) continues from there; Write '
+              'kept. Resume (${_hint(_Cmd.halt)}) or selecting Stage $target '
+              'continues from there; Write '
               '(${_hint(_Cmd.save)}) keeps it across sessions (the file then '
               'holds the partial derivation — guard it). Changing D, or '
               're-placing a point in a shallower stage, discards it.'
@@ -4804,7 +4808,12 @@ press.calibrate.target    tick_soft.wav
       return;
     }
     _sounds.play(UiSound.confirm);
-    _toast('Setup loaded.');
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
+    _toast(cp != null && _canResumeAdvance
+        ? 'Setup loaded. Its advance into Stage ${cp.stage} was halted after '
+            '${cp.pass}/$_iterations passes: selecting Stage ${cp.stage} or '
+            'Resume (${_hint(_Cmd.halt)}) continues from there.'
+        : 'Setup loaded.');
   }
 
   /// Decrypt the file at [path] with [keyBytes] and restore whichever setup it
