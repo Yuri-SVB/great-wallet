@@ -235,9 +235,63 @@ void main() {
     await tester.sendKeyEvent(LogicalKeyboardKey.digit2);
     await tester.pump();
     expect(canvas().overlays.crosses, isEmpty);
+    expect(canvas().overlays.path, isNull, reason: 'no route while recalled');
     await tester.sendKeyEvent(LogicalKeyboardKey.keyE);
     await tester.pump();
     expect(log(), contains('The answer is shown.'));
+
+    // Given up, its route is drawn: every stop counts (all shown), so none
+    // is dimmed.
+    CanvasPath? route() => canvas().overlays.path;
+    for (int i = 0; i < 300 && route() == null; i++) {
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 100)));
+      await tester.pump();
+    }
+    expect(route(), isNotNull);
+    final int count = route()!.stops.length;
+    expect(count, greaterThan(1), reason: 'a stop before the leaf');
+    expect(route()!.stops.where((CanvasPathStop s) => s.dimmed), isEmpty);
+    // A spot on the first stop's own cells.
+    final CanvasCells first = route()!.stops.first.cells;
+    final int filled = first.cells.indexWhere((int v) => v != 0);
+    final FractalSelection onFirst = FractalSelection(
+      re: first.originRe + (filled % first.width) * first.cellSize,
+      im: first.originIm + (filled ~/ first.width) * first.cellSize,
+      pixelX: 0,
+      pixelY: 0,
+    );
+
+    // Recall: the route hidden again, and a click on stop 1 is a find.
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyW);
+    await tester.pump();
+    expect(route(), isNull);
+    expect(log(), contains('dive from memory to stop 1 of $count'));
+    canvas().onSelect!(onFirst);
+    await tester.pump();
+    expect(log(), contains('Found stop 1 of $count'));
+
+    // Path board (Alt+E) › C: one fewer stop counts. Stop 1 is now short of
+    // the targets, and drawn dimmed once answered.
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyE);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
+    await tester.pump();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyW);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyW);
+    await tester.pump();
+    expect(log(), contains('dive from memory to stop 2 of $count'));
+    canvas().onSelect!(onFirst);
+    await tester.pump();
+    expect(log(), contains('Reached stop 1; the targets start at stop 2.'));
+    expect(route()!.stops.first.dimmed, isTrue);
+    expect(route()!.stops.skip(1).where((CanvasPathStop s) => s.dimmed),
+        isEmpty);
 
     // Save progress (Z) under the same key.
     await tester.sendKeyEvent(LogicalKeyboardKey.keyZ);

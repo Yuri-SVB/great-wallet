@@ -1328,6 +1328,14 @@ press.calibrate.target    tick_soft.wav
       _slotIndex >= 1 &&
       _paths[(_activeStage, _slotIndex)] != null;
 
+  /// The active map's route knobs can be turned: its path is found and shown,
+  /// or, in Train, where the knobs set the targets, found.
+  bool get _routeKnobsReady =>
+      (_showPath || _training) &&
+      _isBoardSlot &&
+      _slotIndex >= 1 &&
+      _paths[(_activeStage, _slotIndex)] != null;
+
   /// Step the active map's route: ρ and the exponent by index into the
   /// engine's choices, the visible stops by one, each within its range.
   void _stepRoute({int rho = 0, int exponent = 0, int visible = 0}) {
@@ -1570,8 +1578,9 @@ press.calibrate.target    tick_soft.wav
       case _Cmd.recall:
         return BoardCommand(
           name: 'Recall',
-          help: 'The next click on the map is your answer: zoom to the leaf '
-              'you remember and click it. Esc cancels.',
+          help: 'The next click on the map is your answer: dive from memory '
+              'to the leaf, or while stops count, to the shallowest target '
+              'or deeper, and click it. Esc cancels.',
           icon: Icons.ads_click,
           enabled: _trainReady &&
               _trainCard != null &&
@@ -1582,8 +1591,9 @@ press.calibrate.target    tick_soft.wav
       case _Cmd.showAnswer:
         return BoardCommand(
           name: 'Show the answer',
-          help: 'Shows this map’s point. Before you answer, it counts as '
-              'giving up: a graded map is graded Again.',
+          help: 'Shows this map’s point and its route, the targets bright. '
+              'Before you answer, it counts as giving up: a graded map is '
+              'graded Again.',
           icon: Icons.visibility,
           enabled: _trainReady &&
               _trainCard != null &&
@@ -1655,7 +1665,7 @@ press.calibrate.target    tick_soft.wav
               'wrapping around: zooming out, across and back in along the '
               'shortest way, the way the path’s hops are measured.',
           icon: next ? Icons.skip_next : Icons.skip_previous,
-          enabled: _routeReady,
+          enabled: _routeReady && !_answerHidden,
           run: () => _cycleStop(next ? 1 : -1),
         );
       case _Cmd.numbers:
@@ -1685,7 +1695,7 @@ press.calibrate.target    tick_soft.wav
           name: 'Frame the path',
           help: 'Flies to the view holding every stop shown.',
           icon: Icons.fit_screen,
-          enabled: _routeReady,
+          enabled: _routeReady && !_answerHidden,
           run: () {
             final (int, int) key = (_activeStage, _slotIndex);
             final _ShownPath? shown = _paths[key];
@@ -1709,7 +1719,7 @@ press.calibrate.target    tick_soft.wav
               ? 'Makes zooming cheaper than panning: a route with fewer stops.'
               : 'Makes panning cheaper than zooming: a route with more stops.',
           icon: zoom ? Icons.zoom_in : Icons.pan_tool,
-          enabled: _routeReady,
+          enabled: _routeKnobsReady,
           run: () => _stepRoute(rho: zoom ? 1 : -1),
         );
       case _Cmd.exponentDown:
@@ -1721,14 +1731,18 @@ press.calibrate.target    tick_soft.wav
               ? 'Penalises long hops more: shorter hops, more stops.'
               : 'Tolerates longer hops: fewer stops.',
           glyph: (Color colour) => HopGlyph(spread: !up, colour: colour),
-          enabled: _routeReady,
+          enabled: _routeKnobsReady,
           run: () => _stepRoute(exponent: up ? 1 : -1),
         );
       case _Cmd.path:
         return BoardCommand(
           name: 'Landmark path',
-          help: 'Shows or hides the landmark path of this map’s point: its '
-              'features outlined, joined by a line, numbered.',
+          help: _training
+              ? 'Shows or hides the route once answered, the stops that '
+                  'count as targets bright. While you recall it stays '
+                  'hidden: give up to see it.'
+              : 'Shows or hides the landmark path of this map’s point: its '
+                  'features outlined, joined by a line, numbered.',
           icon: Icons.route,
           active: _showPath,
           run: _toggleLandmarkPath,
@@ -1737,13 +1751,22 @@ press.calibrate.target    tick_soft.wav
       case _Cmd.stopsUp:
         final bool up = c == _Cmd.stopsUp;
         return BoardCommand(
-          name: up ? 'More stops shown' : 'Fewer stops shown',
-          help: up
-              ? 'Shows one more stop before the leaf.'
-              : 'Hides the shallowest stop shown. With none left the map is '
-                  'unaided, and its review is graded.',
+          name: _training
+              ? (up ? 'More stops count' : 'Fewer stops count')
+              : (up ? 'More stops shown' : 'Fewer stops shown'),
+          help: _training
+              ? (up
+                  ? 'Lets one more stop count as a target: a recall may stop '
+                      'one stop shallower.'
+                  : 'Makes the shallowest target the next stop down: more of '
+                      'the dive from memory. With the leaf alone the review '
+                      'is graded.')
+              : (up
+                  ? 'Shows one more stop before the leaf.'
+                  : 'Hides the shallowest stop shown. With none left the map '
+                      'is unaided, and its review is graded.'),
           icon: up ? Icons.layers : Icons.layers_clear,
-          enabled: _routeReady,
+          enabled: _routeKnobsReady,
           repeats: true,
           run: () => _stepRoute(visible: up ? 1 : -1),
         );
@@ -1847,6 +1870,12 @@ press.calibrate.target    tick_soft.wav
   /// Toggle the landmark path on the active map (Path board). The mode is
   /// announced; the path never is.
   void _toggleLandmarkPath() {
+    if (_answerHidden) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('The route stays hidden while you recall: give up '
+          '(${_hint(_Cmd.showAnswer)}) to see it.');
+      return;
+    }
     setState(() => _showPath = !_showPath);
     _sounds.play(_showPath ? UiSound.modeOn : UiSound.modeOff);
     final bool computing = _showPath &&
@@ -1976,20 +2005,9 @@ press.calibrate.target    tick_soft.wav
     final _Route next = reroute
         ? (rho: route.rho, exponent: route.exponent, visible: null)
         : route;
-    // Recalling, a route change shows or hides stops: the attempt is practice.
+    // Recalling, a route change changes the targets: the attempt is practice.
     if (_answerHidden) _attemptAided = true;
-    setState(() {
-      _routes[key] = next;
-      final _ShownPath? p = _paths[key];
-      if (!reroute && p != null) {
-        _paths[key] = (
-          path: p.path,
-          rho: p.rho,
-          exponent: p.exponent,
-          overlay: _canvasPathOf(p.path, next.visible),
-        );
-      }
-    });
+    setState(() => _routes[key] = next);
   }
 
   /// The landmark-path overlay of [slot]'s point on the active stage, or null
@@ -2006,34 +2024,44 @@ press.calibrate.target    tick_soft.wav
       unawaited(_computePath(key, slot));
     }
     final CanvasPath? overlay = shown?.overlay;
-    if (overlay == null) return null;
-    // The same stops (so their traced outlines are kept), drawn as set; in
-    // Train mode the leaf's stop is the answer, hidden until answered.
+    // In Train the route stays hidden while recalled.
+    if (overlay == null || !_showPath || _answerHidden) return null;
+    // The same stops (so their traced outlines are kept). Setup draws those
+    // shown; Train the whole route, the stops that are not targets dimmed.
+    final List<CanvasPathStop> stops = overlay.stops;
+    final int first = _firstTarget(stops.length, route.visible);
     return CanvasPath(
-      stops: _answerHidden && overlay.stops.isNotEmpty
-          ? overlay.stops.sublist(0, overlay.stops.length - 1)
-          : overlay.stops,
+      stops: _training
+          ? <CanvasPathStop>[
+              for (int i = 0; i < stops.length; i++)
+                CanvasPathStop(
+                  re: stops[i].re,
+                  im: stops[i].im,
+                  cells: stops[i].cells,
+                  dimmed: i < first,
+                ),
+            ]
+          : stops.sublist(first),
       showNumbers: _showNumbers,
       showLine: _showLines,
     );
   }
 
-  /// The stops of [path] drawn with [visible] stops before the leaf (null:
-  /// all), the shallowest hidden first.
-  static List<LandmarkFeature> _visibleOf(LandmarkPath path, int? visible) {
-    final int before = path.stops.length - 1;
-    final int shown = visible == null ? before : visible.clamp(0, before);
-    return path.stops.skip(before - shown).toList();
+  /// Index of the shallowest stop shown, or in Train the shallowest target,
+  /// of a route of [count] stops (the leaf last) with [visible] stops before
+  /// the leaf (null: all).
+  static int _firstTarget(int count, int? visible) {
+    final int before = count - 1;
+    return before - (visible ?? before).clamp(0, before);
   }
 
-  /// The stops of [path] to fly to or frame: those drawn, without the leaf's
-  /// while it is the hidden answer (Train mode).
-  List<LandmarkFeature> _stopsShown(LandmarkPath path, int? visible) {
-    final List<LandmarkFeature> stops = _visibleOf(path, visible);
-    return _answerHidden && stops.isNotEmpty
-        ? stops.sublist(0, stops.length - 1)
-        : stops;
-  }
+  /// The stops of [path] to fly to or frame: those drawn. In Setup, those
+  /// shown with [visible] stops before the leaf (null: all), the shallowest
+  /// hidden first; in Train, once answered, the whole route.
+  List<LandmarkFeature> _stopsShown(LandmarkPath path, int? visible) =>
+      _training
+          ? path.stops
+          : path.stops.sublist(_firstTarget(path.stops.length, visible));
 
   /// How much larger than the framed stops a frame is, and the fewest cells
   /// of a stop it spans: a stop fills about a third of the view.
@@ -2169,20 +2197,20 @@ press.calibrate.target    tick_soft.wav
               path: found,
               rho: route.rho,
               exponent: route.exponent,
-              overlay: _canvasPathOf(found, _routeOf(key).visible),
+              overlay: _canvasPathOf(found),
             );
     });
     if (found == null && _showPath) _toast('No landmark path for this point.');
   }
 
   /// A landmark path as an overlay: each stop at its barycentre, its feature
-  /// highlighted from its own cells. With [visible] set, only that many stops
-  /// before the leaf are drawn, the shallowest hidden first. The cells are
-  /// shared, so wiping the path blanks the overlay too.
-  CanvasPath _canvasPathOf(LandmarkPath path, int? visible) {
+  /// highlighted from its own cells; every stop, which of them are drawn is
+  /// [_pathOverlay]'s. The cells are shared, so wiping the path blanks the
+  /// overlay too.
+  CanvasPath _canvasPathOf(LandmarkPath path) {
     return CanvasPath(
       stops: <CanvasPathStop>[
-        for (final LandmarkFeature f in _visibleOf(path, visible))
+        for (final LandmarkFeature f in path.stops)
           CanvasPathStop(
             re: fixedToDouble(f.barycentreRe),
             im: fixedToDouble(f.barycentreIm),
@@ -2204,7 +2232,9 @@ press.calibrate.target    tick_soft.wav
   /// stops) and the stops visible before the leaf. Both route sliders give
   /// more stops to the right. Words only: the values are the engine's.
   Widget? _routePanel() {
-    if (!_showPath || !_isBoardSlot || _slotIndex < 1) return null;
+    if ((!_showPath && !_training) || !_isBoardSlot || _slotIndex < 1) {
+      return null;
+    }
     final (int, int) key = (_activeStage, _slotIndex);
     final _ShownPath? shown = _paths[key];
     if (shown == null) return null;
@@ -2258,7 +2288,8 @@ press.calibrate.target    tick_soft.wav
                     exponent: v,
                     visible: route.visible,
                   ))),
-          row('no stops', 'all shown', visible, before,
+          row(_training ? 'leaf only' : 'no stops',
+              _training ? 'all count' : 'all shown', visible, before,
               (int v) => _setRoute(key, (
                     rho: route.rho,
                     exponent: route.exponent,
@@ -2696,7 +2727,10 @@ press.calibrate.target    tick_soft.wav
           ),
       ],
       crosses: crosses,
-      path: _showPath && point != null ? _pathOverlay(slot) : null,
+      // In Train the route is found even while hidden: it sets the targets.
+      path: (_showPath || _training) && point != null
+          ? _pathOverlay(slot)
+          : null,
     );
   }
 
@@ -3000,11 +3034,41 @@ press.calibrate.target    tick_soft.wav
   String? _practiceReason(MemCard card) =>
       switch (_review.practiceReasonFor(card, aided: _attemptAided)) {
         null => null,
-        PracticeReason.stopsShown => 'stops are shown',
+        PracticeReason.stopsShown => 'stops count as targets',
         PracticeReason.routeChanged => 'the route changed during the attempt',
         PracticeReason.gradedThisSession => 'graded already this session',
         PracticeReason.notDue => 'not due until ${_dateText(card.due!)}',
       };
+
+  /// The shown map's route, for its targets: its stops (the leaf last) and
+  /// the index of the shallowest target; null while it is searched for, or
+  /// if the point has none.
+  ({List<LandmarkFeature> stops, int first})? get _trainRoute {
+    final (int, int) key = (_activeStage, _slotIndex);
+    final _ShownPath? shown = _paths[key];
+    final _Route route = _routeOf(key);
+    if (shown == null ||
+        shown.rho != route.rho ||
+        shown.exponent != route.exponent) {
+      return null;
+    }
+    final List<LandmarkFeature> stops = shown.path.stops;
+    return (stops: stops, first: _firstTarget(stops.length, route.visible));
+  }
+
+  /// Whether the raw point ([reRaw], [imRaw]) lies on one of [f]'s cells.
+  static bool _onFeature(LandmarkFeature f, int reRaw, int imRaw) {
+    final int cell = f.cellRaw;
+    if (cell <= 0) return false;
+    // From the corner of cell (0, 0): its centre less half a cell.
+    final int dx = reRaw - f.cellsOriginRe + cell ~/ 2;
+    final int dy = imRaw - f.cellsOriginIm + cell ~/ 2;
+    if (dx < 0 || dy < 0) return false;
+    final int col = dx ~/ cell;
+    final int row = dy ~/ cell;
+    if (col >= f.cellsWidth || row >= f.cellsHeight) return false;
+    return f.cells[row * f.cellsWidth + col] != 0;
+  }
 
   /// Arm the recall: the next click on the map is the answer.
   void _armRecall() {
@@ -3013,54 +3077,93 @@ press.calibrate.target    tick_soft.wav
     if (_step == _TrainStep.answered) _newAttempt();
     setState(() => _editPointMode = true);
     final String? practice = _practiceReason(card);
-    _toast('Recall: zoom to the leaf you remember and click it '
+    final ({List<LandmarkFeature> stops, int first})? r = _trainRoute;
+    final String what = r != null && r.first < r.stops.length - 1
+        ? 'dive from memory to stop ${r.first + 1} of ${r.stops.length} or '
+            'deeper and click it'
+        : 'zoom to the leaf you remember and click it';
+    _toast('Recall: $what '
         '(${practice == null ? 'graded' : 'practice: $practice'}). '
         'Esc cancels.');
   }
 
-  /// A click while recalling: the leaf there against the map's point.
+  /// A click while recalling: the leaf there against the map's point, and,
+  /// while stops count as targets, the stops of its route.
   void _attemptAt(FractalSelection sel) {
     final MemCard? card = _trainCard;
     final ({int o, int p, int q})? prm = _boardPrm(_slotIndex);
     final List<int>? truth = _boardChunks[_activeStage][_slotIndex];
     if (card == null || prm == null || truth == null) return;
-    final CoreDecodeResult d = widget.core.decodePoint(
-        reRaw: fixedFromDouble(sel.re),
-        imRaw: fixedFromDouble(sel.im),
-        o: prm.o,
-        p: prm.p,
-        q: prm.q);
-    if (!d.valid) {
-      _sounds.play(UiSound.denyMiss);
-      _toast('No encodable leaf there — zoom in and click closer.');
-      return; // still armed
-    }
-    bool hit = d.bits.length == truth.length;
-    for (int i = 0; hit && i < truth.length; i++) {
-      hit = d.bits[i] == truth[i];
+    final int reRaw = fixedFromDouble(sel.re);
+    final int imRaw = fixedFromDouble(sel.im);
+    final CoreDecodeResult d = widget.core
+        .decodePoint(reRaw: reRaw, imRaw: imRaw, o: prm.o, p: prm.p, q: prm.q);
+    bool leaf = d.valid && d.bits.length == truth.length;
+    for (int i = 0; leaf && i < truth.length; i++) {
+      leaf = d.bits[i] == truth[i];
     }
     Entropy.wipe(d.bits);
+    // The deepest stop of the route clicked, the leaf aside.
+    final (int, int) map = (_activeStage, _slotIndex);
+    final ({List<LandmarkFeature> stops, int first})? r = _trainRoute;
+    int? reached;
+    if (!leaf && r != null) {
+      for (int i = r.stops.length - 2; i >= 0 && reached == null; i--) {
+        if (_onFeature(r.stops[i], reRaw, imRaw)) reached = i;
+      }
+    }
+    if (!leaf && reached == null) {
+      // Stops count, but the route is still being found: it may be one.
+      if (r == null &&
+          _routeOf(map).visible != 0 &&
+          _pathsPending.contains(map)) {
+        _sounds.play(UiSound.denyBlocked);
+        _toast('The route is still being found — click again in a moment.');
+        return; // still armed
+      }
+      if (!d.valid) {
+        _sounds.play(UiSound.denyMiss);
+        _toast('No encodable leaf there — zoom in and click closer.');
+        return; // still armed
+      }
+    }
+    final bool stopHit = reached != null && reached >= r!.first;
+    final bool hit = leaf || stopHit;
     final String? practice = _practiceReason(card);
     setState(() {
       _editPointMode = false;
-      _step = hit && practice == null && !_attemptHint
+      _step = leaf && practice == null && !_attemptHint
           ? _TrainStep.found
           : _TrainStep.answered;
+      _showPath = true; // answered: the route is drawn
     });
+    // While stops count, the way down: hide one more.
+    final String fewer = r != null && r.first < r.stops.length - 1
+        ? ' ${_hint(_Cmd.stopsDown)} makes one fewer count.'
+        : '';
     if (!hit) {
       _sounds.play(UiSound.denyMiss);
+      final String short = reached == null
+          ? ''
+          : 'Reached stop ${reached + 1}; the targets start at stop '
+              '${r!.first + 1}. ';
       if (practice != null) {
-        _toast('Missed (practice: $practice). The answer is shown.');
+        _toast('${short}Missed (practice: $practice). The answer is shown.');
         return;
       }
       final MemCard next = _record(card, Grade.again);
-      _toast('Missed: graded Again, next review ${_dueText(next)}. The '
-          'answer is shown.');
+      _toast('${short}Missed: graded Again, next review ${_dueText(next)}. '
+          'The answer is shown.');
       return;
     }
     _sounds.play(UiSound.selectPoint);
+    if (stopHit) {
+      _toast('Found stop ${reached + 1} of ${r.stops.length} '
+          '(practice: $practice).$fewer');
+      return;
+    }
     if (practice != null) {
-      _toast('Found it (practice: $practice).');
+      _toast('Found it (practice: $practice).$fewer');
       return;
     }
     if (_attemptHint) {
@@ -3112,6 +3215,7 @@ press.calibrate.target    tick_soft.wav
     setState(() {
       _step = _TrainStep.answered;
       _editPointMode = false;
+      _showPath = true; // given up: the route is drawn
     });
     _sounds.play(UiSound.navZoom);
     if (!gaveUp) {
