@@ -156,12 +156,14 @@ void main() {
           HopGlyph(spread: false, colour: Colors.white),
           D20Glyph(colour: Colors.white),
           SweatGlyph(colour: Colors.white),
+          DeadGlyph(colour: Colors.white),
         ],
       ),
     ));
     expect(find.byType(HopGlyph), findsNWidgets(2));
     expect(find.byType(D20Glyph), findsOneWidget);
     expect(find.byType(SweatGlyph), findsOneWidget);
+    expect(find.byType(DeadGlyph), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

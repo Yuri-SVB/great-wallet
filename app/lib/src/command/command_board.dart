@@ -577,3 +577,53 @@ class _SweatPainter extends CustomPainter {
   @override
   bool shouldRepaint(_SweatPainter old) => old.colour != colour;
 }
+
+/// A face with crossed-out eyes and a straight mouth: the Again grade, not
+/// remembered. Drawn on the same grid, at the same size, as [SweatGlyph].
+class DeadGlyph extends StatelessWidget {
+  const DeadGlyph({super.key, required this.colour});
+
+  final Color colour;
+
+  @override
+  Widget build(BuildContext context) => CustomPaint(
+        size: const Size.square(_SweatPainter.size),
+        painter: _DeadPainter(colour: colour),
+      );
+}
+
+class _DeadPainter extends CustomPainter {
+  _DeadPainter({required this.colour});
+
+  final Color colour;
+
+  /// Half the width of an eye's cross, and the cross's stroke.
+  static const double _crossHalf = 1.6;
+  static const double _crossStroke = 1.5;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.scale(size.width / _SweatPainter._grid);
+    final Paint line = Paint()
+      ..color = colour
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = _SweatPainter._faceStroke
+      ..strokeCap = StrokeCap.round;
+    canvas.drawCircle(_SweatPainter._centre, _SweatPainter._radius, line);
+    line.strokeWidth = _crossStroke;
+    for (final Offset eye in <Offset>[
+      _SweatPainter._leftEye,
+      _SweatPainter._rightEye,
+    ]) {
+      canvas.drawLine(eye.translate(-_crossHalf, -_crossHalf),
+          eye.translate(_crossHalf, _crossHalf), line);
+      canvas.drawLine(eye.translate(-_crossHalf, _crossHalf),
+          eye.translate(_crossHalf, -_crossHalf), line);
+    }
+    canvas.drawLine(_SweatPainter._mouthFrom, _SweatPainter._mouthTo,
+        line..strokeWidth = _SweatPainter._mouthStroke);
+  }
+
+  @override
+  bool shouldRepaint(_DeadPainter old) => old.colour != colour;
+}
