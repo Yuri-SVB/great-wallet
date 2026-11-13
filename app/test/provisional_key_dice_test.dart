@@ -14,7 +14,7 @@ import 'package:great_wallet_app/src/setup/setup_screen.dart';
 /// The provisional key from Dragon Dice, on the real screen with the engine
 /// linked: a setup is opened and written, the key dialog's Roll dice (R)
 /// switches to a 256-bit key in the wizard, and the file opens under the
-/// key it gives.
+/// key it gives. Then Wipe everything (V) removes the file.
 void main() {
   GreatWallCore? core;
   String? openError;
@@ -173,6 +173,24 @@ void main() {
     expect(reopened!.sigma, sigmaHex);
 
     await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+
+    // Wipe everything (V): one button, seven presses; six leave all as is.
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyV);
+    await tester.pumpAndSettle();
+    expect(find.text('Wipe — press 7 times'), findsOneWidget);
+    for (int i = 0; i < 6; i++) {
+      await tester.tap(find.byType(FilledButton));
+      await tester.pump();
+    }
+    expect(find.text('Wipe — 1 more'), findsOneWidget);
+    expect(File(path).existsSync(), isTrue);
+    await tester.tap(find.byType(FilledButton));
+    await tester.pump();
+    await settle();
+    expect(File(path).existsSync(), isFalse);
+    expect(log(), contains('Wiped: the setup file was overwritten and deleted'));
+
     await tester.pumpWidget(const SizedBox());
     await settle();
   }, timeout: const Timeout(Duration(minutes: 10)));

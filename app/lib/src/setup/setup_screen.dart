@@ -44,6 +44,7 @@ import '../ffi/core_bindings.dart';
 import '../ffi/fixed.dart';
 import 'cover_writes.dart';
 import 'desktop_qr_scanner.dart';
+import 'file_wipe.dart';
 import 'orbit_vault.dart';
 import 'setup_crypto.dart';
 
@@ -1469,6 +1470,15 @@ press.calibrate.target    tick_soft.wav
           enabled: !_busy,
           run: _confirmReset,
         );
+      case _Cmd.wipe:
+        return BoardCommand(
+          name: 'Wipe everything',
+          help: 'Overwrites and deletes the setup file, and clears the setup on '
+              'screen, halting any advance. Asks $_kWipePresses presses of '
+              'one button: deliberate, never a slip. Cannot be undone.',
+          icon: Icons.delete_forever,
+          run: () => unawaited(_wipeWizard()),
+        );
       case _Cmd.label:
         return BoardCommand(
           name: 'Key label',
@@ -2511,6 +2521,8 @@ press.calibrate.target    tick_soft.wav
       }
     }
     if (!mounted) return;
+    // Halted by a wipe: nothing is kept, and the wipe says so.
+    if (cancelled && _wiping) return;
     if (cancelled) {
       // The checkpoint survives the halt — that is the whole point of it.
       final int done = _advanceCheckpoint?.pass ?? 0;
@@ -2617,6 +2629,7 @@ press.calibrate.target    tick_soft.wav
       }
     }
     if (!mounted) return;
+    if (cancelled && _wiping) return;
     if (cancelled) {
       final int done = _advanceCheckpoint?.pass ?? 0;
       _sounds.play(UiSound.navStage);
@@ -5729,6 +5742,105 @@ press.calibrate.target    tick_soft.wav
 
   /// Reset behind an inline console confirmation, so the Reset key (or a stray
   /// keypress) cannot discard a setup by accident.
+  /// A wipe is under way: an advance it halts reports nothing.
+  bool _wiping = false;
+
+  /// Presses the wipe takes: a deliberate act, never a slip.
+  static const int _kWipePresses = 7;
+
+  /// Width of the wipe wizard.
+  static const double _kWipeDialogWidth = 420;
+
+  /// The wipe wizard (Main board V): one button, pressed [_kWipePresses]
+  /// times, a counter showing the presses left; Esc or Cancel leaves nothing
+  /// done. Then [_wipe].
+  Future<void> _wipeWizard() async {
+    final String path = _vaultPath.text.trim();
+    int left = _kWipePresses;
+    await _dialog(
+      _Cue.wipe,
+      () => showDialog<void>(
+        context: context,
+        builder: (BuildContext ctx) => StatefulBuilder(
+          builder: (BuildContext ctx, void Function(void Function()) setLocal) {
+            final ColorScheme scheme = Theme.of(ctx).colorScheme;
+            return CallbackShortcuts(
+              bindings: <ShortcutActivator, VoidCallback>{
+                const SingleActivator(LogicalKeyboardKey.escape): () =>
+                    Navigator.of(ctx).pop(),
+              },
+              child: AlertDialog(
+                title: const Text('Wipe everything'),
+                content: SizedBox(
+                  width: _kWipeDialogWidth,
+                  child: Text(
+                    '${path.isEmpty ? 'No setup file is set: only the setup on '
+                        'screen is cleared' : 'The setup file $path is '
+                        'overwritten and deleted, and the setup on screen '
+                        'cleared'}${_busy ? ', the running advance halted' : ''}. '
+                    'This cannot be undone. On flash storage the overwrite is '
+                    'best effort: the old bytes are ciphertext, useless once '
+                    'the key is gone too.',
+                  ),
+                ),
+                actions: <Widget>[
+                  TextButton(
+                    onPressed: _press(
+                        _Cue.wipeCancel, () => Navigator.of(ctx).pop()),
+                    child: const Text('Cancel'),
+                  ),
+                  FilledButton(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: scheme.error,
+                      foregroundColor: scheme.onError,
+                    ),
+                    onPressed: _press(_Cue.wipePress, () {
+                      setLocal(() => left--);
+                      if (left == 0) Navigator.of(ctx).pop();
+                    }),
+                    child: Text(left == _kWipePresses
+                        ? 'Wipe — press $left times'
+                        : 'Wipe — $left more'),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    );
+    if (left > 0 || !mounted) return;
+    await _wipe(path);
+  }
+
+  /// Wipe the setup file at [path] (if any) and clear the setup on screen,
+  /// halting a running advance first so nothing it derives outlives the wipe.
+  Future<void> _wipe(String path) async {
+    _wiping = true;
+    final OrbitAdvanceJob? job = _advanceJob;
+    if (job != null) {
+      job.cancel();
+      try {
+        await job.result;
+      } on Object {
+        // Halted, as asked.
+      }
+    }
+    _harvestSession?.cancel();
+    final String? failed =
+        path.isEmpty ? null : await _fileLocked(() => wipeFile(path));
+    if (!mounted) return;
+    _vaultPath.clear();
+    _reset();
+    _wiping = false;
+    _sounds.play(UiSound.warn);
+    _toast(failed ??
+        (path.isEmpty
+            ? 'Wiped: the setup on screen is cleared.'
+            : 'Wiped: the setup file was overwritten and deleted, and the '
+                'setup on screen cleared.'));
+  }
+
   Future<void> _confirmReset() async {
     final bool ok = await _consoleConfirm(
       message: 'Reset and discard the current setup? σ, every placed point and '
@@ -5818,6 +5930,7 @@ enum _Cmd {
   volumeUp(CommandContext.main, 5),
   secrets(CommandContext.main, 6),
   layout(CommandContext.main, 7),
+  wipe(CommandContext.main, 11),
   label(CommandContext.setup, 0),
   profile(CommandContext.setup, 1),
   steps(CommandContext.setup, 2),
@@ -5900,6 +6013,7 @@ abstract final class _Cue {
   static const String dice = 'dice';
   static const String key = 'key';
   static const String harvestDate = 'harvest.date';
+  static const String wipe = 'wipe';
   static const List<String> dialogs = <String>[
     calibrate,
     calibrateLeave,
@@ -5908,6 +6022,7 @@ abstract final class _Cue {
     key,
     dice,
     harvestDate,
+    wipe,
   ];
 
   // Buttons outside the board, under `press.`.
@@ -5931,6 +6046,8 @@ abstract final class _Cue {
   static const String keyOwn = 'key.own';
   static const String keyDice = 'key.dice';
   static const String keyClose = 'key.close';
+  static const String wipePress = 'wipe.press';
+  static const String wipeCancel = 'wipe.cancel';
   static const String calibrateClose = 'calibrate.close';
   static const String calibrateBench = 'calibrate.bench';
   static const String calibrateScope = 'calibrate.scope';
@@ -5963,6 +6080,8 @@ abstract final class _Cue {
     keyOwn,
     keyDice,
     keyClose,
+    wipePress,
+    wipeCancel,
     calibrateClose,
     calibrateBench,
     calibrateScope,
