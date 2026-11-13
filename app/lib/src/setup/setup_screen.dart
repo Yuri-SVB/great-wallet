@@ -1626,10 +1626,13 @@ press.calibrate.target    tick_soft.wav
           },
           icon: switch (g) {
             Grade.again => Icons.replay,
-            Grade.hard => Icons.sentiment_neutral,
+            Grade.hard => null,
             Grade.good => Icons.sentiment_satisfied,
             Grade.easy => Icons.sentiment_very_satisfied,
           },
+          glyph: g == Grade.hard
+              ? (Color colour) => SweatGlyph(colour: colour)
+              : null,
           enabled: _step == _TrainStep.found,
           run: () => _grade(g),
         );

@@ -491,3 +491,89 @@ class _D20Painter extends CustomPainter {
   @override
   bool shouldRepaint(_D20Painter old) => old.colour != colour;
 }
+
+/// A face with a straight mouth and a sweat drop at its upper right: the Hard
+/// grade, found with effort. Drawn on the 24-unit grid of the stock face
+/// icons, at their board size, so it sits beside them.
+class SweatGlyph extends StatelessWidget {
+  const SweatGlyph({super.key, required this.colour});
+
+  final Color colour;
+
+  @override
+  Widget build(BuildContext context) => CustomPaint(
+        size: const Size.square(_SweatPainter.size),
+        painter: _SweatPainter(colour: colour),
+      );
+}
+
+class _SweatPainter extends CustomPainter {
+  _SweatPainter({required this.colour});
+
+  final Color colour;
+
+  /// Side of the glyph's square in logical pixels: the board's icon size.
+  static const double size = 22;
+
+  /// The stock icons' grid, in units.
+  static const double _grid = 24;
+
+  /// The face: centre, radius and stroke; its outline is open over
+  /// [_gap] radians at the upper right, ending at [_gapEnd], where the drop
+  /// sits.
+  static const Offset _centre = Offset(12, 12);
+  static const double _radius = 9.5;
+  static const double _faceStroke = 1.8;
+  static const double _gap = 0.68;
+  static const double _gapEnd = -0.55;
+
+  /// The eyes: centres and radius.
+  static const Offset _leftEye = Offset(8.5, 9.8);
+  static const Offset _rightEye = Offset(15.2, 9.8);
+  static const double _eyeRadius = 1.2;
+
+  /// The mouth: a straight line.
+  static const Offset _mouthFrom = Offset(8.4, 15.6);
+  static const Offset _mouthTo = Offset(15.6, 15.6);
+  static const double _mouthStroke = 1.6;
+
+  /// The drop, point up: its axis, tip, shoulders' control height and the
+  /// half-widths of its control points and of its round bottom.
+  static const double _dropX = 20.2;
+  static const double _dropTip = 2.2;
+  static const double _dropShoulder = 6.6;
+  static const double _dropBottom = 8.0;
+  static const double _dropControl = 3.2;
+  static const double _dropRadius = 2.8;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.scale(size.width / _grid);
+    final Paint line = Paint()
+      ..color = colour
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = _faceStroke
+      ..strokeCap = StrokeCap.round;
+    final Paint fill = Paint()..color = colour;
+    canvas.drawArc(Rect.fromCircle(center: _centre, radius: _radius), _gapEnd,
+        2 * math.pi - _gap, false, line);
+    canvas.drawCircle(_leftEye, _eyeRadius, fill);
+    canvas.drawCircle(_rightEye, _eyeRadius, fill);
+    canvas.drawLine(_mouthFrom, _mouthTo, line..strokeWidth = _mouthStroke);
+    canvas.drawPath(
+      Path()
+        ..moveTo(_dropX, _dropTip)
+        ..quadraticBezierTo(_dropX + _dropControl, _dropShoulder,
+            _dropX + _dropRadius, _dropBottom)
+        ..arcToPoint(const Offset(_dropX - _dropRadius, _dropBottom),
+            radius: const Radius.circular(_dropRadius))
+        ..quadraticBezierTo(
+            _dropX - _dropControl, _dropShoulder, _dropX, _dropTip)
+        ..close(),
+      fill,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_SweatPainter old) => old.colour != colour;
+}
