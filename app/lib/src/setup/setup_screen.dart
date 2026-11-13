@@ -42,6 +42,7 @@ import '../core/orbit_protocol.dart';
 import '../core/stage_params.dart';
 import '../ffi/core_bindings.dart';
 import '../ffi/fixed.dart';
+import 'card_stats.dart';
 import 'cover_writes.dart';
 import 'desktop_qr_scanner.dart';
 import 'file_wipe.dart';
@@ -1469,6 +1470,17 @@ press.calibrate.target    tick_soft.wav
           icon: Icons.note_add,
           enabled: !_busy,
           run: _confirmReset,
+        );
+      case _Cmd.stats:
+        return BoardCommand(
+          name: 'Card stats',
+          help: 'Train: every card of the deck and, for the one picked, its '
+              'schedule and the chance of recalling it over time '
+              '(${percentText(kRetentionAtDue)} when due). ↑ ↓ pick a '
+              'card; Esc closes.',
+          icon: Icons.query_stats,
+          enabled: _trainReady,
+          run: () => unawaited(_showCardStats()),
         );
       case _Cmd.wipe:
         return BoardCommand(
@@ -3072,7 +3084,7 @@ press.calibrate.target    tick_soft.wav
         PracticeReason.stopsShown => 'stops count as targets',
         PracticeReason.routeChanged => 'the route changed during the attempt',
         PracticeReason.gradedThisSession => 'graded already this session',
-        PracticeReason.notDue => 'not due until ${_dateText(card.due!)}',
+        PracticeReason.notDue => 'not due until ${dateText(card.due!)}',
       };
 
   /// The shown map's route, for its targets: its stops (the leaf last) and
@@ -3228,7 +3240,7 @@ press.calibrate.target    tick_soft.wav
   /// When [card] is due, in words.
   String _dueText(MemCard card) {
     final DateTime? due = card.due;
-    return due == null ? 'now' : 'on ${_dateText(due)}';
+    return due == null ? 'now' : 'on ${dateText(due)}';
   }
 
   /// Grade [card] with [g] in the deck; the graded card.
@@ -5743,6 +5755,47 @@ press.calibrate.target    tick_soft.wav
 
   /// Reset behind an inline console confirmation, so the Reset key (or a stray
   /// keypress) cannot discard a setup by accident.
+  /// Size of the card stats wizard.
+  static const double _kStatsWidth = 760;
+  static const double _kStatsHeight = 480;
+  static const double _kStatsPad = 16;
+
+  /// The card stats wizard (Train, Main board Z), the shown map's card
+  /// picked first.
+  Future<void> _showCardStats() async {
+    final List<MemCard> cards = _trainCards;
+    final MemCard? shown = _trainCard;
+    final int initial =
+        shown == null ? 0 : cards.indexWhere((MemCard c) => c.id == shown.id);
+    await _dialog(
+      _Cue.stats,
+      () => showDialog<void>(
+        context: context,
+        builder: (BuildContext ctx) => CallbackShortcuts(
+          bindings: <ShortcutActivator, VoidCallback>{
+            const SingleActivator(LogicalKeyboardKey.escape): () =>
+                Navigator.of(ctx).pop(),
+          },
+          child: Dialog(
+            child: SizedBox(
+              width: _kStatsWidth,
+              height: _kStatsHeight,
+              child: Padding(
+                padding: const EdgeInsets.all(_kStatsPad),
+                child: CardStatsView(
+                  cards: cards,
+                  schedule: _schedule,
+                  now: _schedule.clock.now(),
+                  initial: initial < 0 ? 0 : initial,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   /// A wipe is under way: an advance it halts reports nothing.
   bool _wiping = false;
 
@@ -5931,6 +5984,7 @@ enum _Cmd {
   volumeUp(CommandContext.main, 5),
   secrets(CommandContext.main, 6),
   layout(CommandContext.main, 7),
+  stats(CommandContext.main, 8),
   wipe(CommandContext.main, 11),
   label(CommandContext.setup, 0),
   profile(CommandContext.setup, 1),
@@ -6015,6 +6069,7 @@ abstract final class _Cue {
   static const String key = 'key';
   static const String harvestDate = 'harvest.date';
   static const String wipe = 'wipe';
+  static const String stats = 'stats';
   static const List<String> dialogs = <String>[
     calibrate,
     calibrateLeave,
@@ -6024,6 +6079,7 @@ abstract final class _Cue {
     dice,
     harvestDate,
     wipe,
+    stats,
   ];
 
   // Buttons outside the board, under `press.`.
@@ -6245,13 +6301,6 @@ class _SystemClock implements Clock {
 
   @override
   DateTime now() => DateTime.now();
-}
-
-/// [t] as a local date, YYYY-MM-DD.
-String _dateText(DateTime t) {
-  final DateTime l = t.toLocal();
-  String two(int v) => v.toString().padLeft(2, '0');
-  return '${l.year}-${two(l.month)}-${two(l.day)}';
 }
 
 /// Where an attempt at a map stands in Train mode: recalling (its point
