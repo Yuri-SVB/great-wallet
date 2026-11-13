@@ -105,6 +105,32 @@ void main() {
     });
   });
 
+  group('graduation settings', () {
+    test('the pass time, the gap and ε round-trip; absent, they stay null',
+        () {
+      final OrbitVault v = sample()
+        ..passSeconds = 1.5
+        ..gapSeconds = 86400
+        ..epsilon = 0.0001;
+      final OrbitVault back = OrbitVault.fromJson(v.toJson());
+      expect(back.passSeconds, 1.5);
+      expect(back.gapSeconds, 86400);
+      expect(back.epsilon, 0.0001);
+      final OrbitVault plain = OrbitVault.fromJson(sample().toJson());
+      expect(plain.passSeconds, isNull);
+      expect(plain.gapSeconds, isNull);
+      expect(plain.epsilon, isNull);
+    });
+
+    test('a non-positive or non-numeric setting is refused', () {
+      for (final Object bad in <Object>[0, -1, 'x']) {
+        final Map<String, dynamic> json = sample().toJson()..['epsilon'] = bad;
+        expect(() => OrbitVault.fromJson(json), throwsFormatException,
+            reason: 'epsilon = $bad');
+      }
+    });
+  });
+
   group('halted-advance resume section', () {
     OrbitVault halted() => OrbitVault(
           sigma: 'DEADBEEF',

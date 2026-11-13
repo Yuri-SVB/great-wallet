@@ -37,6 +37,9 @@ class OrbitVault {
     required this.stages,
     this.resume,
     this.deck,
+    this.passSeconds,
+    this.gapSeconds,
+    this.epsilon,
   });
 
   /// On-disk format version written by this build.
@@ -92,6 +95,18 @@ class OrbitVault {
   /// which maps are memorised and how well, so it rides inside the encryption.
   Deck? deck;
 
+  /// The time one memory-hard pass takes on this device at [profile], in
+  /// seconds: measured by the calibration and by real passes. Null until one
+  /// was measured. With [iterations] it estimates the derivation (hard reset)
+  /// time.
+  double? passSeconds;
+
+  /// The graduation gate's target gap `T`, in seconds, and its threshold `ε`;
+  /// null for the defaults (the derivation time, and
+  /// [GraduationParams.defaultEpsilon]).
+  int? gapSeconds;
+  double? epsilon;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
         'v': formatVersion,
         kindKey: kind,
@@ -103,6 +118,9 @@ class OrbitVault {
         ],
         if (resume != null) 'resume': resume!.toJson(),
         if (deck != null) 'deck': deck!.toJson(),
+        if (passSeconds != null) 'passSeconds': passSeconds,
+        if (gapSeconds != null) 'gapSeconds': gapSeconds,
+        if (epsilon != null) 'epsilon': epsilon,
       };
 
   /// Rebuild a vault from decoded JSON. Throws a generic [FormatException] on any
@@ -145,7 +163,18 @@ class OrbitVault {
               ? rawResume
               : throw const FormatException('bad vault')),
       deck: rawDeck == null ? null : _deck(rawDeck),
+      passSeconds: _optionalPositive(json, 'passSeconds'),
+      gapSeconds: _optionalPositive(json, 'gapSeconds')?.round(),
+      epsilon: _optionalPositive(json, 'epsilon'),
     );
+  }
+
+  /// An optional positive number, or a [FormatException] that echoes no value.
+  static double? _optionalPositive(Map<String, dynamic> json, String key) {
+    final Object? v = json[key];
+    if (v == null) return null;
+    if (v is! num || v <= 0) throw const FormatException('bad vault');
+    return v.toDouble();
   }
 
   /// Zero every stage's secret integers (the `o_i` bytes and placed point

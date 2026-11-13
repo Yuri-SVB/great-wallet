@@ -21,6 +21,24 @@ String dateText(DateTime t) {
 String percentText(double r) => '${(r * _kPercent).round()}%';
 const double _kPercent = 100;
 
+/// A chance, small ones with two significant digits (`0.0032%`).
+String chanceText(double r) => r == 0 || r >= _kWholePercentFrom
+    ? percentText(r)
+    : '${(r * _kPercent).toStringAsPrecision(_kSmallDigits)}%';
+const double _kWholePercentFrom = 0.01;
+const int _kSmallDigits = 2;
+
+/// A duration in days and hours, hours and minutes, or minutes.
+String durationText(Duration d) {
+  if (d.inDays >= 1) {
+    return '${d.inDays} d ${d.inHours % Duration.hoursPerDay} h';
+  }
+  if (d.inHours >= 1) {
+    return '${d.inHours} h ${d.inMinutes % Duration.minutesPerHour} min';
+  }
+  return '${d.inMinutes} min';
+}
+
 /// A card's name in the wizard.
 String cardName(MemCard c) => c.kind == CardKind.point
     ? 'Stage ${c.stageIndex}, map ${c.slot}'

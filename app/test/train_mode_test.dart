@@ -156,6 +156,24 @@ void main() {
     expect(find.byIcon(Icons.school), findsOneWidget);
     // Every map of the stage is a card: the 2 placed and the 7 derived.
     expect(log(), contains('Stage 0: needs 2 maps; 9 in the deck'));
+    // Nothing graded yet: the gate is not met.
+    expect(log(), contains('chance of recalling fewer than 2 of its 9 maps'));
+    expect(log(), contains('Graduation: not yet'));
+
+    // Graduation (Train board X): the stage at the gate, T and ε to set.
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyW);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyX);
+    await tester.pumpAndSettle();
+    expect(find.text('Graduation'), findsOneWidget);
+    expect(find.textContaining('Stage 0: after '), findsOneWidget);
+    expect(find.widgetWithText(TextField, 'T (days)'), findsOneWidget);
+    expect(find.widgetWithText(TextField, 'ε (%)'), findsOneWidget);
+    expect(find.text('Wipe the setup file…'), findsNothing);
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
 
     FractalCanvas canvas() =>
         tester.widget<FractalCanvas>(find.byType(FractalCanvas));

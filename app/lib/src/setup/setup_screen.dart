@@ -15,12 +15,15 @@ import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
         Deck,
         DeckProgress,
         Grade,
+        GraduationParams,
         MemCard,
         MemSchedule,
         PracticeReason,
         ReviewSession,
+        StageGate,
         StageProgress,
         buildDeck,
+        graduationGates,
         honestGrade;
 import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:flutter/services.dart';
@@ -258,6 +261,51 @@ class _SetupScreenState extends State<SetupScreen>
 
   /// Where the attempt at the shown map stands.
   _TrainStep _step = _TrainStep.recall;
+
+  /// The time one memory-hard pass takes at [_profile], in seconds: from the
+  /// calibration, refined by real passes; null until one was timed.
+  double? _passSeconds;
+
+  /// The graduation gate's target gap, in seconds (null: the derivation
+  /// time), and its threshold `ε`. Saved with the setup.
+  int? _gapSeconds;
+  double _epsilon = GraduationParams.defaultEpsilon;
+
+  /// The gap until a derivation time is known.
+  static const Duration _kGapFallback = Duration(days: 7);
+
+  /// The derivation (hard reset) time: every deep stage's `D` passes, at the
+  /// time a pass was last measured; null until one was, or with no deep stage.
+  Duration? get _derivationTime {
+    final double? s = _passSeconds;
+    final int deep = _orbitDeepestStage;
+    if (s == null || deep == 0) return null;
+    return Duration(
+        microseconds:
+            (s * _iterations * deep * Duration.microsecondsPerSecond).round());
+  }
+
+  /// The gate's target gap `T`: the one set, else the derivation time, else
+  /// [_kGapFallback].
+  Duration get _gap => _gapSeconds != null
+      ? Duration(seconds: _gapSeconds!)
+      : _derivationTime ?? _kGapFallback;
+
+  /// Every stage of the open setup at the graduation gate, [gap] from now,
+  /// against [epsilon].
+  List<StageGate> _gatesWith(Duration gap, double epsilon) => graduationGates(
+        Deck(_trainCards),
+        <int>[for (int i = 0; i <= _orbitDeepestStage; i++) _requiredOf(i)],
+        _schedule.clock.now().add(gap),
+        _schedule,
+        params: GraduationParams(epsilon: epsilon),
+      );
+
+  /// A stage at the gate, in words.
+  static String _gateText(StageGate g, Duration gap) =>
+      'after ${durationText(gap)}, ${chanceText(g.failure)} chance of '
+      'recalling fewer than ${g.required} of its ${g.maps} maps — '
+      '${g.passes ? 'passes' : 'not yet'}';
 
   /// Stops were shown or the route changed during this attempt: practice.
   bool _attemptAided = false;
@@ -1482,6 +1530,19 @@ press.calibrate.target    tick_soft.wav
           enabled: _trainReady,
           run: () => unawaited(_showCardStats()),
         );
+      case _Cmd.graduation:
+        return BoardCommand(
+          name: 'Graduation',
+          help: 'Every stage at the graduation gate: the chance of recalling '
+              'fewer than its required maps after the gap T. Sets T (the '
+              'derivation time by default) and ε '
+              '(${chanceText(GraduationParams.defaultEpsilon)} by default). '
+              'When every stage passes: the green light to shred the '
+              'provisional key.',
+          icon: Icons.school_outlined,
+          enabled: _trainReady,
+          run: () => unawaited(_showGraduation()),
+        );
       case _Cmd.wipe:
         return BoardCommand(
           name: 'Wipe everything',
@@ -2495,6 +2556,7 @@ press.calibrate.target    tick_soft.wav
       // stage bar and Halt can stop it. `oFrom` is NOT wiped here — for stage 0
       // it is a fresh derivation from σ, but for a deep stage it *is*
       // `_orbitO[from]`, which the setup still needs.
+      final Stopwatch timer = Stopwatch()..start();
       final OrbitAdvanceJob job = await widget.core.startOrbitAdvance(
         oFrom,
         shBytes,
@@ -2502,6 +2564,7 @@ press.calibrate.target    tick_soft.wav
         profile: _profile,
         onProgress: (int done, int total) {
           if (!mounted) return;
+          _timePasses(timer, done);
           setState(() {
             _advanceDone = done;
             _advanceTotal = total;
@@ -2573,6 +2636,14 @@ press.calibrate.target    tick_soft.wav
     _toast('Advanced to stage $target — place its points.');
   }
 
+  /// Refine [_passSeconds] from a running advance: [passes] done in [timer]'s
+  /// time.
+  void _timePasses(Stopwatch timer, int passes) {
+    if (passes <= 0) return;
+    _passSeconds =
+        timer.elapsedMicroseconds / Duration.microsecondsPerSecond / passes;
+  }
+
   /// Continue a halted advance from its preserved checkpoint, running only the
   /// passes that remain. The orbit peer of [_resumeDerivation].
   ///
@@ -2605,6 +2676,7 @@ press.calibrate.target    tick_soft.wav
     ({Uint8List k, Uint8List next})? adv;
     bool cancelled = false;
     try {
+      final Stopwatch timer = Stopwatch()..start();
       final OrbitAdvanceJob job = await widget.core.resumeOrbitAdvance(
         k,
         cp.digest,
@@ -2613,6 +2685,7 @@ press.calibrate.target    tick_soft.wav
         profile: _profile,
         onProgress: (int done, int total) {
           if (!mounted) return;
+          _timePasses(timer, done - cp.pass);
           setState(() {
             _advanceDone = done;
             _advanceTotal = total;
@@ -3320,6 +3393,7 @@ press.calibrate.target    tick_soft.wav
         <int>[for (int i = 0; i <= deepest; i++) _requiredOf(i)], _schedule);
     final DateTime now = _schedule.clock.now();
     final List<MemCard> cards = _trainCards;
+    final List<StageGate> gates = _gatesWith(_gap, _epsilon);
     for (int i = 0; i <= deepest; i++) {
       final StageProgress p = progress.stages[i];
       final List<int> due = <int>[
@@ -3327,11 +3401,198 @@ press.calibrate.target    tick_soft.wav
           if (c.stageIndex == i && c.isDue(now)) c.slot,
       ]..sort();
       _toast('Stage $i: needs ${p.required} maps; ${p.maps} in the deck, '
-          '${p.unaided} without stops, ${p.consolidated} consolidated'
+          '${p.unaided} without stops; ${_gateText(gates[i], _gap)}'
           '${due.isEmpty ? '' : '; due: map${due.length == 1 ? '' : 's'} '
               '${due.join(', ')}'}.');
     }
+    _toast(gates.every((StageGate g) => g.passes)
+        ? 'Green light: every stage passes the graduation gate — you may '
+            'shred the provisional key (${_hint(_Cmd.wipe)} wipes the setup '
+            'file).'
+        : 'Graduation: not yet (ε ${chanceText(_epsilon)}; '
+            '${_hint(_Cmd.graduation)} sets it and the gap).');
   }
+
+  /// Width of the graduation dialog, and of its number fields.
+  static const double _kGraduationWidth = 520;
+  static const double _kGraduationFieldWidth = 160;
+
+  /// The graduation dialog (Train board X): every stage at the gate, the
+  /// target gap `T` and the threshold `ε` to set — a gap below the derivation
+  /// time asked first — and, when every stage passes, the green light with a
+  /// way to the wipe.
+  Future<void> _showGraduation() async {
+    final Duration? derivation = _derivationTime;
+    final TextEditingController gapInput = TextEditingController(
+        text: _gapSeconds == null
+            ? ''
+            : (_gapSeconds! / Duration.secondsPerDay).toString());
+    final TextEditingController epsInput = TextEditingController(
+        text: (_epsilon * _kPercentScale).toString());
+    bool wipe = false;
+    final DialogRoute<void> route = DialogRoute<void>(
+        context: context,
+        builder: (BuildContext ctx) => StatefulBuilder(
+          builder: (BuildContext ctx, void Function(void Function()) setLocal) {
+            final double? days = double.tryParse(gapInput.text.trim());
+            final double? pct = double.tryParse(epsInput.text.trim());
+            final Duration gap = days != null && days > 0
+                ? Duration(seconds: (days * Duration.secondsPerDay).round())
+                : derivation ?? _kGapFallback;
+            final double eps =
+                pct != null && pct > 0 ? pct / _kPercentScale : _epsilon;
+            final List<StageGate> gates = _gatesWith(gap, eps);
+            final bool green = gates.every((StageGate g) => g.passes);
+
+            Future<void> apply() async {
+              if (days != null && days > 0 && derivation != null &&
+                  gap < derivation) {
+                final bool go = await showDialog<bool>(
+                      context: ctx,
+                      builder: (BuildContext c) => AlertDialog(
+                        title: const Text('Shorter than a derivation'),
+                        content: Text(
+                          'A gap of ${durationText(gap)} is shorter than a '
+                          'derivation (${durationText(derivation)}). If '
+                          're-deriving is the only way to review, reviewing '
+                          'that often takes two or more setups cycling at '
+                          'the same time. Set it anyway?',
+                        ),
+                        actions: <Widget>[
+                          TextButton(
+                            onPressed: () => Navigator.of(c).pop(false),
+                            child: const Text('Cancel'),
+                          ),
+                          FilledButton(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: Theme.of(c).colorScheme.error,
+                              foregroundColor: Theme.of(c).colorScheme.onError,
+                            ),
+                            onPressed: () => Navigator.of(c).pop(true),
+                            child: const Text('Set it'),
+                          ),
+                        ],
+                      ),
+                    ) ??
+                    false;
+                if (!go) return;
+              }
+              setState(() {
+                _gapSeconds = days != null && days > 0 ? gap.inSeconds : null;
+                _epsilon = eps;
+                _deckDirty = true;
+              });
+              if (ctx.mounted) Navigator.of(ctx).pop();
+              _logProgress();
+            }
+
+            Widget field(TextEditingController c, String label, String hint) =>
+                SizedBox(
+                  width: _kGraduationFieldWidth,
+                  child: TextField(
+                    controller: c,
+                    keyboardType:
+                        const TextInputType.numberWithOptions(decimal: true),
+                    onChanged: (_) => setLocal(() {}),
+                    decoration: InputDecoration(
+                      isDense: true,
+                      border: const OutlineInputBorder(),
+                      labelText: label,
+                      hintText: hint,
+                    ),
+                  ),
+                );
+
+            return CallbackShortcuts(
+              bindings: <ShortcutActivator, VoidCallback>{
+                const SingleActivator(LogicalKeyboardKey.escape): () =>
+                    Navigator.of(ctx).pop(),
+              },
+              child: AlertDialog(
+                title: const Text('Graduation'),
+                content: SizedBox(
+                  width: _kGraduationWidth,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: <Widget>[
+                      Text(
+                        'A stage graduates when the chance of recalling fewer '
+                        'than its required maps, after the gap T, is at most '
+                        'ε. Any of its maps count, so a few recalled very '
+                        'well pass as well as more recalled less well. '
+                        'Derivation (hard reset): '
+                        '${derivation == null ? 'unknown — calibrate on the '
+                            'Setup board' : durationText(derivation)}.',
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        children: <Widget>[
+                          field(gapInput, 'T (days)',
+                              'derivation time'),
+                          const SizedBox(width: 12),
+                          field(epsInput, 'ε (%)',
+                              chanceText(GraduationParams.defaultEpsilon)),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      for (final StageGate g in gates)
+                        Text('Stage ${g.stage}: ${_gateText(g, gap)}.'),
+                      const SizedBox(height: 12),
+                      Text(
+                        green
+                            ? 'Green light: every stage passes — you may '
+                                'shred the provisional key.'
+                            : 'Not yet: keep training, or grade honestly '
+                                'lower where recall falls short — reviews '
+                                'come sooner.',
+                        style: TextStyle(
+                          color: green
+                              ? Theme.of(ctx).colorScheme.primary
+                              : null,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                actions: <Widget>[
+                  if (green)
+                    TextButton(
+                      onPressed: _press(_Cue.graduationWipe, () {
+                        wipe = true;
+                        Navigator.of(ctx).pop();
+                      }),
+                      child: const Text('Wipe the setup file…'),
+                    ),
+                  TextButton(
+                    onPressed: _press(
+                        _Cue.graduationCancel, () => Navigator.of(ctx).pop()),
+                    child: const Text('Cancel'),
+                  ),
+                  FilledButton(
+                    onPressed: _press(_Cue.graduationApply, () {
+                      unawaited(apply());
+                    }),
+                    child: const Text('Apply'),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+    );
+    await _dialog(_Cue.graduation, () => Navigator.of(context).push(route));
+    // The fields are still drawn while the dialog animates out: free them
+    // after.
+    unawaited(route.completed.whenComplete(() {
+      gapInput.dispose();
+      epsInput.dispose();
+    }));
+    if (wipe && mounted) await _wipeWizard();
+  }
+
+  /// ε is entered and shown as a percentage.
+  static const double _kPercentScale = 100;
 
   /// Save the training progress into the setup file, under the key that
   /// opened it: the key must open the file it replaces.
@@ -4334,7 +4595,8 @@ press.calibrate.target    tick_soft.wav
     if (_busy) return;
     final int profileIdx =
         _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
-    final int? n = await _dialog(_Cue.calibrate, () => showDialog<int>(
+    final ({int n, double secPerPass})? r =
+        await _dialog(_Cue.calibrate, () => showDialog<({int n, double secPerPass})>(
       context: context,
       barrierDismissible: false,
       builder: (BuildContext _) => _CalibrationDialog(
@@ -4345,10 +4607,11 @@ press.calibrate.target    tick_soft.wav
         initialStages: _pointStages,
       ),
     ));
-    if (!mounted || n == null) return;
+    if (!mounted || r == null) return;
     setState(() {
-      _iterations = n;
-      _iterationsField.text = n.toString();
+      _iterations = r.n;
+      _iterationsField.text = r.n.toString();
+      _passSeconds = r.secPerPass;
     });
     _sounds.play(UiSound.confirm);
   }
@@ -4429,7 +4692,11 @@ press.calibrate.target    tick_soft.wav
                       final Argon2Profile next = _profiles[v.round()];
                       if (next == _profile) return;
                       _sounds.play(UiSound.tickSoft);
-                      setState(() => _profile = next);
+                      // A pass takes another time at another profile.
+                      setState(() {
+                        _profile = next;
+                        _passSeconds = null;
+                      });
                     },
             ),
           ),
@@ -4499,6 +4766,10 @@ press.calibrate.target    tick_soft.wav
     final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
     return OrbitVault(
       deck: _deckForSave(deepest),
+      passSeconds: _passSeconds,
+      gapSeconds: _gapSeconds,
+      epsilon:
+          _epsilon == GraduationParams.defaultEpsilon ? null : _epsilon,
       sigma: _sigmaCtrl.text.trim().replaceAll(RegExp(r'\s'), ''),
       iterations: _iterations,
       profile: _profile,
@@ -4679,6 +4950,9 @@ press.calibrate.target    tick_soft.wav
       _iterations = vault.iterations;
       _iterationsField.text = '${vault.iterations}';
       _profile = vault.profile;
+      _passSeconds = vault.passSeconds;
+      _gapSeconds = vault.gapSeconds;
+      _epsilon = vault.epsilon ?? GraduationParams.defaultEpsilon;
       for (int i = 1; i <= deepest; i++) {
         // o₀ is never stored: [_stageOrbit] re-derives it from σ on demand.
         _orbitO[i] = orbits[i];
@@ -6011,6 +6285,7 @@ enum _Cmd {
   gradeGood(CommandContext.train, 6),
   gradeEasy(CommandContext.train, 7),
   saveProgress(CommandContext.train, 8),
+  graduation(CommandContext.train, 9),
   prevStop(CommandContext.path, 0),
   nextStop(CommandContext.path, 1),
   rhoZoom(CommandContext.path, 2),
@@ -6074,6 +6349,7 @@ abstract final class _Cue {
   static const String harvestDate = 'harvest.date';
   static const String wipe = 'wipe';
   static const String stats = 'stats';
+  static const String graduation = 'graduation';
   static const List<String> dialogs = <String>[
     calibrate,
     calibrateLeave,
@@ -6084,6 +6360,7 @@ abstract final class _Cue {
     harvestDate,
     wipe,
     stats,
+    graduation,
   ];
 
   // Buttons outside the board, under `press.`.
@@ -6109,6 +6386,9 @@ abstract final class _Cue {
   static const String keyClose = 'key.close';
   static const String wipePress = 'wipe.press';
   static const String wipeCancel = 'wipe.cancel';
+  static const String graduationApply = 'graduation.apply';
+  static const String graduationCancel = 'graduation.cancel';
+  static const String graduationWipe = 'graduation.wipe';
   static const String calibrateClose = 'calibrate.close';
   static const String calibrateBench = 'calibrate.bench';
   static const String calibrateScope = 'calibrate.scope';
@@ -6143,6 +6423,9 @@ abstract final class _Cue {
     keyClose,
     wipePress,
     wipeCancel,
+    graduationApply,
+    graduationCancel,
+    graduationWipe,
     calibrateClose,
     calibrateBench,
     calibrateScope,
@@ -7157,7 +7440,8 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                         FilledButton(
                           onPressed: _press(_Cue.calibrateApply, (_benching || n == null)
                               ? null
-                              : () => Navigator.of(context).pop(n)),
+                              : () => Navigator.of(context)
+                                  .pop((n: n, secPerPass: _secPerPass!))),
                           child: const Text('Apply N'),
                         ),
                       ],
