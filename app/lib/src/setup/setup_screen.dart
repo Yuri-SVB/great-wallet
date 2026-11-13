@@ -1381,8 +1381,8 @@ press.calibrate.target    tick_soft.wav
         return BoardCommand(
           name: 'Save setup',
           help: 'Encrypts this setup to the file path under a provisional key '
-              '(a QR, a password manager or your own key): a crutch for the '
-              'memorisation window, deleted at graduation.',
+              '(a QR, a password manager, Dragon Dice or your own key): a '
+              'crutch for the memorisation window, deleted at graduation.',
           icon: Icons.save,
           enabled: !_vaultBusy,
           run: _writeSetup,
@@ -3288,6 +3288,9 @@ press.calibrate.target    tick_soft.wav
   static const double _kDiceWizardWidth = 960;
   static const double _kDiceWizardHeight = 620;
 
+  /// Padding around the key-size choice above the wizard.
+  static const double _kKeySizePad = 16;
+
   /// Bits the dice must carry beyond a point's: cutting the digest to 32
   /// bits loses some of what the rolls carry, and 32-bit outputs can be
   /// tabulated (dragon-dice/doc/FORMAT.md, "From the digest").
@@ -4941,6 +4944,19 @@ press.calibrate.target    tick_soft.wav
             }
           }
 
+          // R — roll Dragon Dice for a new key and re-seal the file under it.
+          Future<void> rollOwnKey() async {
+            if (busy) return;
+            final Uint8List? rolled = await _rollKey(keyLen);
+            if (rolled == null || !ctx.mounted) {
+              if (rolled != null) _wipeBytes(rolled);
+              return;
+            }
+            if (await reseal(ownKey: rolled, newLen: rolled.length)) {
+              _toast('Re-saved with a ${keyLen * 8}-bit key from Dragon Dice.');
+            }
+          }
+
           // Q reveals the QR; pressing it again switches 128↔256 (a fresh key,
           // overwriting the file). Alt+Q copies; pressing it again switches too.
           void onShowQr() {
@@ -4975,6 +4991,8 @@ press.calibrate.target    tick_soft.wav
                 const SingleActivator(LogicalKeyboardKey.keyI): scanOwnKey,
               const SingleActivator(LogicalKeyboardKey.keyI, alt: true): () =>
                   hexFocus.requestFocus(),
+              // R — not a hex digit, so typing a key in the field is safe.
+              const SingleActivator(LogicalKeyboardKey.keyR): rollOwnKey,
               const SingleActivator(LogicalKeyboardKey.escape): () =>
                   Navigator.of(ctx).pop(),
             },
@@ -5004,6 +5022,8 @@ press.calibrate.target    tick_soft.wav
                           'file).  '
                           '${canScan ? 'I — scan an existing QR to reuse its key '
                               '(re-seals this setup under it).  ' : ''}'
+                          'R — roll Dragon Dice for a new key, 128 or 256 '
+                          'bits (re-seals this setup under it).  '
                           'Alt+I — type your own 32- or 64-hex key (Enter).  '
                           'Esc — close.',
                           style: const TextStyle(fontSize: 11),
@@ -5042,7 +5062,7 @@ press.calibrate.target    tick_soft.wav
                             border: OutlineInputBorder(),
                             labelText:
                                 'Your own key — 32 or 64 hex digits (optional)',
-                            hintText: 'from dice etc., then Enter to apply',
+                            hintText: 'from another source, then Enter to apply',
                           ),
                         ),
                       ],
@@ -5059,6 +5079,12 @@ press.calibrate.target    tick_soft.wav
                     onPressed: _press(_Cue.keyCopy, busy ? null : onCopy),
                     icon: const Icon(Icons.copy),
                     label: const Text('Copy key (Alt+Q)'),
+                  ),
+                  TextButton.icon(
+                    onPressed: _press(_Cue.keyDice, busy ? null : rollOwnKey),
+                    icon: D20Glyph(
+                        colour: Theme.of(ctx).colorScheme.primary),
+                    label: const Text('Roll dice (R)'),
                   ),
                   if (canScan)
                     TextButton.icon(
@@ -5081,6 +5107,79 @@ press.calibrate.target    tick_soft.wav
     hexInput.dispose();
     hexFocus.dispose();
     _wipeBytes(key); // recorded or abandoned — drop our copy
+  }
+
+  /// A provisional key from the Dragon Dice wizard: the first 16 or 32 bytes
+  /// of the rolls' digest; null if cancelled. The size starts at [lenBytes]
+  /// and can be switched in the wizard's dialog. The target is the key's
+  /// bits, with no margin: from 128 bits on, a digest cut to them cannot be
+  /// tabulated (dragon-dice/doc/FORMAT.md, "From the digest"). The caller
+  /// wipes the key.
+  Future<Uint8List?> _rollKey(int lenBytes) async {
+    int len = lenBytes;
+    int bits() => len == SetupCrypto.keyLenBytes
+        ? SetupCrypto.keyBits
+        : SetupCrypto.keyBits256;
+    DiceRolls? rolled;
+    await _dialog(
+      _Cue.dice,
+      () => showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (BuildContext ctx) => Dialog(
+          child: SizedBox(
+            width: _kDiceWizardWidth,
+            height: _kDiceWizardHeight,
+            child: StatefulBuilder(
+              builder: (BuildContext ctx,
+                      void Function(void Function()) setLocal) =>
+                  Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(
+                        _kKeySizePad, _kKeySizePad, _kKeySizePad, 0),
+                    child: SegmentedButton<int>(
+                      segments: const <ButtonSegment<int>>[
+                        ButtonSegment<int>(
+                            value: SetupCrypto.keyLenBytes,
+                            label: Text('${SetupCrypto.keyBits}-bit key')),
+                        ButtonSegment<int>(
+                            value: SetupCrypto.keyLenBytes256,
+                            label: Text('${SetupCrypto.keyBits256}-bit key')),
+                      ],
+                      selected: <int>{len},
+                      onSelectionChanged: (Set<int> s) =>
+                          setLocal(() => len = s.first),
+                    ),
+                  ),
+                  Expanded(
+                    child: DragonDiceWizard(
+                      targetBits: bits().toDouble(),
+                      purpose: 'The provisional key, ${bits()} bits',
+                      systemRandomByDefault: true,
+                      onCue: _cue,
+                      onDone: (DiceRolls r) {
+                        rolled = r;
+                        Navigator.of(ctx).pop();
+                      },
+                      onCancel: () => Navigator.of(ctx).pop(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    final DiceRolls? r = rolled;
+    if (r == null) return null;
+    final Uint8List digest = r.digest();
+    r.wipe();
+    final Uint8List key = Uint8List.fromList(digest.sublist(0, len));
+    _wipeBytes(digest);
+    return key;
   }
 
   /// Byte-mode QR matrix for a provisional key: v1 (21×21) for the 16-byte
@@ -5666,6 +5765,7 @@ abstract final class _Cue {
   static const String keyQr = 'key.qr';
   static const String keyCopy = 'key.copy';
   static const String keyOwn = 'key.own';
+  static const String keyDice = 'key.dice';
   static const String keyClose = 'key.close';
   static const String calibrateClose = 'calibrate.close';
   static const String calibrateBench = 'calibrate.bench';
@@ -5697,6 +5797,7 @@ abstract final class _Cue {
     keyQr,
     keyCopy,
     keyOwn,
+    keyDice,
     keyClose,
     calibrateClose,
     calibrateBench,
