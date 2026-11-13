@@ -4,9 +4,9 @@ import '../core/great_wall_core.dart';
 import '../setup/setup_screen.dart';
 
 /// The great-wallet modes (ARCHITECTURE.md §"7. great-wallet"). **Setup** builds
-/// the orbit (protocol 0.5.0); Train / Accelerate / Inherit depend on
-/// libraries (celestial-peace-nf-core, jade-clock, phoenix-scroll) still in
-/// development.
+/// the orbit (protocol 0.5.0); **Train** recalls its maps (celestial-peace-nf-
+/// core), on the same screen and the same open setup; Accelerate / Inherit
+/// depend on libraries (jade-clock, phoenix-scroll) still in development.
 enum WalletMode {
   setup('Setup', Icons.auto_awesome_mosaic),
   train('Train', Icons.school),
@@ -31,6 +31,17 @@ class ModeShell extends StatefulWidget {
 class _ModeShellState extends State<ModeShell> {
   WalletMode _mode = WalletMode.setup;
 
+  /// Setup or Train, whichever the setup screen last showed: it stays
+  /// mounted (and its setup open) while another mode is shown.
+  bool _training = false;
+
+  void _select(WalletMode m) => setState(() {
+        _mode = m;
+        if (m == WalletMode.setup || m == WalletMode.train) {
+          _training = m == WalletMode.train;
+        }
+      });
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -39,8 +50,7 @@ class _ModeShellState extends State<ModeShell> {
         children: <Widget>[
           NavigationRail(
             selectedIndex: _mode.index,
-            onDestinationSelected: (int i) =>
-                setState(() => _mode = WalletMode.values[i]),
+            onDestinationSelected: (int i) => _select(WalletMode.values[i]),
             labelType: NavigationRailLabelType.all,
             destinations: <NavigationRailDestination>[
               for (final WalletMode m in WalletMode.values)
@@ -58,14 +68,25 @@ class _ModeShellState extends State<ModeShell> {
   }
 
   Widget _body() {
-    switch (_mode) {
-      case WalletMode.setup:
-        return SetupScreen(core: widget.core);
-      case WalletMode.train:
-      case WalletMode.accelerate:
-      case WalletMode.inherit:
-        return _comingSoon(_mode);
-    }
+    final bool screen =
+        _mode == WalletMode.setup || _mode == WalletMode.train;
+    return Stack(
+      children: <Widget>[
+        Offstage(
+          offstage: !screen,
+          child: TickerMode(
+            enabled: screen,
+            child: SetupScreen(
+              core: widget.core,
+              training: _training,
+              onTrainingChanged: (bool t) =>
+                  _select(t ? WalletMode.train : WalletMode.setup),
+            ),
+          ),
+        ),
+        if (!screen) _comingSoon(_mode),
+      ],
+    );
   }
 
   Widget _comingSoon(WalletMode mode) {
@@ -81,8 +102,8 @@ class _ModeShellState extends State<ModeShell> {
                 style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
             const Text(
-              'This integration pass wires Setup (great-wall-core + '
-              'great-wall-ux). The remaining modes depend on libraries that '
+              'Setup and Train are wired (great-wall-core, great-wall-ux, '
+              'celestial-peace-nf-core). This mode depends on libraries that '
               'are not yet public.',
               textAlign: TextAlign.center,
             ),

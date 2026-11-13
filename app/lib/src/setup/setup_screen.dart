@@ -9,7 +9,20 @@ import 'package:flutter/material.dart';
 import 'package:dragon_dice_ui/dragon_dice_ui.dart'
     show DiceCue, DiceRolls, DragonDiceWizard, digestBits;
 import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
-    show CardKind, Cues, Deck, MemCard, buildDeck;
+    show
+        CardKind,
+        Clock,
+        Cues,
+        Deck,
+        DeckProgress,
+        Grade,
+        MemCard,
+        MemSchedule,
+        PracticeReason,
+        ReviewSession,
+        StageProgress,
+        buildDeck,
+        honestGrade;
 import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:flutter/services.dart';
 import 'package:great_wall_ux/great_wall_ux.dart';
@@ -43,9 +56,21 @@ import 'setup_crypto.dart';
 /// the orbit's maps, the engine encodes their points, and a worker isolate runs
 /// the memory-hard advance between stages.
 class SetupScreen extends StatefulWidget {
-  const SetupScreen({super.key, required this.core});
+  const SetupScreen({
+    super.key,
+    required this.core,
+    this.training = false,
+    this.onTrainingChanged,
+  });
 
   final GreatWallCore core;
+
+  /// Train mode (F3): the open setup's maps are recalled and graded rather
+  /// than set up (CPNF, celestial-peace-nf-core). Setup mode (F2) otherwise.
+  final bool training;
+
+  /// Told when F2 or F3 switches the mode, so the host's tabs follow.
+  final ValueChanged<bool>? onTrainingChanged;
 
   @override
   State<SetupScreen> createState() => _SetupScreenState();
@@ -213,6 +238,29 @@ class _SetupScreenState extends State<SetupScreen>
 
   /// The command board's context (Alt + a top-row board key).
   CommandContext _context = CommandContext.main;
+
+  // --- Train mode (CPNF) -----------------------------------------------------
+
+  /// Train mode: the open setup's maps are recalled, not set up.
+  late bool _training = widget.training;
+
+  /// The CPNF scheduler, on the device's clock.
+  static const MemSchedule _schedule = MemSchedule(_SystemClock());
+
+  /// Where the attempt at the shown map stands.
+  _TrainStep _step = _TrainStep.recall;
+
+  /// Stops were shown or the route changed during this attempt: practice.
+  bool _attemptAided = false;
+
+  /// The islands were revealed during this attempt: a find counts as Again.
+  bool _attemptHint = false;
+
+  /// This session's grading: a map graded once is practice after.
+  final ReviewSession _review = ReviewSession(_schedule);
+
+  /// The deck changed since the setup was last saved or opened.
+  bool _deckDirty = false;
 
   /// The explanation of the board button or tab under the pointer or focus,
   /// shown in the log in place of its text; null when none is.
@@ -667,19 +715,77 @@ press.calibrate.target    tick_soft.wav
         const SingleActivator(LogicalKeyboardKey.escape): _focusViewer,
         const SingleActivator(LogicalKeyboardKey.f1): () =>
             _togglePanel(byKey: true),
-        const SingleActivator(LogicalKeyboardKey.f2): () =>
-            _gotoMode('Setup', _Cue.f2, here: true),
-        const SingleActivator(LogicalKeyboardKey.f3): () =>
-            _gotoMode('Train', _Cue.f3, here: false),
+        const SingleActivator(LogicalKeyboardKey.f2): () {
+          _cue(_Cue.f2);
+          _switchMode(training: false);
+        },
+        const SingleActivator(LogicalKeyboardKey.f3): () {
+          _cue(_Cue.f3);
+          _switchMode(training: true);
+        },
         const SingleActivator(LogicalKeyboardKey.f4): () =>
             _gotoMode('Accelerate', _Cue.f4, here: false),
         const SingleActivator(LogicalKeyboardKey.f5): () =>
             _gotoMode('Inherit', _Cue.f5, here: false),
       };
 
-  /// Switch top-level mode (F2 Setup · F3 Train · F4 Accelerate · F5 Inherit).
-  /// Only Setup exists in this app today; the others announce themselves so the
-  /// keys (and muscle memory) are correct from the start.
+  /// F2 or F3: Setup or Train, telling the host.
+  void _switchMode({required bool training}) {
+    if (training == _training) {
+      _toast('${training ? 'Train' : 'Setup'} (current mode).');
+      return;
+    }
+    _setTraining(training);
+    widget.onTrainingChanged?.call(training);
+  }
+
+  @override
+  void didUpdateWidget(SetupScreen old) {
+    super.didUpdateWidget(old);
+    if (widget.training != old.training && widget.training != _training) {
+      _setTraining(widget.training);
+    }
+  }
+
+  /// Enter or leave Train mode. Train shows the Train board in Setup's place
+  /// and starts a fresh attempt at the shown map; nothing of the setup
+  /// changes in it.
+  void _setTraining(bool on) {
+    setState(() {
+      _training = on;
+      _editPointMode = false;
+      _boardImportSlot = null;
+      _boardIslands = const <CanvasIsland>[];
+      _boardCanonicalView = false;
+      if (on && _context == CommandContext.setup) {
+        _context = CommandContext.train;
+      } else if (!on && _context == CommandContext.train) {
+        _context = CommandContext.setup;
+      }
+      if (on && _orbitSettled) {
+        _deck ??= _deckForSave(_orbitDeepestStage);
+      }
+      // The landmark stops are a map's cues: shown as each card sets them.
+      if (on) _showPath = true;
+    });
+    _recenter(); // Train starts every map from the default view
+    if (!on) {
+      if (_deckDirty) {
+        _toast('Training progress is not saved yet: Train board › '
+            '${_layout.keys[_Cmd.saveProgress.slot]} (save progress).');
+      }
+      return;
+    }
+    _newAttempt();
+    if (!_orbitSettled) {
+      _toast('Train: open a setup file first (${_hint(_Cmd.open)}).');
+      return;
+    }
+    _logProgress();
+  }
+
+  /// Switch top-level mode (F4 Accelerate · F5 Inherit): not built yet; the
+  /// keys announce themselves so muscle memory is right from the start.
   void _gotoMode(String name, String cue, {required bool here}) {
     _cue(cue);
     _toast(here
@@ -756,10 +862,12 @@ press.calibrate.target    tick_soft.wav
                         ),
                         if (_busy) Positioned.fill(child: _progressOverlay()),
                         if (_editPointMode && _isBoardSlot)
-                          const Positioned(
+                          Positioned(
                             top: 56,
                             left: 12,
-                            child: _Badge('Click the new point · Esc to cancel'),
+                            child: _Badge(_training
+                                ? 'Click the leaf you recall · Esc to cancel'
+                                : 'Click the new point · Esc to cancel'),
                           ),
                         // Deep render reminder: explains the lag while the high
                         // escape-count cap is active, and how to turn it off.
@@ -820,7 +928,13 @@ press.calibrate.target    tick_soft.wav
     }
     if (i == _slotIndex) {
       // Re-pressing the active board slot toggles between the initial default
-      // view and the canonical view (island centred, zoomed, brightened).
+      // view and the canonical view (island centred, zoomed, brightened) —
+      // not while that island is the answer being recalled.
+      if (_answerHidden) {
+        _sounds.play(UiSound.denyBlocked);
+        _toast('The answer stays hidden while you recall.');
+        return;
+      }
       if (_isBoardSlot) _toggleBoardView();
       return;
     }
@@ -838,6 +952,7 @@ press.calibrate.target    tick_soft.wav
     // Landing on a board resets the view, so each fractal opens centred at the
     // default zoom/brightness (the same recenter stage selection performs).
     if (_isBoardSlot) _recenter();
+    if (_training) _newAttempt();
   }
 
   /// The **secondary slot tabs** — a fixed row of ten numbered tabs (`0..9`)
@@ -1141,7 +1256,7 @@ press.calibrate.target    tick_soft.wav
     if (kb.isAltPressed) {
       if (event is! KeyDownEvent) return KeyEventResult.ignored;
       // Alt + a top-row board key: switch the board's context.
-      for (final CommandContext c in CommandContext.values) {
+      for (final CommandContext c in _contexts) {
         if (board == c.key) {
           _setContext(c);
           return KeyEventResult.handled;
@@ -1442,6 +1557,92 @@ press.calibrate.target    tick_soft.wav
           enabled: !_busy,
           run: () => _copyMasterSecret(full: full),
         );
+      case _Cmd.nextDue:
+        return BoardCommand(
+          name: 'Next due map',
+          help: 'Goes to the next map due for review, the longest-due first. '
+              'Any map can be trained, in any order: pick one with its digit '
+              'keys too.',
+          icon: Icons.event_available,
+          enabled: _trainReady,
+          run: _gotoNextDue,
+        );
+      case _Cmd.recall:
+        return BoardCommand(
+          name: 'Recall',
+          help: 'The next click on the map is your answer: zoom to the leaf '
+              'you remember and click it. Esc cancels.',
+          icon: Icons.ads_click,
+          enabled: _trainReady &&
+              _trainCard != null &&
+              _step != _TrainStep.found,
+          active: _training && _editPointMode,
+          run: _armRecall,
+        );
+      case _Cmd.showAnswer:
+        return BoardCommand(
+          name: 'Show the answer',
+          help: 'Shows this map’s point. Before you answer, it counts as '
+              'giving up: a graded map is graded Again.',
+          icon: Icons.visibility,
+          enabled: _trainReady &&
+              _trainCard != null &&
+              _step == _TrainStep.recall,
+          run: _showAnswer,
+        );
+      case _Cmd.progress:
+        return BoardCommand(
+          name: 'Progress',
+          help: 'Writes in the log what is memorised and what is left, per '
+              'stage against the maps it needs, and which maps are due.',
+          icon: Icons.insights,
+          enabled: _trainReady,
+          run: _logProgress,
+        );
+      case _Cmd.gradeAgain:
+      case _Cmd.gradeHard:
+      case _Cmd.gradeGood:
+      case _Cmd.gradeEasy:
+        final Grade g = switch (c) {
+          _Cmd.gradeAgain => Grade.again,
+          _Cmd.gradeHard => Grade.hard,
+          _Cmd.gradeGood => Grade.good,
+          _ => Grade.easy,
+        };
+        return BoardCommand(
+          name: switch (g) {
+            Grade.again => 'Again',
+            Grade.hard => 'Hard',
+            Grade.good => 'Good',
+            Grade.easy => 'Easy',
+          },
+          help: switch (g) {
+            Grade.again => 'Grade the find Again: it was luck, or came after '
+                'you had given up. The map comes back tomorrow.',
+            Grade.hard => 'Grade the find Hard: you found it, with effort.',
+            Grade.good => 'Grade the find Good: you found it with reasonable '
+                'confidence.',
+            Grade.easy => 'Grade the find Easy: you found it at once.',
+          },
+          icon: switch (g) {
+            Grade.again => Icons.replay,
+            Grade.hard => Icons.sentiment_neutral,
+            Grade.good => Icons.sentiment_satisfied,
+            Grade.easy => Icons.sentiment_very_satisfied,
+          },
+          enabled: _step == _TrainStep.found,
+          run: () => _grade(g),
+        );
+      case _Cmd.saveProgress:
+        return BoardCommand(
+          name: 'Save progress',
+          help: 'Saves the training progress into the setup file, under the '
+              'key that opened it: scan or type that key.',
+          icon: Icons.save,
+          enabled: _trainReady && !_vaultBusy,
+          active: _deckDirty,
+          run: () => unawaited(_saveProgress()),
+        );
       case _Cmd.prevStop:
       case _Cmd.nextStop:
         final bool next = c == _Cmd.nextStop;
@@ -1486,8 +1687,14 @@ press.calibrate.target    tick_soft.wav
             final (int, int) key = (_activeStage, _slotIndex);
             final _ShownPath? shown = _paths[key];
             if (shown == null) return;
+            final List<LandmarkFeature> stops =
+                _stopsShown(shown.path, _routeOf(key).visible);
+            if (stops.isEmpty) {
+              _sounds.play(UiSound.denyBlocked);
+              return;
+            }
             _sounds.play(UiSound.navZoom);
-            _frame(_visibleOf(shown.path, _routeOf(key).visible));
+            _frame(stops);
           },
         );
       case _Cmd.rhoZoom:
@@ -1766,6 +1973,8 @@ press.calibrate.target    tick_soft.wav
     final _Route next = reroute
         ? (rho: route.rho, exponent: route.exponent, visible: null)
         : route;
+    // Recalling, a route change shows or hides stops: the attempt is practice.
+    if (_answerHidden) _attemptAided = true;
     setState(() {
       _routes[key] = next;
       final _ShownPath? p = _paths[key];
@@ -1795,9 +2004,12 @@ press.calibrate.target    tick_soft.wav
     }
     final CanvasPath? overlay = shown?.overlay;
     if (overlay == null) return null;
-    // The same stops (so their traced outlines are kept), drawn as set.
+    // The same stops (so their traced outlines are kept), drawn as set; in
+    // Train mode the leaf's stop is the answer, hidden until answered.
     return CanvasPath(
-      stops: overlay.stops,
+      stops: _answerHidden && overlay.stops.isNotEmpty
+          ? overlay.stops.sublist(0, overlay.stops.length - 1)
+          : overlay.stops,
       showNumbers: _showNumbers,
       showLine: _showLines,
     );
@@ -1809,6 +2021,15 @@ press.calibrate.target    tick_soft.wav
     final int before = path.stops.length - 1;
     final int shown = visible == null ? before : visible.clamp(0, before);
     return path.stops.skip(before - shown).toList();
+  }
+
+  /// The stops of [path] to fly to or frame: those drawn, without the leaf's
+  /// while it is the hidden answer (Train mode).
+  List<LandmarkFeature> _stopsShown(LandmarkPath path, int? visible) {
+    final List<LandmarkFeature> stops = _visibleOf(path, visible);
+    return _answerHidden && stops.isNotEmpty
+        ? stops.sublist(0, stops.length - 1)
+        : stops;
   }
 
   /// How much larger than the framed stops a frame is, and the fewest cells
@@ -1874,8 +2095,12 @@ press.calibrate.target    tick_soft.wav
     final _ShownPath? shown = _paths[key];
     if (shown == null) return;
     final int? visible = _routeOf(key).visible;
-    final List<LandmarkFeature> stops = _visibleOf(shown.path, visible);
+    final List<LandmarkFeature> stops = _stopsShown(shown.path, visible);
     final int n = stops.length;
+    if (n == 0) {
+      _sounds.play(UiSound.denyBlocked);
+      return;
+    }
     final ({(int, int) key, LandmarkPath path, int? visible, int index})? at =
         _stopAt;
     final bool fresh = at == null ||
@@ -2091,6 +2316,12 @@ press.calibrate.target    tick_soft.wav
     if (index < _orbitStage || _stageOrbit(index) != null) {
       _sounds.play(UiSound.navStage);
       _setOrbitStage(index);
+      return;
+    }
+    // Train recalls the open setup's stages; it never advances.
+    if (_training) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Train covers the stages of the open setup.');
       return;
     }
     // Forward into the immediate next stage: run the memory-hard advance
@@ -2364,6 +2595,7 @@ press.calibrate.target    tick_soft.wav
       _boardKey = ''; // force the render cache to rebuild for the new stage
     });
     _recenter();
+    if (_training) _newAttempt();
   }
 
   /// Whether the keyboard focus is currently inside an editable text field, so
@@ -2409,6 +2641,10 @@ press.calibrate.target    tick_soft.wav
       // cannot encode the mode stays armed to retry.
       onSelect: _editPointMode
           ? (FractalSelection sel) {
+              if (_training) {
+                _attemptAt(sel);
+                return;
+              }
               if (_placeableBoardSlot && _placePrimaryAt(_slotIndex, sel)) {
                 setState(() => _editPointMode = false);
               }
@@ -2422,7 +2658,9 @@ press.calibrate.target    tick_soft.wav
   /// once the island spans enough pixels it becomes a square frame around its
   /// cells (the switch has hysteresis — see [_updateBoardMarkerMode]).
   CanvasOverlays _boardOverlays(int slot) {
-    final ({int reRaw, int imRaw})? pt = _boardPoints[_activeStage][slot];
+    final ({int reRaw, int imRaw})? point = _boardPoints[_activeStage][slot];
+    // In Train mode the point is the answer: hidden until answered.
+    final ({int reRaw, int imRaw})? pt = _answerHidden ? null : point;
     final _BoardDeco? deco = pt == null ? null : _boardDecoFor(slot);
     final bool square = _boardMarkerSquare && deco != null;
     final List<CrossMarker> crosses = <CrossMarker>[];
@@ -2451,7 +2689,7 @@ press.calibrate.target    tick_soft.wav
           ),
       ],
       crosses: crosses,
-      path: _showPath && pt != null ? _pathOverlay(slot) : null,
+      path: _showPath && point != null ? _pathOverlay(slot) : null,
     );
   }
 
@@ -2540,6 +2778,11 @@ press.calibrate.target    tick_soft.wav
       return;
     }
     _sounds.play(UiSound.focus);
+    // Recalling, the islands are a hint: a find then counts as Again.
+    if (_answerHidden && !_attemptHint) {
+      _attemptHint = true;
+      _toast('Islands shown: a find in this attempt counts as Again.');
+    }
     // Point the leaf source at this board so the decode/enumerate run on the
     // same fractal that is on screen.
     widget.core.leafSource.reservoirs =
@@ -2710,6 +2953,261 @@ press.calibrate.target    tick_soft.wav
   }
 
   static double _log2(double x) => math.log(x) / math.ln2;
+
+  // --- Train mode (CPNF) -----------------------------------------------------
+
+  /// The board's contexts in this mode: Train shows its board in Setup's
+  /// place.
+  List<CommandContext> get _contexts =>
+      _training ? kTrainContexts : kSetupContexts;
+
+  /// Train mode with an open setup and its deck.
+  bool get _trainReady => _training && _orbitSettled && _deck != null;
+
+  /// The shown map's card, with its cues as the route is now set; null when
+  /// the shown slot is not a map of the deck.
+  MemCard? get _trainCard {
+    final Deck? deck = _deck;
+    if (!_training || deck == null || !_isBoardSlot) return null;
+    final (int, int) key = (_activeStage, _slotIndex);
+    final MemCard? card = deck.map(key.$1, key.$2);
+    if (card == null || !_placed(key.$1, key.$2)) return null;
+    return card.copyWith(cues: _cuesOf(_routeOf(key)));
+  }
+
+  /// The shown map's point is hidden: Train mode, before an answer.
+  bool get _answerHidden => _training && _step == _TrainStep.recall;
+
+  /// A fresh attempt at the shown map: its point hidden again.
+  void _newAttempt() {
+    setState(() {
+      _step = _TrainStep.recall;
+      _attemptAided = false;
+      _attemptHint = false;
+      _editPointMode = false;
+    });
+  }
+
+  /// Why an attempt at [card] now is practice, in words, or null if it is
+  /// graded ([ReviewSession.practiceReasonFor]).
+  String? _practiceReason(MemCard card) =>
+      switch (_review.practiceReasonFor(card, aided: _attemptAided)) {
+        null => null,
+        PracticeReason.stopsShown => 'stops are shown',
+        PracticeReason.routeChanged => 'the route changed during the attempt',
+        PracticeReason.gradedThisSession => 'graded already this session',
+        PracticeReason.notDue => 'not due until ${_dateText(card.due!)}',
+      };
+
+  /// Arm the recall: the next click on the map is the answer.
+  void _armRecall() {
+    final MemCard? card = _trainCard;
+    if (card == null || _step == _TrainStep.found) return;
+    if (_step == _TrainStep.answered) _newAttempt();
+    setState(() => _editPointMode = true);
+    final String? practice = _practiceReason(card);
+    _toast('Recall: zoom to the leaf you remember and click it '
+        '(${practice == null ? 'graded' : 'practice: $practice'}). '
+        'Esc cancels.');
+  }
+
+  /// A click while recalling: the leaf there against the map's point.
+  void _attemptAt(FractalSelection sel) {
+    final MemCard? card = _trainCard;
+    final ({int o, int p, int q})? prm = _boardPrm(_slotIndex);
+    final List<int>? truth = _boardChunks[_activeStage][_slotIndex];
+    if (card == null || prm == null || truth == null) return;
+    final CoreDecodeResult d = widget.core.decodePoint(
+        reRaw: fixedFromDouble(sel.re),
+        imRaw: fixedFromDouble(sel.im),
+        o: prm.o,
+        p: prm.p,
+        q: prm.q);
+    if (!d.valid) {
+      _sounds.play(UiSound.denyMiss);
+      _toast('No encodable leaf there — zoom in and click closer.');
+      return; // still armed
+    }
+    bool hit = d.bits.length == truth.length;
+    for (int i = 0; hit && i < truth.length; i++) {
+      hit = d.bits[i] == truth[i];
+    }
+    Entropy.wipe(d.bits);
+    final String? practice = _practiceReason(card);
+    setState(() {
+      _editPointMode = false;
+      _step = hit && practice == null && !_attemptHint
+          ? _TrainStep.found
+          : _TrainStep.answered;
+    });
+    if (!hit) {
+      _sounds.play(UiSound.denyMiss);
+      if (practice != null) {
+        _toast('Missed (practice: $practice). The answer is shown.');
+        return;
+      }
+      final MemCard next = _record(card, Grade.again);
+      _toast('Missed: graded Again, next review ${_dueText(next)}. The '
+          'answer is shown.');
+      return;
+    }
+    _sounds.play(UiSound.selectPoint);
+    if (practice != null) {
+      _toast('Found it (practice: $practice).');
+      return;
+    }
+    if (_attemptHint) {
+      final MemCard next =
+          _record(card, honestGrade(succeeded: true, usedHint: true));
+      _toast('Found, after revealing the islands: graded Again, next review '
+          '${_dueText(next)}.');
+      return;
+    }
+    String key(_Cmd c) => _layout.keys[c.slot];
+    _toast('Found it. Grade it: ${key(_Cmd.gradeHard)} Hard, '
+        '${key(_Cmd.gradeGood)} Good, ${key(_Cmd.gradeEasy)} Easy — or '
+        '${key(_Cmd.gradeAgain)} Again if it was luck or came after giving '
+        'up.');
+  }
+
+  /// Grade the find with the user's [g].
+  void _grade(Grade g) {
+    final MemCard? card = _trainCard;
+    if (card == null || _step != _TrainStep.found) return;
+    final MemCard next = _record(card, honestGrade(succeeded: true, proposed: g));
+    setState(() => _step = _TrainStep.answered);
+    _toast('Graded ${g.name}: next review ${_dueText(next)}. Save progress '
+        '(${_layout.keys[_Cmd.saveProgress.slot]}) to keep it.');
+  }
+
+  /// When [card] is due, in words.
+  String _dueText(MemCard card) {
+    final DateTime? due = card.due;
+    return due == null ? 'now' : 'on ${_dateText(due)}';
+  }
+
+  /// Grade [card] with [g] in the deck; the graded card.
+  MemCard _record(MemCard card, Grade g) {
+    final MemCard next = _review.record(card, g);
+    setState(() {
+      _deck = _deck!.withCard(next);
+      _deckDirty = true;
+    });
+    return next;
+  }
+
+  /// Show the shown map's point. Before an answer, on a graded attempt, it
+  /// is giving up: Again.
+  void _showAnswer() {
+    final MemCard? card = _trainCard;
+    if (card == null || _step != _TrainStep.recall) return;
+    final bool gaveUp = _practiceReason(card) == null;
+    setState(() {
+      _step = _TrainStep.answered;
+      _editPointMode = false;
+    });
+    _sounds.play(UiSound.navZoom);
+    if (!gaveUp) {
+      _toast('The answer is shown.');
+      return;
+    }
+    final MemCard next = _record(card, Grade.again);
+    _toast('Gave up: graded Again, next review ${_dueText(next)}. The answer '
+        'is shown.');
+  }
+
+  /// The deck's map cards of this setup, with their cues as now set.
+  List<MemCard> get _trainCards => <MemCard>[
+        for (final MemCard c in _deck?.cards ?? const <MemCard>[])
+          if (c.kind == CardKind.point &&
+              c.stageIndex <= _orbitDeepestStage &&
+              _placed(c.stageIndex, c.slot))
+            c.copyWith(cues: _cuesOf(_routeOf((c.stageIndex, c.slot)))),
+      ];
+
+  /// Go to the next due map after the shown one, the longest-due first.
+  void _gotoNextDue() {
+    final List<MemCard> due = _schedule.queue(_trainCards).due;
+    if (due.isEmpty) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Nothing is due.');
+      return;
+    }
+    final int at = due.indexWhere((MemCard c) =>
+        c.stageIndex == _activeStage && c.slot == _slotIndex);
+    final MemCard next = due[(at + 1) % due.length];
+    if (next.stageIndex != _activeStage) _setOrbitStage(next.stageIndex);
+    if (next.slot != _slotIndex) {
+      _selectSlot(next.slot);
+    } else {
+      _recenter();
+      _newAttempt();
+    }
+    final String? practice = _practiceReason(next);
+    _toast('Stage ${next.stageIndex}, map ${next.slot}: '
+        '${practice == null ? 'graded' : 'practice, $practice'}.');
+  }
+
+  /// Write what is memorised and what is left, per stage, in the log.
+  void _logProgress() {
+    final Deck? deck = _deck;
+    if (deck == null) return;
+    final int deepest = _orbitDeepestStage;
+    final DeckProgress progress = deck.progress(
+        <int>[for (int i = 0; i <= deepest; i++) _requiredOf(i)], _schedule);
+    final DateTime now = _schedule.clock.now();
+    final List<MemCard> cards = _trainCards;
+    for (int i = 0; i <= deepest; i++) {
+      final StageProgress p = progress.stages[i];
+      final List<int> due = <int>[
+        for (final MemCard c in cards)
+          if (c.stageIndex == i && c.isDue(now)) c.slot,
+      ]..sort();
+      _toast('Stage $i: needs ${p.required} maps; ${p.maps} in the deck, '
+          '${p.unaided} without stops, ${p.consolidated} consolidated'
+          '${due.isEmpty ? '' : '; due: map${due.length == 1 ? '' : 's'} '
+              '${due.join(', ')}'}.');
+    }
+  }
+
+  /// Save the training progress into the setup file, under the key that
+  /// opened it: the key must open the file it replaces.
+  Future<void> _saveProgress() async {
+    final String path = _vaultPath.text.trim();
+    if (path.isEmpty) {
+      _sounds.play(UiSound.denyInput);
+      _toast('Enter the setup file path (${_hint(_Cmd.filePath)}).');
+      return;
+    }
+    final Uint8List? key =
+        await _enterKey(title: 'Save training progress', action: 'Save');
+    if (!mounted || key == null) return;
+    setState(() => _vaultBusy = true);
+    String? error;
+    try {
+      await SetupCrypto.openPayload(await File(path).readAsBytes(), key);
+    } catch (_) {
+      error = 'That key does not open the setup file: nothing saved. A '
+          'setup never saved goes through ${_hint(_Cmd.save)} first.';
+    }
+    if (error == null) {
+      final ({String? error, Uint8List? key}) r =
+          await _saveOrbitVaultToFile(path, providedKey: key);
+      error = r.error;
+      if (r.key != null) _wipeBytes(r.key!);
+    }
+    _wipeBytes(key);
+    if (!mounted) return;
+    setState(() => _vaultBusy = false);
+    if (error != null) {
+      _sounds.play(UiSound.denyInput);
+      _toast(error);
+      return;
+    }
+    setState(() => _deckDirty = false);
+    _sounds.play(UiSound.exportOk);
+    _toast('Training progress saved, under the same key.');
+  }
 
   /// Arm a manual point placement for the current board slot — the board peer of
   /// [_changePointManual]: the next canvas click sets slot [_slotIndex]'s point.
@@ -3092,6 +3590,8 @@ press.calibrate.target    tick_soft.wav
   /// old points no longer decode, and on dispose.
   void _clearOrbitPlacements() {
     _clearAdvanceCheckpoint(); // a re-rooted orbit invalidates a halted advance
+    _deckDirty = false;
+    _review.clear();
     for (int st = 0; st <= _maxStage; st++) {
       _shareEncodeGen[st]++; // discard any in-flight share-marker encode
       for (int s = 1; s <= _maxSlot; s++) {
@@ -3383,6 +3883,7 @@ press.calibrate.target    tick_soft.wav
             padding: const EdgeInsets.all(_kPanelPadding),
             child: CommandBoard(
               active: _context,
+              contexts: _contexts,
               commands: _board(),
               layout: _layout,
               colour: _kConsoleFg,
@@ -3573,6 +4074,7 @@ press.calibrate.target    tick_soft.wav
     final Widget? body = switch (_context) {
       CommandContext.main => null,
       CommandContext.setup => _setupPane(),
+      CommandContext.train => null,
       CommandContext.path => _routePanel(),
       CommandContext.view => _track(
           _Field.hue,
@@ -3891,6 +4393,7 @@ press.calibrate.target    tick_soft.wav
       await tmp.writeAsBytes(sealed.fileBytes, flush: true);
       await tmp.rename(path);
       _deck = vault.deck; // what the file now holds
+      _deckDirty = false;
       return (error: null, key: sealed.key);
     } catch (e) {
       // Best effort: never leave the partial temp behind. It is ciphertext, but
@@ -4046,6 +4549,13 @@ press.calibrate.target    tick_soft.wav
       }
     });
     _setOrbitStage(deepest);
+    // A new setup: its deck as saved, and no training since.
+    _deckDirty = false;
+    _review.clear();
+    if (_training) {
+      setState(() => _deck ??= _deckForSave(deepest));
+      _logProgress();
+    }
     return null;
   }
 
@@ -4119,12 +4629,25 @@ press.calibrate.target    tick_soft.wav
       _toast('Enter a file path.');
       return;
     }
+    final Uint8List? keyBytes =
+        await _enterKey(title: 'Open setup file', action: 'Load');
+    if (!mounted || keyBytes == null) return;
+    await _loadWithBytes(path, keyBytes);
+  }
+
+  /// The provisional key, scanned from its QR (Q) or typed as 32 or 64 hex
+  /// (Alt+Q focuses the field, Enter takes it); null if cancelled (Esc). The
+  /// key is never displayed; the caller wipes it.
+  Future<Uint8List?> _enterKey({
+    required String title,
+    required String action,
+  }) async {
     final bool canScan = _scanSupported || _desktopScanSupported;
     final TextEditingController hexInput = TextEditingController();
     final FocusNode hexFocus = FocusNode(debugLabel: 'open-hex');
     Uint8List? keyBytes;
 
-    await _dialog(_Cue.openFile, () => showDialog<void>(
+    final DialogRoute<void> route = DialogRoute<void>(
       context: context,
       builder: (BuildContext ctx) {
         void loadHex() {
@@ -4156,7 +4679,7 @@ press.calibrate.target    tick_soft.wav
           child: Focus(
             autofocus: true,
             child: AlertDialog(
-              title: const Text('Open setup file'),
+              title: Text(title),
               content: SizedBox(
                 width: 340,
                 child: Column(
@@ -4203,18 +4726,22 @@ press.calibrate.target    tick_soft.wav
                 ),
                 FilledButton(
                   onPressed: _press(_Cue.openLoad, loadHex),
-                  child: const Text('Load'),
+                  child: Text(action),
                 ),
               ],
             ),
           ),
         );
       },
-    ));
-    hexInput.dispose();
-    hexFocus.dispose();
-    if (!mounted || keyBytes == null) return;
-    await _loadWithBytes(path, keyBytes!);
+    );
+    await _dialog(_Cue.openFile, () => Navigator.of(context).push(route));
+    // The field is still drawn while the dialog animates out: free it after.
+    hexInput.clear();
+    unawaited(route.completed.whenComplete(() {
+      hexInput.dispose();
+      hexFocus.dispose();
+    }));
+    return keyBytes;
   }
 
   /// Scan the provisional-key QR, returning the 16 raw key bytes or null. Uses
@@ -5040,6 +5567,15 @@ enum _Cmd {
   halt(CommandContext.setup, 9),
   copyKey(CommandContext.setup, 10),
   copyDigest(CommandContext.setup, 11),
+  nextDue(CommandContext.train, 0),
+  recall(CommandContext.train, 1),
+  showAnswer(CommandContext.train, 2),
+  progress(CommandContext.train, 3),
+  gradeAgain(CommandContext.train, 4),
+  gradeHard(CommandContext.train, 5),
+  gradeGood(CommandContext.train, 6),
+  gradeEasy(CommandContext.train, 7),
+  saveProgress(CommandContext.train, 8),
   prevStop(CommandContext.path, 0),
   nextStop(CommandContext.path, 1),
   rhoZoom(CommandContext.path, 2),
@@ -5317,6 +5853,25 @@ class _HuePainter extends CustomPainter {
   bool shouldRepaint(_HuePainter old) =>
       old.selected != selected || old.focused != focused;
 }
+
+/// The device's clock, for the CPNF scheduler.
+class _SystemClock implements Clock {
+  const _SystemClock();
+
+  @override
+  DateTime now() => DateTime.now();
+}
+
+/// [t] as a local date, YYYY-MM-DD.
+String _dateText(DateTime t) {
+  final DateTime l = t.toLocal();
+  String two(int v) => v.toString().padLeft(2, '0');
+  return '${l.year}-${two(l.month)}-${two(l.day)}';
+}
+
+/// Where an attempt at a map stands in Train mode: recalling (its point
+/// hidden), found and awaiting the user's grade, or answered (shown).
+enum _TrainStep { recall, found, answered }
 
 /// A confirmation rendered inline in the console (instead of a modal dialog).
 /// The console's action buttons complete [completer] with the user's choice.

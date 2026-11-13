@@ -8,19 +8,35 @@ import 'keyboard_layout.dart';
 /// with Alt and one of the board's top-row keys (as selecting a unit switches
 /// its command card).
 enum CommandContext {
-  main('Main', Icons.home),
-  setup('Setup', Icons.tune),
-  path('Path', Icons.route),
-  view('View', Icons.palette);
+  main('Main', Icons.home, 0),
+  setup('Setup', Icons.tune, 1),
+  train('Train', Icons.school, 1),
+  path('Path', Icons.route, 2),
+  view('View', Icons.palette, 3);
 
-  const CommandContext(this.label, this.icon);
+  const CommandContext(this.label, this.icon, this.key);
   final String label;
   final IconData icon;
 
   /// The board key (index into [kBoardKeys]) that, with Alt, selects it: the
-  /// top row, left to right.
-  int get key => index;
+  /// top row, left to right. Setup and Train share one: each mode shows one
+  /// of them ([kSetupContexts], [kTrainContexts]).
+  final int key;
 }
+
+/// The contexts the board shows in Setup mode, and in Train mode.
+const List<CommandContext> kSetupContexts = <CommandContext>[
+  CommandContext.main,
+  CommandContext.setup,
+  CommandContext.path,
+  CommandContext.view,
+];
+const List<CommandContext> kTrainContexts = <CommandContext>[
+  CommandContext.main,
+  CommandContext.train,
+  CommandContext.path,
+  CommandContext.view,
+];
 
 /// One command on the board: what it shows and what it does. [enabled] is
 /// asked at every build; a disabled command stays in place, greyed out.
@@ -102,10 +118,14 @@ class CommandBoard extends StatelessWidget {
     required this.onExplain,
     required this.onCue,
     required this.colour,
+    this.contexts = kSetupContexts,
   });
 
   /// The context shown.
   final CommandContext active;
+
+  /// The tabs, in order.
+  final List<CommandContext> contexts;
 
   /// Its commands, one per board key ([kBoardKeys] order); null for an empty
   /// slot.
@@ -130,7 +150,7 @@ class CommandBoard extends StatelessWidget {
         Row(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            for (final CommandContext c in CommandContext.values)
+            for (final CommandContext c in contexts)
               Padding(
                 padding: const EdgeInsets.only(right: kBoardGap),
                 child: _Tab(

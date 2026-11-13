@@ -162,4 +162,13 @@ void main() {
     expect(find.byType(D20Glyph), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  test('Train shows its board in Setup’s place, on the same key', () {
+    expect(kTrainContexts.length, kSetupContexts.length);
+    expect(kTrainContexts, contains(CommandContext.train));
+    expect(kTrainContexts, isNot(contains(CommandContext.setup)));
+    expect(CommandContext.train.key, CommandContext.setup.key);
+    expect(<int>{for (final CommandContext c in kTrainContexts) c.key}.length,
+        kTrainContexts.length);
+  });
 }
