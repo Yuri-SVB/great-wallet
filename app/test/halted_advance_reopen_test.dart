@@ -126,14 +126,17 @@ void main() {
       await tester.pump();
     }
 
-    Future<void> openFile(String hex) async {
+    Future<void> openFile(String hex, {bool prefilled = false}) async {
       await alt(LogicalKeyboardKey.keyQ); // Main board
-      await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
-      await tester.pump();
-      await tester.enterText(find.widgetWithText(TextField, 'File path'), path);
-      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
-      await tester.sendKeyEvent(LogicalKeyboardKey.keyE);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyE); // Open
       await tester.pumpAndSettle();
+      if (prefilled) {
+        // The launch path is filled in.
+        expect(find.widgetWithText(TextField, path), findsOneWidget);
+      } else {
+        await tester.enterText(
+            find.widgetWithText(TextField, 'File path'), path);
+      }
       await tester.enterText(
           find.widgetWithText(TextField, 'Key — 32 or 64 hex digits'), hex);
       await tester.tap(find.widgetWithText(FilledButton, 'Load'));
@@ -166,7 +169,9 @@ void main() {
     expect(find.byIcon(Icons.play_arrow), findsOneWidget); // Resume
 
     await alt(LogicalKeyboardKey.keyQ); // Main board
-    await tester.sendKeyEvent(LogicalKeyboardKey.keyW); // Write
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyW); // Write: its path
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'Save'));
     await tester.pump();
     await settle();
     await alt(LogicalKeyboardKey.keyQ); // copy the key, blind
@@ -187,10 +192,10 @@ void main() {
     await settle();
     await tester.pumpWidget(MaterialApp(
       key: const ValueKey<int>(2),
-      home: Scaffold(body: SetupScreen(core: c)),
+      home: Scaffold(body: SetupScreen(core: c, initialPath: path)),
     ));
     await tester.pump();
-    await openFile(copied!);
+    await openFile(copied!, prefilled: true);
     expect(log(), contains('was halted after 1/$passes passes'));
     await alt(LogicalKeyboardKey.keyW); // Setup board
     expect(find.byIcon(Icons.play_arrow), findsOneWidget); // Resume

@@ -137,14 +137,11 @@ void main() {
         .map((Text t) => t.data ?? '')
         .join('\n');
 
-    // Open the file: Main board › File path (F), the path, Open (E), the key.
-    await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
-    await tester.pump();
-    await tester.enterText(
-        find.widgetWithText(TextField, 'File path'), path);
-    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    // Open the file: Main board › Open (E), its path and its key.
     await tester.sendKeyEvent(LogicalKeyboardKey.keyE);
     await tester.pumpAndSettle();
+    await tester.enterText(
+        find.widgetWithText(TextField, 'File path'), path);
     await tester.enterText(
         find.widgetWithText(TextField, 'Key — 32 or 64 hex digits'), keyHex);
     await tester.tap(find.widgetWithText(FilledButton, 'Load'));

@@ -119,13 +119,10 @@ void main() {
         .map((Text t) => t.data ?? '')
         .join('\n');
 
-    // Open the file: Main board › File path (F), the path, Open (E), the key.
-    await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
-    await tester.pump();
-    await tester.enterText(find.widgetWithText(TextField, 'File path'), path);
-    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    // Open the file: Main board › Open (E), its path and its key.
     await tester.sendKeyEvent(LogicalKeyboardKey.keyE);
     await tester.pumpAndSettle();
+    await tester.enterText(find.widgetWithText(TextField, 'File path'), path);
     await tester.enterText(
         find.widgetWithText(TextField, 'Key — 32 or 64 hex digits'), keyHex);
     await tester.tap(find.widgetWithText(FilledButton, 'Load'));
@@ -133,8 +130,12 @@ void main() {
     await settle();
     expect(log(), contains('Setup loaded.'));
 
-    // Write (W): the key dialog, a fresh 128-bit key.
+    // Write (W): its path asked, the opened file's filled in; then the key
+    // dialog, a fresh 128-bit key.
     await tester.sendKeyEvent(LogicalKeyboardKey.keyW);
+    await tester.pumpAndSettle();
+    expect(find.widgetWithText(TextField, path), findsOneWidget);
+    await tester.tap(find.widgetWithText(FilledButton, 'Save'));
     await tester.pump();
     await settle();
     expect(find.text('Provisional key — 128-bit'), findsOneWidget);

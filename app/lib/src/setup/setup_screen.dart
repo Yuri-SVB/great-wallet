@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart'
     show defaultTargetPlatform, kIsWeb, TargetPlatform;
@@ -173,7 +172,6 @@ class _SetupScreenState extends State<SetupScreen>
   /// shown, or copied only inside the Write/Open dialogs. [_vaultBusy] disables
   /// the controls while an encrypt/decrypt pass runs.
   final TextEditingController _vaultPath = TextEditingController();
-  final FocusNode _vaultPathFocus = FocusNode(debugLabel: 'vault-path');
   bool _vaultBusy = false;
 
   /// True while the memory-hard orbit advance `o_{i+1} = H*(u_i)` is running in a
@@ -697,7 +695,6 @@ press.calibrate.target    tick_soft.wav
     _pointImport.dispose();
     _pointImportFocus.dispose();
     _vaultPath.dispose();
-    _vaultPathFocus.dispose();
     _hotkeys.dispose();
     _iterationsFocus.dispose();
     _profileFocus.dispose();
@@ -1426,9 +1423,10 @@ press.calibrate.target    tick_soft.wav
       case _Cmd.save:
         return BoardCommand(
           name: 'Save setup',
-          help: 'Encrypts this setup to the file path under a provisional key '
-              '(a QR, a password manager, Dragon Dice or your own key): a '
-              'crutch for the memorisation window, deleted at graduation.',
+          help: 'Encrypts this setup to a file, its path asked first, under a '
+              'provisional key (a QR, a password manager, Dragon Dice or your '
+              'own key): a crutch for the memorisation window, deleted at '
+              'graduation.',
           icon: Icons.save,
           enabled: !_vaultBusy,
           run: _writeSetup,
@@ -1436,20 +1434,11 @@ press.calibrate.target    tick_soft.wav
       case _Cmd.open:
         return BoardCommand(
           name: 'Open setup',
-          help: 'Opens an encrypted setup file with its provisional key (scan '
-              'the QR or type the key).',
+          help: 'Opens an encrypted setup file: its path, then its provisional '
+              'key (scan the QR or type the key).',
           icon: Icons.folder_open,
           enabled: !_vaultBusy,
           run: _openSetup,
-        );
-      case _Cmd.templates:
-        return BoardCommand(
-          name: 'Blank QR templates',
-          help: 'Saves the 128- and 256-bit QR skeletons, to print and colour '
-              'in by hand with the key.',
-          icon: Icons.qr_code_2,
-          enabled: !_vaultBusy,
-          run: _exportBlankTemplate,
         );
       case _Cmd.volumeDown:
       case _Cmd.volumeUp:
@@ -1470,19 +1459,13 @@ press.calibrate.target    tick_soft.wav
           active: !_importHidden,
           run: _toggleSensitiveVisibility,
         );
-      case _Cmd.filePath:
-        return BoardCommand(
-          name: 'File path',
-          help: 'Shows the setup file path, where save and open look.',
-          icon: Icons.description,
-          run: _focusVaultPath,
-        );
       case _Cmd.reset:
         return BoardCommand(
-          name: 'Reset',
-          help: 'Clears the setup — σ, every point and stage — after asking. '
-              'Not while an advance runs: halt it first.',
-          icon: Icons.restart_alt,
+          name: 'New setup',
+          help: 'Starts a new setup, clearing this one — σ, every point and '
+              'stage — after asking. Not while an advance runs: halt it '
+              'first.',
+          icon: Icons.note_add,
           enabled: !_busy,
           run: _confirmReset,
         );
@@ -3325,7 +3308,7 @@ press.calibrate.target    tick_soft.wav
     final String path = _vaultPath.text.trim();
     if (path.isEmpty) {
       _sounds.play(UiSound.denyInput);
-      _toast('Enter the setup file path (${_hint(_Cmd.filePath)}).');
+      _toast('Open the setup file first (${_hint(_Cmd.open)}).');
       return;
     }
     final Uint8List? key =
@@ -4257,8 +4240,6 @@ press.calibrate.target    tick_soft.wav
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: <Widget>[
-                  if (_paneField[CommandContext.main] == _Field.vault)
-                    _vaultPathField(),
                   if (_vaultBusy)
                     const Padding(
                       padding: EdgeInsets.only(top: 8),
@@ -4713,52 +4694,18 @@ press.calibrate.target    tick_soft.wav
     return null;
   }
 
-  /// Provisional-key save / load: an encrypted on-disk copy of the setup, kept
-  /// only across the memorisation window and destroyed at graduation.
-  Widget _vaultPathField() {
-    // Heading + explanation live in the console (focus _Field.vault). The
-    // provisional key is entered / shown / copied only inside the Write and
-    // Open dialogs — never in a panel field — so it is never an idle on-screen
-    // artifact.
-    return _track(
-      _Field.vault,
-      TextField(
-        controller: _vaultPath,
-        focusNode: _vaultPathFocus,
-        enabled: !_vaultBusy,
-        maxLines: 1,
-        autocorrect: false,
-        enableSuggestions: false,
-        decoration: const InputDecoration(
-          isDense: true,
-          border: OutlineInputBorder(),
-          labelText: 'File path',
-          hintText: '/path/to/setup.gwvault',
-        ),
-      ),
-    );
-  }
-
-  /// Bring up the setup file path field (Main board).
-  void _focusVaultPath() =>
-      _showField(_Field.vault, _vaultPathFocus, 'setup file path');
-
-  /// Write (save) the settled orbit setup to the file path as an
-  /// [OrbitVault], encrypted under a fresh app-generated 128-bit key, then
-  /// open the key dialog. The key can be overridden with the user's own
-  /// entropy from inside that dialog.
+  /// Write (save) the settled orbit setup as an [OrbitVault] to the path
+  /// asked for, encrypted under a fresh app-generated 128-bit key, then open
+  /// the key dialog. The key can be overridden with the user's own entropy
+  /// from inside that dialog.
   Future<void> _writeSetup() async {
     if (!_orbitSettled) {
       _sounds.play(UiSound.denyInput);
       _toast('Finish a setup first — there is nothing to write yet.');
       return;
     }
-    final String path = _vaultPath.text.trim();
-    if (path.isEmpty) {
-      _sounds.play(UiSound.denyInput);
-      _toast('Enter a file path.');
-      return;
-    }
+    final String? path = await _askPath();
+    if (!mounted || path == null) return;
     setState(() => _vaultBusy = true);
     final ({String? error, Uint8List? key}) result =
         await _saveOrbitVaultToFile(path);
@@ -4773,38 +4720,132 @@ press.calibrate.target    tick_soft.wav
     await _showKeyDialog(path, result.key!);
   }
 
-  /// Open (load) a saved setup from the file path (O): scan the QR (Q) or type
-  /// the 32- or 64-hex key (Alt+Q focuses the field, Enter loads), Esc to
-  /// cancel. The key is never displayed.
+  /// Open (load) a saved setup: its path and its key in one dialog — scan the
+  /// QR (Q) or type the 32- or 64-hex key (Alt+Q focuses the field, Enter
+  /// loads), Esc to cancel. The key is never displayed.
   Future<void> _openSetup() async {
-    final String path = _vaultPath.text.trim();
-    if (path.isEmpty) {
-      _sounds.play(UiSound.denyInput);
-      _toast('Enter a file path.');
-      return;
-    }
-    final Uint8List? keyBytes =
-        await _enterKey(title: 'Open setup file', action: 'Load');
+    final Uint8List? keyBytes = await _enterKey(
+        title: 'Open setup file', action: 'Load', askPath: true);
     if (!mounted || keyBytes == null) return;
-    await _loadWithBytes(path, keyBytes);
+    await _loadWithBytes(_vaultPath.text.trim(), keyBytes);
   }
+
+  /// The setup file path for a save, asked with the current one filled in
+  /// (Enter takes it, Esc cancels); null if cancelled. The one taken becomes
+  /// the current path.
+  Future<String?> _askPath() async {
+    final TextEditingController input =
+        TextEditingController(text: _vaultPath.text.trim());
+    String? path;
+    final DialogRoute<void> route = DialogRoute<void>(
+      context: context,
+      builder: (BuildContext ctx) {
+        void take() {
+          final String p = input.text.trim();
+          if (p.isEmpty) {
+            _sounds.play(UiSound.denyInput);
+            _toast('Enter a file path.');
+            return;
+          }
+          path = p;
+          Navigator.of(ctx).pop();
+        }
+
+        return CallbackShortcuts(
+          bindings: <ShortcutActivator, VoidCallback>{
+            const SingleActivator(LogicalKeyboardKey.escape): () =>
+                Navigator.of(ctx).pop(),
+          },
+          child: AlertDialog(
+            title: const Text('Save setup file'),
+            content: SizedBox(
+              width: _kPathDialogWidth,
+              child: _pathField(input, autofocus: true, onSubmitted: take),
+            ),
+            actions: <Widget>[
+              TextButton(
+                onPressed: _press(_Cue.openCancel, () => Navigator.of(ctx).pop()),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: _press(_Cue.openLoad, take),
+                child: const Text('Save'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+    await _dialog(_Cue.openFile, () => Navigator.of(context).push(route));
+    unawaited(route.completed.whenComplete(input.dispose));
+    final String? taken = path;
+    if (taken != null) _vaultPath.text = taken;
+    return taken;
+  }
+
+  /// Width of the dialogs that ask for a file path.
+  static const double _kPathDialogWidth = 420;
+
+  /// A setup file path field.
+  Widget _pathField(
+    TextEditingController controller, {
+    FocusNode? focusNode,
+    bool autofocus = false,
+    required VoidCallback onSubmitted,
+  }) =>
+      TextField(
+        controller: controller,
+        focusNode: focusNode,
+        autofocus: autofocus,
+        autocorrect: false,
+        enableSuggestions: false,
+        maxLines: 1,
+        onSubmitted: (_) => onSubmitted(),
+        decoration: const InputDecoration(
+          isDense: true,
+          border: OutlineInputBorder(),
+          labelText: 'File path',
+          hintText: '/path/to/setup.gw',
+        ),
+      );
 
   /// The provisional key, scanned from its QR (Q) or typed as 32 or 64 hex
   /// (Alt+Q focuses the field, Enter takes it); null if cancelled (Esc). The
-  /// key is never displayed; the caller wipes it.
+  /// key is never displayed; the caller wipes it. With [askPath] the file's
+  /// path is asked too, above the key, the current one filled in; the one
+  /// taken becomes the current path.
   Future<Uint8List?> _enterKey({
     required String title,
     required String action,
+    bool askPath = false,
   }) async {
     final bool canScan = _scanSupported || _desktopScanSupported;
     final TextEditingController hexInput = TextEditingController();
     final FocusNode hexFocus = FocusNode(debugLabel: 'open-hex');
+    final TextEditingController pathInput =
+        TextEditingController(text: _vaultPath.text.trim());
+    final FocusNode pathFocus = FocusNode(debugLabel: 'open-path');
     Uint8List? keyBytes;
 
     final DialogRoute<void> route = DialogRoute<void>(
       context: context,
       builder: (BuildContext ctx) {
+        // The path, when asked: it must be there before a key is taken.
+        bool pathTaken() {
+          if (!askPath) return true;
+          final String p = pathInput.text.trim();
+          if (p.isEmpty) {
+            _sounds.play(UiSound.denyInput);
+            _toast('Enter a file path.');
+            pathFocus.requestFocus();
+            return false;
+          }
+          _vaultPath.text = p;
+          return true;
+        }
+
         void loadHex() {
+          if (!pathTaken()) return;
           try {
             keyBytes = SetupCrypto.hexToKey(hexInput.text);
           } on FormatException catch (e) {
@@ -4816,30 +4857,58 @@ press.calibrate.target    tick_soft.wav
         }
 
         Future<void> scan() async {
+          if (!pathTaken()) return;
           final Uint8List? k = await _scanKey();
           if (k == null) return;
           keyBytes = k;
           if (ctx.mounted) Navigator.of(ctx).pop();
         }
 
-        return CallbackShortcuts(
-          bindings: <ShortcutActivator, VoidCallback>{
-            if (canScan) const SingleActivator(LogicalKeyboardKey.keyQ): scan,
-            const SingleActivator(LogicalKeyboardKey.keyQ, alt: true): () =>
-                hexFocus.requestFocus(),
-            const SingleActivator(LogicalKeyboardKey.escape): () =>
-                Navigator.of(ctx).pop(),
+        return Focus(
+          // Q scans and Alt+Q types the key, unless a field is being typed in
+          // (a path holds letters): there the keys are the field's.
+          onKeyEvent: (FocusNode node, KeyEvent e) {
+            if (e is! KeyDownEvent) return KeyEventResult.ignored;
+            if (e.logicalKey == LogicalKeyboardKey.escape) {
+              Navigator.of(ctx).pop();
+              return KeyEventResult.handled;
+            }
+            if (e.logicalKey != LogicalKeyboardKey.keyQ) {
+              return KeyEventResult.ignored;
+            }
+            final bool alt = HardwareKeyboard.instance.isAltPressed;
+            if (!alt && (pathFocus.hasFocus || hexFocus.hasFocus)) {
+              return KeyEventResult.ignored;
+            }
+            if (alt) {
+              hexFocus.requestFocus();
+            } else if (canScan) {
+              unawaited(scan());
+            } else {
+              return KeyEventResult.ignored;
+            }
+            return KeyEventResult.handled;
           },
           child: Focus(
-            autofocus: true,
+            // With no path yet, typing starts there; else Q scans at once.
+            autofocus: !askPath || pathInput.text.isNotEmpty,
             child: AlertDialog(
               title: Text(title),
               content: SizedBox(
-                width: 340,
+                width: askPath ? _kPathDialogWidth : 340,
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: <Widget>[
+                    if (askPath) ...<Widget>[
+                      _pathField(
+                        pathInput,
+                        focusNode: pathFocus,
+                        autofocus: pathInput.text.isEmpty,
+                        onSubmitted: () => hexFocus.requestFocus(),
+                      ),
+                      const SizedBox(height: 12),
+                    ],
                     Text(
                       canScan
                           ? 'Q — scan the QR with the camera.  Alt+Q — type the '
@@ -4894,6 +4963,8 @@ press.calibrate.target    tick_soft.wav
     unawaited(route.completed.whenComplete(() {
       hexInput.dispose();
       hexFocus.dispose();
+      pathInput.dispose();
+      pathFocus.dispose();
     }));
     return keyBytes;
   }
@@ -5354,60 +5425,6 @@ press.calibrate.target    tick_soft.wav
     }
   }
 
-  /// Export both reusable **blank** hand-fill templates (the key-independent
-  /// skeleton: finders, timing, dark module, the v2 alignment pattern, over a
-  /// highlighted module grid) as PNGs in the vault path's folder — one per key
-  /// size, named `128-bit-…` / `256-bit-provisional-key-qr-template.png` so the
-  /// size leads the file name. They hold no secret; print and hand-colour.
-  Future<void> _exportBlankTemplate() async {
-    final String base = _vaultPath.text.trim();
-    if (base.isEmpty) {
-      _sounds.play(UiSound.denyInput);
-      _toast('Enter a file path first; the templates save in its folder.');
-      return;
-    }
-    final String dir = File(base).parent.path;
-    final String sep = Platform.pathSeparator;
-    try {
-      final List<String> saved = <String>[];
-      for (final int lenBytes in <int>[
-        SetupCrypto.keyLenBytes,
-        SetupCrypto.keyLenBytes256,
-      ]) {
-        final Uint8List png = await _renderBlankTemplatePng(lenBytes);
-        final String name =
-            '${lenBytes * 8}-bit-provisional-key-qr-template.png';
-        await File('$dir$sep$name').writeAsBytes(png, flush: true);
-        saved.add(name);
-      }
-      if (!mounted) return;
-      _sounds.play(UiSound.exportOk);
-      _toast('Blank templates saved in $dir: ${saved.join(', ')}');
-    } catch (e) {
-      if (mounted) _toast('Could not save the templates (${e.runtimeType}).');
-    }
-  }
-
-  /// Render the blank hand-fill skeleton PNG for a [lenBytes]-byte key (v1 for
-  /// 16, v2 for 32). A dummy all-zero key yields only the module geometry; only
-  /// the key-independent cells are drawn, so it leaks nothing.
-  Future<Uint8List> _renderBlankTemplatePng(int lenBytes) async {
-    final qr.QrImage matrix = _keyMatrix(Uint8List(lenBytes));
-    // 24 px per module, including the painter's 4-module quiet zone each side.
-    final int px = (matrix.moduleCount + 2 * _QrPainter.quiet) * 24;
-    final ui.PictureRecorder recorder = ui.PictureRecorder();
-    final Canvas canvas = Canvas(recorder);
-    _QrPainter(matrix, _QrView.blank)
-        .paint(canvas, Size(px.toDouble(), px.toDouble()));
-    final ui.Picture picture = recorder.endRecording();
-    final ui.Image image = await picture.toImage(px, px);
-    final ByteData? png = await image.toByteData(format: ui.ImageByteFormat.png);
-    image.dispose();
-    picture.dispose();
-    if (png == null) throw StateError('template render failed');
-    return png.buffer.asUint8List();
-  }
-
   /// The inline hex editor for a point: a masked field labelled with
   /// [title], and Apply/Cancel (Enter / Esc).
   Widget _importEditorBody({
@@ -5699,12 +5716,6 @@ press.calibrate.target    tick_soft.wav
             'blind, never shown.';
       case _Field.hue:
         return 'Colour scheme: ${_hue.name}. ← → to cycle through the six hues.';
-      case _Field.vault:
-        return 'Provisional key: encrypt this setup to a file (AES-256-GCM) for '
-            'the memorisation window — a transient crutch, not a backup; delete '
-            'it at graduation. Protect it with your own password (managed/deleted '
-            'in a password manager) or an app-generated key shown as a small QR '
-            'to print and keep OFFLINE. The file is useless without its secret.';
     }
   }
 
@@ -5795,21 +5806,18 @@ enum _Field {
   profile,
   exportLabel,
   hue,
-  vault,
 }
 
 /// The command board's commands, each at its context and position (an index
 /// into [kBoardKeys]: rows top to bottom, left to right).
 enum _Cmd {
-  layout(CommandContext.main, 0),
+  reset(CommandContext.main, 0),
   save(CommandContext.main, 1),
   open(CommandContext.main, 2),
-  templates(CommandContext.main, 3),
   volumeDown(CommandContext.main, 4),
   volumeUp(CommandContext.main, 5),
   secrets(CommandContext.main, 6),
-  filePath(CommandContext.main, 7),
-  reset(CommandContext.main, 8),
+  layout(CommandContext.main, 7),
   label(CommandContext.setup, 0),
   profile(CommandContext.setup, 1),
   steps(CommandContext.setup, 2),
