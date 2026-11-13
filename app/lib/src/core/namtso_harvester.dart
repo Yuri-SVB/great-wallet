@@ -44,6 +44,59 @@ class NamtsoHarvester {
     String explorer = '',
     Duration timeout = defaultTimeout,
   }) {
+    return _session(
+      args: <String>[
+        'harvest',
+        '--date',
+        _isoDate(date),
+        '--network',
+        network,
+        '--window',
+        '$window',
+        '--explorer',
+        explorer,
+      ],
+      verb: 'harvest',
+      timeout: timeout,
+      what: 'a σ hex line',
+    );
+  }
+
+  /// Start a cancellable, timeout-bounded **unbury** (Namtso spec §15): the 64
+  /// bytes buried under [label] on [date]. [HarvestSession.result] completes
+  /// with them as hex — or fails with [NamtsoUnavailable], [NamtsoCancelled],
+  /// or [NamtsoError] (a Namtso build that cannot unbury yet says so).
+  HarvestSession unbury({
+    required String label,
+    required DateTime date,
+    String explorer = '',
+    Duration timeout = defaultTimeout,
+  }) {
+    return _session(
+      args: <String>[
+        'unbury',
+        '--label',
+        label,
+        '--date',
+        _isoDate(date),
+        '--explorer',
+        explorer,
+      ],
+      verb: 'unbury',
+      timeout: timeout,
+      what: 'a data hex line',
+    );
+  }
+
+  /// Run `namtso` with [args] ([verb] names it in messages) and take the hex
+  /// on its first stdout line ([what] describes it). Cancellable and bounded
+  /// by [timeout].
+  HarvestSession _session({
+    required List<String> args,
+    required String verb,
+    required Duration timeout,
+    required String what,
+  }) {
     final Completer<String> completer = Completer<String>();
     Process? proc;
     bool cancelled = false;
@@ -58,23 +111,11 @@ class NamtsoHarvester {
 
     Future<void> run() async {
       if (!isSupported) {
-        completer.completeError(const NamtsoUnavailable(
-            'Namtso harvest needs a desktop build (Process support). '
-            'Enter σ manually on this platform.'));
+        completer.completeError(NamtsoUnavailable(
+            'Namtso $verb needs a desktop build (Process support).'));
         return;
       }
       final String bin = _locateBinary();
-      final List<String> args = <String>[
-        'harvest',
-        '--date',
-        _isoDate(date),
-        '--network',
-        network,
-        '--window',
-        '$window',
-        '--explorer',
-        explorer,
-      ];
       try {
         proc = await Process.start(bin, args);
       } on ProcessException catch (e) {
@@ -115,33 +156,36 @@ class NamtsoHarvester {
       if (timedOut) {
         if (!completer.isCompleted) {
           completer.completeError(NamtsoError(
-              'namtso harvest timed out after ${timeout.inSeconds}s '
-              '(network unreachable?). Try a --headers/--node source, or '
-              'enter σ manually.'));
+              'namtso $verb timed out after ${timeout.inSeconds}s '
+              '(network unreachable?).'));
         }
         return;
       }
       if (code != 0) {
         if (!completer.isCompleted) {
+          // An older namtso does not know the subcommand at all.
+          final bool unknown = err.contains(verb) &&
+              (err.contains('unrecognized') || err.contains('invalid'));
           final String reason = _extractError(err);
-          completer.completeError(NamtsoError(
-              'namtso harvest failed (exit $code)'
-              '${reason.isEmpty ? '' : ': $reason'}'));
+          completer.completeError(NamtsoError(unknown
+              ? 'This Namtso build cannot $verb yet.'
+              : 'namtso $verb failed (exit $code)'
+                  '${reason.isEmpty ? '' : ': $reason'}'));
         }
         return;
       }
       final String first = out
           .split('\n')
           .firstWhere((String l) => l.trim().isNotEmpty, orElse: () => '');
-      final String sigma = first.trim().toLowerCase();
-      if (!_looksLikeSigmaHex(sigma)) {
+      final String hex = first.trim().toLowerCase();
+      if (!_looksLikeSigmaHex(hex)) {
         if (!completer.isCompleted) {
           completer.completeError(NamtsoError('namtso output did not start '
-              'with a σ hex line (got "${_ellipsis(first)}").'));
+              'with $what (got "${_ellipsis(first)}").'));
         }
         return;
       }
-      if (!completer.isCompleted) completer.complete(sigma);
+      if (!completer.isCompleted) completer.complete(hex);
     }
 
     // Fire-and-forget: run() drives the process; failures land on the future.

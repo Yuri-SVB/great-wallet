@@ -48,6 +48,8 @@ import '../ffi/fixed.dart';
 import 'card_stats.dart';
 import 'cover_writes.dart';
 import 'desktop_qr_scanner.dart';
+import 'fact_cards.dart';
+import 'fact_review.dart';
 import 'file_wipe.dart';
 import 'orbit_vault.dart';
 import 'setup_crypto.dart';
@@ -261,6 +263,24 @@ class _SetupScreenState extends State<SetupScreen>
 
   /// Where the attempt at the shown map stands.
   _TrainStep _step = _TrainStep.recall;
+
+  /// Your own fact cards, by fact id: prompts and answers. Saved with the
+  /// setup; their schedules are in the deck.
+  final Map<String, CustomFact> _customFacts = <String, CustomFact>{};
+
+  /// The deck's fact cards this app reviews: the salt's, the supply chain's
+  /// (when on), and your own.
+  List<MemCard> get _factCards => <MemCard>[
+        for (final MemCard c in _deck?.cards ?? const <MemCard>[])
+          if (isReviewedFact(c) &&
+              (!c.factId.startsWith(kCustomPrefix) ||
+                  _customFacts.containsKey(c.factId)))
+            c,
+      ];
+
+  /// Whether the supply-chain card is on.
+  bool get _provenanceOn =>
+      _deck?.cards.any((MemCard c) => c.factId == kProvenanceFact) ?? false;
 
   /// The time one memory-hard pass takes at [_profile], in seconds: from the
   /// calibration, refined by real passes; null until one was timed.
@@ -978,6 +998,8 @@ press.calibrate.target    tick_soft.wav
                               children: <Widget>[
                                 _stageTabs(),
                                 _slotTabs(),
+                                if (_training && _provenanceOn)
+                                  _factTabs(),
                               ],
                             ),
                           ),
@@ -1009,6 +1031,14 @@ press.calibrate.target    tick_soft.wav
   void _selectSlot(int i) {
     if (i < 0 || i > _maxSlot) {
       _sounds.play(UiSound.denyBlocked);
+      return;
+    }
+    // In Train, stage 0's slot 0 is the salt's card.
+    if (_training && _activeStage == 0 && i == 0 && _deck != null) {
+      final MemCard salt = _deck!.cards.firstWhere(
+          (MemCard c) => c.factId == kSaltFact,
+          orElse: () => MemCard.fact(kSaltFact));
+      unawaited(_reviewFact(salt));
       return;
     }
     if (i == _slotIndex) {
@@ -1081,6 +1111,32 @@ press.calibrate.target    tick_soft.wav
                   ),
                 ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// The third row (Train): the supply-chain card, opened by clicking it.
+  Widget _factTabs() {
+    const String help = 'Supply chain: could you rebuild this app yourself? '
+        'Paste the release\'s commit digest after cloning and building it '
+        'anew. Click to review.';
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6),
+        child: MouseRegion(
+          onEnter: (_) => _explain(help),
+          onExit: (_) => _explain(null),
+          child: OutlinedButton.icon(
+            onPressed: () {
+              final MemCard card = _deck!.cards
+                  .firstWhere((MemCard c) => c.factId == kProvenanceFact);
+              unawaited(_reviewFact(card));
+            },
+            icon: const Icon(Icons.verified_outlined),
+            label: const Text('Supply chain'),
           ),
         ),
       ),
@@ -1542,6 +1598,16 @@ press.calibrate.target    tick_soft.wav
           icon: Icons.school_outlined,
           enabled: _trainReady,
           run: () => unawaited(_showGraduation()),
+        );
+      case _Cmd.cards:
+        return BoardCommand(
+          name: 'Cards',
+          help: 'The fact cards: the salt\'s (always on), the supply '
+              'chain\'s (on or off) and your own — add or remove them '
+              '(at most $kMaxCustomFacts, $kMaxFactChars characters each).',
+          icon: Icons.style,
+          enabled: _orbitSettled,
+          run: () => unawaited(_showCardsManager()),
         );
       case _Cmd.wipe:
         return BoardCommand(
@@ -2104,6 +2170,12 @@ press.calibrate.target    tick_soft.wav
       final MemCard? card = deck.map(key.$1, key.$2);
       if (card != null) deck = deck.withCard(card.copyWith(cues: _cuesOf(r)));
     });
+    // The salt's card is always on; your own cards each have one.
+    for (final String id in <String>[kSaltFact, ..._customFacts.keys]) {
+      if (!deck.cards.any((MemCard c) => c.factId == id)) {
+        deck = deck.withCard(MemCard.fact(id));
+      }
+    }
     return deck;
   }
 
@@ -3156,8 +3228,11 @@ press.calibrate.target    tick_soft.wav
 
   /// Why an attempt at [card] now is practice, in words, or null if it is
   /// graded ([ReviewSession.practiceReasonFor]).
-  String? _practiceReason(MemCard card) =>
-      switch (_review.practiceReasonFor(card, aided: _attemptAided)) {
+  String? _practiceReason(MemCard card) => _practiceText(
+      _review.practiceReasonFor(card, aided: _attemptAided), card);
+
+  /// [r], why an attempt at [card] is practice, in words.
+  static String? _practiceText(PracticeReason? r, MemCard card) => switch (r) {
         null => null,
         PracticeReason.stopsShown => 'stops count as targets',
         PracticeReason.routeChanged => 'the route changed during the attempt',
@@ -3331,6 +3406,46 @@ press.calibrate.target    tick_soft.wav
     return next;
   }
 
+  /// Review the fact [card] in its dialog, and grade it as answered there.
+  Future<void> _reviewFact(MemCard card) async {
+    final String? practice =
+        _practiceText(_review.practiceReasonFor(card), card);
+    final CustomFact? custom = _customFacts[card.factId];
+    final Widget? dialog = switch (card.factId) {
+      kSaltFact => SaltDialog(
+          sigma: _sigmaCtrl.text,
+          orbits: <List<int>?>[for (final Uint8List? o in _orbitO) o],
+          harvest: (DateTime d) => const NamtsoHarvester()
+              .start(date: d, explorer: _explorerCtrl.text.trim())
+              .result,
+          unbury: (String label, DateTime d) => const NamtsoHarvester()
+              .unbury(
+                  label: label, date: d, explorer: _explorerCtrl.text.trim())
+              .result,
+          practice: practice,
+        ),
+      kProvenanceFact => ProvenanceDialog(practice: practice),
+      _ when custom != null =>
+        CustomFactDialog(fact: custom, practice: practice),
+      _ => null,
+    };
+    if (dialog == null) return;
+    final Grade? g = await _dialog(
+      _Cue.fact,
+      () => showDialog<Grade>(
+        context: context,
+        barrierDismissible: false,
+        builder: (BuildContext _) => dialog,
+      ),
+    );
+    if (!mounted || g == null || practice != null) return;
+    final MemCard next = _record(card, g);
+    _sounds.play(g == Grade.again ? UiSound.denyMiss : UiSound.selectPoint);
+    _toast('${factName(card, _customFacts)}: graded ${g.name}, next review '
+        '${_dueText(next)}. Save progress '
+        '(${_layout.keys[_Cmd.saveProgress.slot]}) to keep it.');
+  }
+
   /// Show the shown map's point. Before an answer, on a graded attempt, it
   /// is giving up: Again.
   void _showAnswer() {
@@ -3363,15 +3478,22 @@ press.calibrate.target    tick_soft.wav
 
   /// Go to the next due map after the shown one, the longest-due first.
   void _gotoNextDue() {
-    final List<MemCard> due = _schedule.queue(_trainCards).due;
+    final List<MemCard> due =
+        _schedule.queue(<MemCard>[..._trainCards, ..._factCards]).due;
     if (due.isEmpty) {
       _sounds.play(UiSound.denyBlocked);
       _toast('Nothing is due.');
       return;
     }
     final int at = due.indexWhere((MemCard c) =>
-        c.stageIndex == _activeStage && c.slot == _slotIndex);
+        c.kind == CardKind.point &&
+        c.stageIndex == _activeStage &&
+        c.slot == _slotIndex);
     final MemCard next = due[(at + 1) % due.length];
+    if (next.kind == CardKind.fact) {
+      unawaited(_reviewFact(next));
+      return;
+    }
     if (next.stageIndex != _activeStage) _setOrbitStage(next.stageIndex);
     if (next.slot != _slotIndex) {
       _selectSlot(next.slot);
@@ -4045,6 +4167,7 @@ press.calibrate.target    tick_soft.wav
     _boardDecoCache.clear();
     _mapsChanged((int _, int __) => true);
     _deck = null;
+    _customFacts.clear();
     _dropPaths();
     _boardCanonicalView = false;
   }
@@ -4770,6 +4893,7 @@ press.calibrate.target    tick_soft.wav
       gapSeconds: _gapSeconds,
       epsilon:
           _epsilon == GraduationParams.defaultEpsilon ? null : _epsilon,
+      facts: _customFacts.values.toList(),
       sigma: _sigmaCtrl.text.trim().replaceAll(RegExp(r'\s'), ''),
       iterations: _iterations,
       profile: _profile,
@@ -4953,6 +5077,11 @@ press.calibrate.target    tick_soft.wav
       _passSeconds = vault.passSeconds;
       _gapSeconds = vault.gapSeconds;
       _epsilon = vault.epsilon ?? GraduationParams.defaultEpsilon;
+      _customFacts
+        ..clear()
+        ..addAll(<String, CustomFact>{
+          for (final CustomFact f in vault.facts) f.id: f,
+        });
       for (int i = 1; i <= deepest; i++) {
         // o₀ is never stored: [_stageOrbit] re-derives it from σ on demand.
         _orbitO[i] = orbits[i];
@@ -6033,6 +6162,162 @@ press.calibrate.target    tick_soft.wav
 
   /// Reset behind an inline console confirmation, so the Reset key (or a stray
   /// keypress) cannot discard a setup by accident.
+  /// Width of the cards manager.
+  static const double _kCardsWidth = 520;
+
+  /// The cards manager (Main board X): the salt's card, the supply chain's
+  /// (on or off, with what it is), and your own (added and removed here).
+  Future<void> _showCardsManager() async {
+    setState(() => _deck ??= _deckForSave(_orbitDeepestStage));
+    final TextEditingController prompt = TextEditingController();
+    final TextEditingController answer = TextEditingController();
+    final DialogRoute<void> route = DialogRoute<void>(
+      context: context,
+      builder: (BuildContext ctx) => StatefulBuilder(
+        builder: (BuildContext ctx, void Function(void Function()) setLocal) {
+          void change(void Function() f) {
+            setState(() {
+              f();
+              _deckDirty = true;
+            });
+            setLocal(() {});
+          }
+
+          void add() {
+            final String p = prompt.text.trim();
+            final String a = answer.text.trim();
+            if (p.isEmpty || a.isEmpty) {
+              _sounds.play(UiSound.denyInput);
+              _toast('A card needs a prompt and an answer.');
+              return;
+            }
+            if (_customFacts.length >= kMaxCustomFacts) {
+              _sounds.play(UiSound.denyBlocked);
+              _toast('At most $kMaxCustomFacts cards of your own.');
+              return;
+            }
+            int n = 1;
+            while (_customFacts.containsKey('$kCustomPrefix$n')) {
+              n++;
+            }
+            final String id = '$kCustomPrefix$n';
+            change(() {
+              _customFacts[id] = CustomFact(id: id, prompt: p, answer: a);
+              _deck = _deck!.withCard(MemCard.fact(id));
+            });
+            prompt.clear();
+            answer.clear();
+          }
+
+          void remove(String id) => change(() {
+                _customFacts.remove(id);
+                _deck = Deck(<MemCard>[
+                  for (final MemCard c in _deck!.cards)
+                    if (c.factId != id) c,
+                ]);
+              });
+
+          void provenance(bool on) => change(() {
+                _deck = on
+                    ? _deck!.withCard(MemCard.fact(kProvenanceFact))
+                    : Deck(<MemCard>[
+                        for (final MemCard c in _deck!.cards)
+                          if (c.factId != kProvenanceFact) c,
+                      ]);
+              });
+
+          return CallbackShortcuts(
+            bindings: <ShortcutActivator, VoidCallback>{
+              const SingleActivator(LogicalKeyboardKey.escape): () =>
+                  Navigator.of(ctx).pop(),
+            },
+            child: AlertDialog(
+              title: const Text('Cards'),
+              content: SizedBox(
+                width: _kCardsWidth,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: <Widget>[
+                      const ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.water_drop_outlined),
+                        title: Text('Salt (Namtso)'),
+                        subtitle: Text('Always on: stage 0, slot 0 in Train.'),
+                      ),
+                      SwitchListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        secondary: const Icon(Icons.verified_outlined),
+                        title: const Text('Supply chain'),
+                        subtitle: const Text(kProvenanceAbout),
+                        value: _provenanceOn,
+                        onChanged: provenance,
+                      ),
+                      const Divider(),
+                      Text('Your own cards (${_customFacts.length} of '
+                          '$kMaxCustomFacts)'),
+                      for (final CustomFact f in _customFacts.values)
+                        ListTile(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          title: Text(f.prompt),
+                          trailing: IconButton(
+                            tooltip: 'Remove',
+                            icon: const Icon(Icons.delete_outline),
+                            onPressed: () => remove(f.id),
+                          ),
+                        ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: prompt,
+                        maxLength: kMaxFactChars,
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          border: OutlineInputBorder(),
+                          labelText: 'Prompt',
+                          hintText: 'e.g. Export salt of the signing key',
+                        ),
+                      ),
+                      TextField(
+                        controller: answer,
+                        maxLength: kMaxFactChars,
+                        onSubmitted: (_) => add(),
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          border: OutlineInputBorder(),
+                          labelText: 'Answer',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: <Widget>[
+                TextButton(
+                  onPressed: _press(_Cue.cardsAdd, add),
+                  child: const Text('Add card'),
+                ),
+                FilledButton(
+                  onPressed: _press(
+                      _Cue.cardsClose, () => Navigator.of(ctx).pop()),
+                  child: const Text('Done'),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+    await _dialog(_Cue.cards, () => Navigator.of(context).push(route));
+    unawaited(route.completed.whenComplete(() {
+      prompt.dispose();
+      answer.dispose();
+    }));
+  }
+
   /// Size of the card stats wizard.
   static const double _kStatsWidth = 760;
   static const double _kStatsHeight = 480;
@@ -6041,7 +6326,7 @@ press.calibrate.target    tick_soft.wav
   /// The card stats wizard (Train, Main board Z), the shown map's card
   /// picked first.
   Future<void> _showCardStats() async {
-    final List<MemCard> cards = _trainCards;
+    final List<MemCard> cards = <MemCard>[..._trainCards, ..._factCards];
     final MemCard? shown = _trainCard;
     final int initial =
         shown == null ? 0 : cards.indexWhere((MemCard c) => c.id == shown.id);
@@ -6062,6 +6347,9 @@ press.calibrate.target    tick_soft.wav
                 padding: const EdgeInsets.all(_kStatsPad),
                 child: CardStatsView(
                   cards: cards,
+                  name: (MemCard c) => c.kind == CardKind.point
+                      ? cardName(c)
+                      : factName(c, _customFacts),
                   schedule: _schedule,
                   now: _schedule.clock.now(),
                   initial: initial < 0 ? 0 : initial,
@@ -6263,6 +6551,7 @@ enum _Cmd {
   secrets(CommandContext.main, 6),
   layout(CommandContext.main, 7),
   stats(CommandContext.main, 8),
+  cards(CommandContext.main, 9),
   wipe(CommandContext.main, 11),
   label(CommandContext.setup, 0),
   profile(CommandContext.setup, 1),
@@ -6350,6 +6639,8 @@ abstract final class _Cue {
   static const String wipe = 'wipe';
   static const String stats = 'stats';
   static const String graduation = 'graduation';
+  static const String cards = 'cards';
+  static const String fact = 'fact';
   static const List<String> dialogs = <String>[
     calibrate,
     calibrateLeave,
@@ -6361,6 +6652,8 @@ abstract final class _Cue {
     wipe,
     stats,
     graduation,
+    cards,
+    fact,
   ];
 
   // Buttons outside the board, under `press.`.
@@ -6389,6 +6682,8 @@ abstract final class _Cue {
   static const String graduationApply = 'graduation.apply';
   static const String graduationCancel = 'graduation.cancel';
   static const String graduationWipe = 'graduation.wipe';
+  static const String cardsAdd = 'cards.add';
+  static const String cardsClose = 'cards.close';
   static const String calibrateClose = 'calibrate.close';
   static const String calibrateBench = 'calibrate.bench';
   static const String calibrateScope = 'calibrate.scope';
@@ -6426,6 +6721,8 @@ abstract final class _Cue {
     graduationApply,
     graduationCancel,
     graduationWipe,
+    cardsAdd,
+    cardsClose,
     calibrateClose,
     calibrateBench,
     calibrateScope,

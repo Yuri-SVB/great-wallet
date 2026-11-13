@@ -53,9 +53,13 @@ class CardStatsView extends StatefulWidget {
     required this.schedule,
     required this.now,
     this.initial = 0,
+    this.name = cardName,
   });
 
   final List<MemCard> cards;
+
+  /// A card's name in the list.
+  final String Function(MemCard) name;
   final MemSchedule schedule;
   final DateTime now;
 
@@ -140,7 +144,7 @@ class _CardStatsViewState extends State<CardStatsView> {
                   ListTile(
                     dense: true,
                     selected: i == _at,
-                    title: Text(cardName(widget.cards[i])),
+                    title: Text(widget.name(widget.cards[i])),
                     onTap: () => setState(() => _at = i),
                   ),
               ],
@@ -151,7 +155,7 @@ class _CardStatsViewState extends State<CardStatsView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
-                Text(cardName(card), style: theme.textTheme.titleMedium),
+                Text(widget.name(card), style: theme.textTheme.titleMedium),
                 const SizedBox(height: _gap / 2),
                 for (final (String label, String value) in _stats(card))
                   Row(

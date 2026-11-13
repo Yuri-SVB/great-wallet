@@ -1,0 +1,202 @@
+import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:great_wallet_app/src/setup/fact_cards.dart';
+import 'package:great_wallet_app/src/setup/fact_review.dart';
+
+/// Fact cards: the matching rules, and the review dialogs — a find takes the
+/// four grades, a miss (or a find that may not be scored) only Again.
+void main() {
+  group('matching', () {
+    test('answers ignore case and extra spaces', () {
+      expect(answerMatches('  Signing-1 ', 'signing-1'), isTrue);
+      expect(answerMatches('our   first  date', 'Our first date'), isTrue);
+      expect(answerMatches('signing-2', 'signing-1'), isFalse);
+    });
+
+    test('σ as hex, any case and spacing', () {
+      expect(sigmaMatches('AB CD 0f', 'abcd0f'), isTrue);
+      expect(sigmaMatches('0xabcd0f', 'ABCD0F'), isTrue);
+      expect(sigmaMatches('', ''), isFalse);
+      expect(sigmaMatches('abcd0e', 'abcd0f'), isFalse);
+    });
+
+    test('the digest: unknown, wrong or this build\'s', () {
+      final String commit = 'a' * kCommitHexDigits;
+      expect(digestMatches(commit), isNull, reason: 'built without a digest');
+      expect(digestMatches('A' * kCommitHexDigits, commit: commit), isTrue);
+      expect(digestMatches('a' * 12, commit: commit), isFalse,
+          reason: 'the full digest is asked');
+    });
+
+    test('a burial matches the stage whose orbit point it is', () {
+      final List<int> o1 = List<int>.generate(64, (int i) => i);
+      final List<int> o2 = List<int>.generate(64, (int i) => 255 - i);
+      expect(buriedStage(o2, <List<int>?>[null, o1, o2]), 2);
+      expect(buriedStage(List<int>.filled(64, 7), <List<int>?>[null, o1]),
+          isNull);
+      expect(hexBytes('0a ff'), <int>[10, 255]);
+      expect(hexBytes('abc'), isNull);
+    });
+
+    test('your own cards round-trip; bad ones are refused', () {
+      const CustomFact f =
+          CustomFact(id: 'misc:1', prompt: 'Export salt', answer: 'SIGN-1');
+      final CustomFact back = CustomFact.fromJson(f.toJson());
+      expect(back.prompt, 'Export salt');
+      expect(
+          () => CustomFact.fromJson(<String, dynamic>{
+                'id': 'other',
+                'prompt': 'p',
+                'answer': 'a',
+              }),
+          throwsFormatException);
+      expect(
+          () => CustomFact.fromJson(<String, dynamic>{
+                'id': 'misc:2',
+                'prompt': 'p',
+                'answer': 'x' * (kMaxFactChars + 1),
+              }),
+          throwsFormatException);
+      expect(isReviewedFact(MemCard.fact('misc:2')), isTrue);
+      expect(isReviewedFact(MemCard.fact('m')), isFalse);
+    });
+  });
+
+  group('dialogs', () {
+    testWidgets('your own card: a find takes the four grades',
+        (WidgetTester tester) async {
+      Grade? got;
+      await tester.pumpWidget(MaterialApp(
+        home: Builder(
+          builder: (BuildContext context) => TextButton(
+            onPressed: () async => got = await showDialog<Grade>(
+              context: context,
+              builder: (BuildContext _) => const CustomFactDialog(
+                fact: CustomFact(id: 'misc:1', prompt: 'Salt?', answer: 'X-1'),
+              ),
+            ),
+            child: const Text('open'),
+          ),
+        ),
+      ));
+      await tester.tap(find.text('open'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), 'x-1 ');
+      await tester.tap(find.text('Check'));
+      await tester.pumpAndSettle();
+      expect(find.text('Right.'), findsOneWidget);
+      expect(find.text('Hard'), findsOneWidget);
+      await tester.tap(find.text('Good'));
+      await tester.pumpAndSettle();
+      expect(got, Grade.good);
+    });
+
+    testWidgets('your own card: a miss shows the answer, only Again',
+        (WidgetTester tester) async {
+      Grade? got;
+      await tester.pumpWidget(MaterialApp(
+        home: Builder(
+          builder: (BuildContext context) => TextButton(
+            onPressed: () async => got = await showDialog<Grade>(
+              context: context,
+              builder: (BuildContext _) => const CustomFactDialog(
+                fact: CustomFact(id: 'misc:1', prompt: 'Salt?', answer: 'X-1'),
+              ),
+            ),
+            child: const Text('open'),
+          ),
+        ),
+      ));
+      await tester.tap(find.text('open'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), 'X-2');
+      await tester.tap(find.text('Check'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('the answer is "X-1"'), findsOneWidget);
+      expect(find.text('Good'), findsNothing);
+      await tester.tap(find.text('Again'));
+      await tester.pumpAndSettle();
+      expect(got, Grade.again);
+    });
+
+    testWidgets('supply chain: without the build confirmed, only Again',
+        (WidgetTester tester) async {
+      final String commit = 'b' * kCommitHexDigits;
+      await tester.pumpWidget(MaterialApp(
+        home: Builder(
+          builder: (BuildContext context) => TextButton(
+            onPressed: () => showDialog<Grade>(
+              context: context,
+              builder: (BuildContext _) => ProvenanceDialog(commit: commit),
+            ),
+            child: const Text('open'),
+          ),
+        ),
+      ));
+      await tester.tap(find.text('open'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), commit);
+      await tester.tap(find.text('Check'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('without the build confirmed'), findsOneWidget);
+      expect(find.text('Easy'), findsNothing);
+      expect(find.text('Again'), findsOneWidget);
+    });
+
+    testWidgets('supply chain: confirmed and right, the four grades',
+        (WidgetTester tester) async {
+      final String commit = 'b' * kCommitHexDigits;
+      await tester.pumpWidget(MaterialApp(
+        home: Builder(
+          builder: (BuildContext context) => TextButton(
+            onPressed: () => showDialog<Grade>(
+              context: context,
+              builder: (BuildContext _) => ProvenanceDialog(commit: commit),
+            ),
+            child: const Text('open'),
+          ),
+        ),
+      ));
+      await tester.tap(find.text('open'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), commit);
+      await tester.tap(find.byType(Checkbox));
+      await tester.tap(find.text('Check'));
+      await tester.pumpAndSettle();
+      expect(find.text('Easy'), findsOneWidget);
+    });
+
+    testWidgets('salt by σ: a find takes the four grades',
+        (WidgetTester tester) async {
+      final List<int> o1 = List<int>.generate(64, (int i) => i);
+      String hex(List<int> b) =>
+          b.map((int v) => v.toRadixString(16).padLeft(2, '0')).join();
+      await tester.pumpWidget(MaterialApp(
+        home: Builder(
+          builder: (BuildContext context) => TextButton(
+            onPressed: () => showDialog<Grade>(
+              context: context,
+              builder: (BuildContext _) => SaltDialog(
+                sigma: 'abcd',
+                orbits: <List<int>?>[null, o1],
+                harvest: (DateTime d) async => 'abcd',
+                unbury: (String label, DateTime d) async => hex(o1),
+              ),
+            ),
+            child: const Text('open'),
+          ),
+        ),
+      ));
+      await tester.tap(find.text('open'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('By σ'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.widgetWithText(TextField, 'σ (hex)'), 'ABCD');
+      await tester.tap(find.text('Check'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('this setup\'s σ'), findsOneWidget);
+      expect(find.text('Good'), findsOneWidget);
+    });
+  });
+}

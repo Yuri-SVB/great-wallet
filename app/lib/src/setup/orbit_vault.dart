@@ -2,6 +2,7 @@ import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
     show Deck;
 
 import '../ffi/core_bindings.dart' show Argon2Profile, kOrbitPointLen;
+import 'fact_cards.dart' show CustomFact;
 
 /// The serializable **orbit provisional key** — everything needed to restore a
 /// *settled* orbit setup **without re-running the memory-hard advance**: the
@@ -40,6 +41,7 @@ class OrbitVault {
     this.passSeconds,
     this.gapSeconds,
     this.epsilon,
+    this.facts = const <CustomFact>[],
   });
 
   /// On-disk format version written by this build.
@@ -107,6 +109,9 @@ class OrbitVault {
   int? gapSeconds;
   double? epsilon;
 
+  /// Your own fact cards: prompts and answers. Their schedules are in [deck].
+  final List<CustomFact> facts;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
         'v': formatVersion,
         kindKey: kind,
@@ -121,6 +126,10 @@ class OrbitVault {
         if (passSeconds != null) 'passSeconds': passSeconds,
         if (gapSeconds != null) 'gapSeconds': gapSeconds,
         if (epsilon != null) 'epsilon': epsilon,
+        if (facts.isNotEmpty)
+          'facts': <Map<String, dynamic>>[
+            for (final CustomFact f in facts) f.toJson(),
+          ],
       };
 
   /// Rebuild a vault from decoded JSON. Throws a generic [FormatException] on any
@@ -166,7 +175,20 @@ class OrbitVault {
       passSeconds: _optionalPositive(json, 'passSeconds'),
       gapSeconds: _optionalPositive(json, 'gapSeconds')?.round(),
       epsilon: _optionalPositive(json, 'epsilon'),
+      facts: _facts(json['facts']),
     );
+  }
+
+  /// The facts section: absent, or a list of [CustomFact]s.
+  static List<CustomFact> _facts(Object? raw) {
+    if (raw == null) return const <CustomFact>[];
+    if (raw is! List) throw const FormatException('bad vault');
+    return <CustomFact>[
+      for (final Object? f in raw)
+        CustomFact.fromJson(f is Map<String, dynamic>
+            ? f
+            : throw const FormatException('bad vault')),
+    ];
   }
 
   /// An optional positive number, or a [FormatException] that echoes no value.

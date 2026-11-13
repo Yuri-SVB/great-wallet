@@ -175,6 +175,37 @@ void main() {
     await tester.sendKeyEvent(LogicalKeyboardKey.escape);
     await tester.pumpAndSettle();
 
+    // Cards (Main board X): the salt's, the supply chain's, and one of ours.
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyQ);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyX);
+    await tester.pumpAndSettle();
+    expect(find.text('Salt (Namtso)'), findsOneWidget);
+    expect(find.widgetWithText(SwitchListTile, 'Supply chain'), findsOneWidget);
+    await tester.enterText(
+        find.widgetWithText(TextField, 'Prompt'), 'Export salt');
+    await tester.enterText(find.widgetWithText(TextField, 'Answer'), 'SIGN-1');
+    await tester.tap(find.text('Add card'));
+    await tester.pumpAndSettle();
+    expect(find.text('Export salt'), findsOneWidget);
+    await tester.tap(find.text('Done'));
+    await tester.pumpAndSettle();
+
+    // Train: the supply chain's card on a third row, by click; the salt's at
+    // stage 0, slot 0.
+    expect(find.widgetWithText(OutlinedButton, 'Supply chain'), findsOneWidget);
+    await tester.sendKeyEvent(LogicalKeyboardKey.digit0);
+    await tester.pumpAndSettle();
+    expect(find.text('Salt (Namtso)'), findsOneWidget);
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyW);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+
     FractalCanvas canvas() =>
         tester.widget<FractalCanvas>(find.byType(FractalCanvas));
 
@@ -335,6 +366,7 @@ void main() {
                 File(path).readAsBytesSync(), key))
             .deck);
     expect(saved!.map(0, 1)!.repetitions, 1);
+    expect(saved.cards.any((MemCard c) => c.factId == 'misc:1'), isTrue);
     expect(saved.map(0, 1)!.due, isNotNull);
     expect(saved.map(0, 2)!.due, isNull);
 

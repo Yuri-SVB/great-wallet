@@ -2,6 +2,7 @@ import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:great_wallet_app/src/ffi/core_bindings.dart'
     show Argon2Profile, kOrbitPointLen;
+import 'package:great_wallet_app/src/setup/fact_cards.dart';
 import 'package:great_wallet_app/src/setup/orbit_vault.dart';
 
 /// Pure-Dart serialization tests for [OrbitVault] — no FFI/engine needed.
@@ -120,6 +121,21 @@ void main() {
       expect(plain.passSeconds, isNull);
       expect(plain.gapSeconds, isNull);
       expect(plain.epsilon, isNull);
+    });
+
+    test('your own cards round-trip', () {
+      final OrbitVault v = OrbitVault(
+        sigma: 'DEADBEEF',
+        iterations: 5,
+        profile: Argon2Profile.basic,
+        stages: sample().stages,
+        facts: const <CustomFact>[
+          CustomFact(id: 'misc:1', prompt: 'Export salt', answer: 'SIGN-1'),
+        ],
+      );
+      final OrbitVault back = OrbitVault.fromJson(v.toJson());
+      expect(back.facts.single.answer, 'SIGN-1');
+      expect(OrbitVault.fromJson(sample().toJson()).facts, isEmpty);
     });
 
     test('a non-positive or non-numeric setting is refused', () {

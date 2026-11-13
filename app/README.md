@@ -118,6 +118,12 @@ flutter create --platforms=linux --org org.greatwall --project-name great_wallet
 flutter run -d linux                 # or macos / windows
 ```
 
+### Building a release
+
+`app/tool/build.sh [platform]` builds with the commit it is built from embedded,
+so the supply-chain card can check the digest you paste after cloning and
+building a release anew. A working tree with changes builds without a digest.
+
 ### A setup file, and reminders at login
 
 The app takes a setup file path, which Save and Open start from:
