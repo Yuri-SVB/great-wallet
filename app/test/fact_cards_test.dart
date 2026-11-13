@@ -59,7 +59,10 @@ void main() {
               }),
           throwsFormatException);
       expect(isReviewedFact(MemCard.fact('misc:2')), isTrue);
-      expect(isReviewedFact(MemCard.fact('m')), isFalse);
+      for (final String id in kParameterFacts) {
+        expect(isReviewedFact(MemCard.fact(id)), isTrue, reason: id);
+      }
+      expect(isReviewedFact(MemCard.fact('export:1')), isFalse);
     });
   });
 
@@ -139,7 +142,9 @@ void main() {
       await tester.enterText(find.byType(TextField), commit);
       await tester.tap(find.text('Check'));
       await tester.pumpAndSettle();
-      expect(find.textContaining('without the build confirmed'), findsOneWidget);
+      expect(find.text(kProvenanceConfirm), findsOneWidget);
+      expect(find.textContaining('without the rebuild confirmed'),
+          findsOneWidget);
       expect(find.text('Easy'), findsNothing);
       expect(find.text('Again'), findsOneWidget);
     });
@@ -165,6 +170,60 @@ void main() {
       await tester.tap(find.text('Check'));
       await tester.pumpAndSettle();
       expect(find.text('Easy'), findsOneWidget);
+    });
+
+    testWidgets('the memory profile: picked right, the four grades',
+        (WidgetTester tester) async {
+      Grade? got;
+      await tester.pumpWidget(MaterialApp(
+        home: Builder(
+          builder: (BuildContext context) => TextButton(
+            onPressed: () async => got = await showDialog<Grade>(
+              context: context,
+              builder: (BuildContext _) => const ProfileDialog(
+                labels: <String>['Basic', 'Advanced', 'Great Wall'],
+                answer: 1,
+              ),
+            ),
+            child: const Text('open'),
+          ),
+        ),
+      ));
+      await tester.tap(find.text('open'));
+      await tester.pumpAndSettle();
+      expect(find.text('Memory profile (m)'), findsOneWidget);
+      await tester.tap(find.text('Advanced'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Check'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Good'));
+      await tester.pumpAndSettle();
+      expect(got, Grade.good);
+    });
+
+    testWidgets('a count missed: the setup\'s shown, only Again',
+        (WidgetTester tester) async {
+      await tester.pumpWidget(MaterialApp(
+        home: Builder(
+          builder: (BuildContext context) => TextButton(
+            onPressed: () => showDialog<Grade>(
+              context: context,
+              builder: (BuildContext _) =>
+                  const CountDialog(factId: kStagesFact, answer: 3),
+            ),
+            child: const Text('open'),
+          ),
+        ),
+      ));
+      await tester.tap(find.text('open'));
+      await tester.pumpAndSettle();
+      expect(find.text('Deep stages (N)'), findsOneWidget);
+      await tester.enterText(find.byType(TextField), '2');
+      await tester.tap(find.text('Check'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('this setup\'s is 3'), findsOneWidget);
+      expect(find.text('Good'), findsNothing);
+      expect(find.text('Again'), findsOneWidget);
     });
 
     testWidgets('salt by σ: a find takes the four grades',

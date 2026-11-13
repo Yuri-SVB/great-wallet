@@ -10,6 +10,7 @@ import 'package:great_wallet_app/src/core/orbit_protocol.dart';
 import 'package:great_wallet_app/src/ffi/core_bindings.dart';
 import 'package:great_wallet_app/src/ffi/fixed.dart';
 import 'package:great_wallet_app/src/ffi/library_loader.dart';
+import 'package:great_wallet_app/src/setup/fact_cards.dart' show kParameterFacts;
 import 'package:great_wallet_app/src/setup/orbit_vault.dart';
 import 'package:great_wallet_app/src/setup/setup_crypto.dart';
 import 'package:great_wallet_app/src/setup/setup_screen.dart';
@@ -183,6 +184,7 @@ void main() {
     await tester.sendKeyEvent(LogicalKeyboardKey.keyX);
     await tester.pumpAndSettle();
     expect(find.text('Salt (Namtso)'), findsOneWidget);
+    expect(find.text('The setup\'s parameters: m, D and N'), findsOneWidget);
     expect(find.widgetWithText(SwitchListTile, 'Supply chain'), findsOneWidget);
     await tester.enterText(
         find.widgetWithText(TextField, 'Prompt'), 'Export salt');
@@ -367,8 +369,33 @@ void main() {
             .deck);
     expect(saved!.map(0, 1)!.repetitions, 1);
     expect(saved.cards.any((MemCard c) => c.factId == 'misc:1'), isTrue);
+    for (final String id in kParameterFacts) {
+      expect(saved.cards.any((MemCard c) => c.factId == id), isTrue,
+          reason: 'the $id card is always on');
+    }
     expect(saved.map(0, 1)!.due, isNotNull);
     expect(saved.map(0, 2)!.due, isNull);
+
+    // Next due (Train board Q) reaches the setup's parameters too: `D`,
+    // checked against this setup's 4.
+    bool reached = false;
+    for (int i = 0; i < 20 && !reached; i++) {
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyQ);
+      await tester.pumpAndSettle();
+      reached = find.text('Derivation steps (D)').evaluate().isNotEmpty;
+      if (!reached && find.text('Cancel').evaluate().isNotEmpty) {
+        await tester.tap(find.text('Cancel'));
+        await tester.pumpAndSettle();
+      }
+    }
+    expect(reached, isTrue);
+    await tester.enterText(find.widgetWithText(TextField, 'D'), '4');
+    await tester.tap(find.text('Check'));
+    await tester.pumpAndSettle();
+    expect(find.text('Right.'), findsOneWidget);
+    await tester.tap(find.text('Good'));
+    await tester.pumpAndSettle();
+    expect(log(), contains('Derivation steps (D): graded good'));
 
     // F2: back to Setup.
     await tester.sendKeyEvent(LogicalKeyboardKey.f2);

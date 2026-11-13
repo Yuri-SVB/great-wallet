@@ -270,8 +270,12 @@ class _SetupScreenState extends State<SetupScreen>
   /// setup; their schedules are in the deck.
   final Map<String, CustomFact> _customFacts = <String, CustomFact>{};
 
-  /// The deck's fact cards this app reviews: the salt's, the supply chain's
-  /// (when on), and your own.
+  /// The fact card *next due map* last opened, so the next press moves past
+  /// it (even when it was cancelled); null when it last went to a map.
+  String? _lastDueFact;
+
+  /// The deck's fact cards this app reviews: the salt's, the setup's
+  /// parameters, the supply chain's (when on), and your own.
   List<MemCard> get _factCards => <MemCard>[
         for (final MemCard c in _deck?.cards ?? const <MemCard>[])
           if (isReviewedFact(c) &&
@@ -1604,8 +1608,9 @@ press.calibrate.target    tick_soft.wav
       case _Cmd.cards:
         return BoardCommand(
           name: 'Cards',
-          help: 'The fact cards: the salt\'s (always on), the supply '
-              'chain\'s (on or off) and your own — add or remove them '
+          help: 'The fact cards: the salt\'s and the setup\'s parameters '
+              'm, D and N (always on), the supply chain\'s (on or off) and '
+              'your own — add or remove them '
               '(at most $kMaxCustomFacts, $kMaxFactChars characters each).',
           icon: Icons.style,
           enabled: _orbitSettled,
@@ -2172,13 +2177,23 @@ press.calibrate.target    tick_soft.wav
       final MemCard? card = deck.map(key.$1, key.$2);
       if (card != null) deck = deck.withCard(card.copyWith(cues: _cuesOf(r)));
     });
-    // The salt's card is always on; your own cards each have one.
-    for (final String id in <String>[kSaltFact, ..._customFacts.keys]) {
-      if (!deck.cards.any((MemCard c) => c.factId == id)) {
-        deck = deck.withCard(MemCard.fact(id));
+    return _withAlwaysOnFacts(deck);
+  }
+
+  /// [deck] with the fact cards that are always on: the salt's, the setup's
+  /// parameters (`m`, `D`, `N`), and one for each of your own.
+  Deck _withAlwaysOnFacts(Deck deck) {
+    Deck out = deck;
+    for (final String id in <String>[
+      kSaltFact,
+      ...kParameterFacts,
+      ..._customFacts.keys,
+    ]) {
+      if (!out.cards.any((MemCard c) => c.factId == id)) {
+        out = out.withCard(MemCard.fact(id));
       }
     }
-    return deck;
+    return out;
   }
 
   /// Set [key]'s route. A new ρ or exponent searches again, with every stop
@@ -3426,6 +3441,17 @@ press.calibrate.target    tick_soft.wav
               .result,
           practice: practice,
         ),
+      kProfileFact => ProfileDialog(
+          labels: _profileLabels,
+          answer: _profiles.indexOf(_profile),
+          practice: practice,
+        ),
+      kIterationsFact => CountDialog(
+          factId: kIterationsFact, answer: _iterations, practice: practice),
+      kStagesFact => CountDialog(
+          factId: kStagesFact,
+          answer: _orbitDeepestStage,
+          practice: practice),
       kProvenanceFact => ProvenanceDialog(practice: practice),
       _ when custom != null =>
         CustomFactDialog(fact: custom, practice: practice),
@@ -3487,15 +3513,19 @@ press.calibrate.target    tick_soft.wav
       _toast('Nothing is due.');
       return;
     }
-    final int at = due.indexWhere((MemCard c) =>
-        c.kind == CardKind.point &&
-        c.stageIndex == _activeStage &&
-        c.slot == _slotIndex);
+    final String? fact = _lastDueFact;
+    final int at = due.indexWhere((MemCard c) => fact != null
+        ? c.factId == fact
+        : c.kind == CardKind.point &&
+            c.stageIndex == _activeStage &&
+            c.slot == _slotIndex);
     final MemCard next = due[(at + 1) % due.length];
     if (next.kind == CardKind.fact) {
+      _lastDueFact = next.factId;
       unawaited(_reviewFact(next));
       return;
     }
+    _lastDueFact = null;
     if (next.stageIndex != _activeStage) _setOrbitStage(next.stageIndex);
     if (next.slot != _slotIndex) {
       _selectSlot(next.slot);
@@ -4713,7 +4743,7 @@ press.calibrate.target    tick_soft.wav
   /// reproducible — see docs §"time is a perishable label on a durable
   /// parameter".)
   /// Open the spacious Argon2 calibration dialog (Setup board). It benchmarks on this
-  /// device, solves the iteration count N for a chosen target time, and — on
+  /// device, solves the iteration count D for a chosen target time, and — on
   /// Apply — returns N, which we write into the derivation-steps field. Exit is
   /// Esc + confirm (handled inside the dialog).
   Future<void> _openCalibrationDialog() async {
@@ -4793,7 +4823,7 @@ press.calibrate.target    tick_soft.wav
 
   /// The Argon2 memory profile, chosen on a three-stop slider rather than a
   /// dropdown so the memory cost reads as one escalating axis next to the
-  /// iteration-count (N) field.
+  /// iteration-count (D) field.
   Widget _argon2ProfileSlider() {
     final int idx = _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
     // Profile name lives in the console (focus _Field.profile); the slider thumb
@@ -5084,6 +5114,7 @@ press.calibrate.target    tick_soft.wav
         ..addAll(<String, CustomFact>{
           for (final CustomFact f in vault.facts) f.id: f,
         });
+      if (_deck != null) _deck = _withAlwaysOnFacts(_deck!);
       for (int i = 1; i <= deepest; i++) {
         // o₀ is never stored: [_stageOrbit] re-derives it from σ on demand.
         _orbitO[i] = orbits[i];
@@ -6257,6 +6288,15 @@ press.calibrate.target    tick_soft.wav
                         title: Text('Salt (Namtso)'),
                         subtitle: Text('Always on: stage 0, slot 0 in Train.'),
                       ),
+                      const ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.tune),
+                        title: Text('The setup\'s parameters: m, D and N'),
+                        subtitle: Text('Always on: the memory profile, the '
+                            'derivation steps per stage and the deep stages, '
+                            'as for a hard reset. Next due reaches them.'),
+                      ),
                       SwitchListTile(
                         dense: true,
                         contentPadding: EdgeInsets.zero,
@@ -7219,7 +7259,7 @@ const List<({String label, Duration target})> _kCalibTargets =
 ];
 /// Whether a calibration target time means one **inter-stage** derivation or
 /// the **whole setup** (all stages). All-stages divides the target by the stage
-/// count to get the per-stage time the iteration count N must hit.
+/// count to get the per-stage time the iteration count D must hit.
 enum _CalibScope { perStage, allStages }
 
 /// The spacious Argon2 calibration dialog (opened by Alt+D / the panel button).

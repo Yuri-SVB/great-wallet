@@ -1,5 +1,6 @@
 /// Fact cards: what a setup asks you to recall besides its maps — the Namtso
-/// salt, the build you can rebuild (supply chain), and your own cards. Their
+/// salt, the setup's parameters (`m`, `D`, `N`), the build you can rebuild
+/// (supply chain), and your own cards. Their
 /// cards live in the CPNF deck (ids only); the answers of your own cards ride
 /// in the setup's encrypted payload ([CustomFact]).
 library;
@@ -10,8 +11,20 @@ import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
 /// The Namtso salt's card (always on): its date re-harvested, or σ itself.
 const String kSaltFact = 'salt';
 
+/// The setup's parameters (always on), recalled for a hard reset on a new
+/// device: the Argon2 memory profile `m`, the Argon2 derivation iterations
+/// per stage `D`, and the number of deep stages `N`.
+const String kProfileFact = 'm';
+const String kIterationsFact = 'D';
+const String kStagesFact = 'N';
+const List<String> kParameterFacts = <String>[
+  kProfileFact,
+  kIterationsFact,
+  kStagesFact,
+];
+
 /// The supply-chain card (optional): the release's commit digest, pasted
-/// after cloning and building it anew.
+/// after cloning, building and running it anew.
 const String kProvenanceFact = 'provenance';
 
 /// The prefix of your own cards' ids.
@@ -71,6 +84,7 @@ class CustomFact {
 bool isReviewedFact(MemCard card) =>
     card.kind == CardKind.fact &&
     (card.factId == kSaltFact ||
+        kParameterFacts.contains(card.factId) ||
         card.factId == kProvenanceFact ||
         card.factId.startsWith(kCustomPrefix));
 
@@ -78,6 +92,9 @@ bool isReviewedFact(MemCard card) =>
 String factName(MemCard card, Map<String, CustomFact> custom) =>
     switch (card.factId) {
       kSaltFact => 'Salt (Namtso)',
+      kProfileFact => 'Memory profile (m)',
+      kIterationsFact => 'Derivation steps (D)',
+      kStagesFact => 'Deep stages (N)',
       kProvenanceFact => 'Supply chain',
       final String id => custom[id]?.prompt ?? id,
     };

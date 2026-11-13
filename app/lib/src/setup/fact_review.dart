@@ -7,7 +7,7 @@ library;
 import 'dart:async';
 
 import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
-    show Grade;
+    show Grade, MemCard;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -222,9 +222,12 @@ class _CustomFactDialogState extends State<CustomFactDialog> {
 const String kProvenanceAbout =
     'Supply chain: could you rebuild this app yourself, as after a hard reset '
     'on a new device? Clone the great-wallet repository anew, check out this '
-    'release, build it (dependencies included), and paste the release\'s '
-    'commit digest from `git log` (all 40 hex digits). Only with "I was able '
-    'to clone and build the app." ticked can it be scored above Again.';
+    'release, build it (dependencies included), run it, and paste the '
+    'release\'s commit digest from `git log` (all 40 hex digits). Only with '
+    '"$kProvenanceConfirm" ticked can it be scored above Again.';
+
+/// The supply-chain card's confirmation.
+const String kProvenanceConfirm = 'I was able to clone, build and run the app.';
 
 /// The supply-chain card: the release's digest pasted, and the build
 /// confirmed. [commit] is this build's digest (empty: unknown).
@@ -275,7 +278,7 @@ class _ProvenanceDialogState extends State<ProvenanceDialog> {
               contentPadding: EdgeInsets.zero,
               value: _built,
               onChanged: (bool? v) => setState(() => _built = v ?? false),
-              title: const Text('I was able to clone and build the app.'),
+              title: const Text(kProvenanceConfirm),
             ),
           ],
         ),
@@ -298,8 +301,121 @@ class _ProvenanceDialogState extends State<ProvenanceDialog> {
             scored: _built,
             message: _built
                 ? 'Right: this build\'s digest.'
-                : 'Right digest — but without the build confirmed, only Again '
-                    'can be scored.',
+                : 'Right digest — but without the rebuild confirmed, only '
+                    'Again can be scored.',
+          );
+        },
+      );
+}
+
+/// The memory profile's card (`m`): this setup's profile picked from
+/// [labels], [answer] its index.
+class ProfileDialog extends StatefulWidget {
+  const ProfileDialog({
+    super.key,
+    required this.labels,
+    required this.answer,
+    this.practice,
+  });
+
+  final List<String> labels;
+  final int answer;
+  final String? practice;
+
+  @override
+  State<ProfileDialog> createState() => _ProfileDialogState();
+}
+
+class _ProfileDialogState extends State<ProfileDialog> {
+  int? _picked;
+
+  @override
+  Widget build(BuildContext context) => FactReviewFrame(
+        title: factName(
+            MemCard.fact(kProfileFact), const <String, CustomFact>{}),
+        about: 'The Argon2 memory profile this setup derives with, as you would '
+            'set it for a hard reset on a new device.',
+        practice: widget.practice,
+        body: Wrap(
+          spacing: _kGap / 2,
+          children: <Widget>[
+            for (int i = 0; i < widget.labels.length; i++)
+              ChoiceChip(
+                label: Text(widget.labels[i]),
+                selected: _picked == i,
+                onSelected: (bool on) =>
+                    setState(() => _picked = on ? i : null),
+              ),
+          ],
+        ),
+        check: () async {
+          final bool hit = _picked == widget.answer;
+          return FactCheck(
+            hit: hit,
+            message: hit
+                ? 'Right.'
+                : 'Missed — this setup\'s is ${widget.labels[widget.answer]}.',
+          );
+        },
+      );
+}
+
+/// A count's card (`D` or `N`, by [factId]): the number typed, compared with
+/// this setup's [answer].
+class CountDialog extends StatefulWidget {
+  const CountDialog({
+    super.key,
+    required this.factId,
+    required this.answer,
+    this.practice,
+  });
+
+  final String factId;
+  final int answer;
+  final String? practice;
+
+  @override
+  State<CountDialog> createState() => _CountDialogState();
+}
+
+class _CountDialogState extends State<CountDialog> {
+  final TextEditingController _count = TextEditingController();
+
+  @override
+  void dispose() {
+    _count.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => FactReviewFrame(
+        title: factName(
+            MemCard.fact(widget.factId), const <String, CustomFact>{}),
+        about: widget.factId == kStagesFact
+            ? 'How many deep stages this setup has, beyond stage 0.'
+            : 'How many Argon2 iterations each stage\'s derivation runs (the '
+                'derivation steps per stage).',
+        practice: widget.practice,
+        body: TextField(
+          controller: _count,
+          autofocus: true,
+          keyboardType: TextInputType.number,
+          inputFormatters: <TextInputFormatter>[
+            FilteringTextInputFormatter.digitsOnly,
+          ],
+          decoration: InputDecoration(
+            isDense: true,
+            border: const OutlineInputBorder(),
+            labelText: widget.factId,
+          ),
+        ),
+        check: () async {
+          final bool hit = int.tryParse(_count.text) == widget.answer;
+          return FactCheck(
+            hit: hit,
+            message: hit
+                ? 'Right.'
+                : 'Missed — this setup\'s is ${widget.answer}.',
           );
         },
       );
