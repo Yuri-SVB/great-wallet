@@ -52,6 +52,8 @@ import 'fact_cards.dart';
 import 'fact_review.dart';
 import 'file_wipe.dart';
 import 'orbit_vault.dart';
+import 'key_qr_painter.dart';
+import 'qr_layout.dart';
 import 'setup_crypto.dart';
 
 /// Setup mode screen: build an orbit setup — place points on each stage's
@@ -5675,8 +5677,9 @@ press.calibrate.target    tick_soft.wav
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          'Q — show the QR to hand-copy onto a printed blank '
-                          'template (Main board).  Alt+Q — copy the key for a password '
+                          'Q — show the QR, to copy its dots onto a printed '
+                          'template (see templates/ in the repository).  '
+                          'Alt+Q — copy the key for a password '
                           'manager (blind).  Press Q or Alt+Q again to switch to '
                           '${otherLen() * 8}-bit (a fresh key, overwriting the '
                           'file).  '
@@ -5695,16 +5698,20 @@ press.calibrate.target    tick_soft.wav
                               color: Colors.white,
                               padding: const EdgeInsets.all(12),
                               child: CustomPaint(
-                                size: const Size(252, 252),
-                                painter: _QrPainter(matrix, _QrView.scan),
+                                size: const Size(_kQrSide, _kQrSide),
+                                painter: KeyQrPainter(matrix),
                               ),
                             ),
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            '${keyLen * 8}-bit · QR v$version. Do this alone, no '
-                            'cameras. At EC-L the code still scans with up to ~2 '
-                            'stray mis-coloured cells, so work carefully.',
+                            '${keyLen * 8}-bit · QR v$version. Copy each black '
+                            'dot onto the template cell of the same colour and '
+                            'place. Mistakes may touch at most '
+                            '${QrLayout(version).correctable} colour blocks '
+                            '(any number of wrong cells in one block counts '
+                            'once); the grey format cells are protected on '
+                            'their own. Do this alone, no cameras.',
                             style: const TextStyle(fontSize: 11),
                           ),
                         ],
@@ -6162,6 +6169,9 @@ press.calibrate.target    tick_soft.wav
 
   /// Reset behind an inline console confirmation, so the Reset key (or a stray
   /// keypress) cannot discard a setup by accident.
+  /// Side of the key's QR in the key dialog.
+  static const double _kQrSide = 300;
+
   /// Width of the cards manager.
   static const double _kCardsWidth = 520;
 
@@ -7196,79 +7206,6 @@ class _Badge extends StatelessWidget {
     );
   }
 }
-
-/// Paints the provisional-key QR. In **scan** mode it draws the plain scannable
-/// code (solid black/white modules) — what the user reveals to hand-copy or to
-/// scan back. In **blank** mode it draws the reusable hand-fill skeleton: only
-/// the key-independent cells (the three finder patterns + separators, the timing
-/// patterns, and the dark module) are inked, every cell sits in a clearly drawn
-/// grid so the user can see exactly which squares to colour, and the data/EC
-/// cells are left empty to fill in by reading the scan code. (Byte-mode v1 has
-/// no alignment patterns.) Both views include the spec's 4-module quiet zone.
-class _QrPainter extends CustomPainter {
-  _QrPainter(this.image, this.view);
-
-  final qr.QrImage image;
-  final _QrView view;
-
-  /// QR spec mandates a clear margin of at least 4 modules around the symbol;
-  /// without it decoders often fail to lock onto the finder patterns.
-  static const int quiet = 4;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final int n = image.moduleCount; // 21 for version 1
-    final double cell = size.width / (n + 2 * quiet);
-    final double off = quiet * cell; // top-left offset of the symbol proper
-    final Paint inked = Paint()..color = Colors.black;
-    // A visible grid so the hand-filler can tell the module divisions apart.
-    final Paint grid = Paint()
-      ..color = const Color(0xFF9E9E9E)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1;
-    canvas.drawRect(Offset.zero & size, Paint()..color = Colors.white);
-    for (int r = 0; r < n; r++) {
-      for (int c = 0; c < n; c++) {
-        final Rect rect = Rect.fromLTWH(off + c * cell, off + r * cell, cell, cell);
-        final bool dark = image.isDark(r, c);
-        switch (view) {
-          case _QrView.scan:
-            if (dark) canvas.drawRect(rect, inked);
-          case _QrView.blank:
-            // Key-independent skeleton only — the user inks the rest by hand,
-            // reading the scan code, guided by the highlighted module grid.
-            if (dark && _isFixed(r, c, n)) canvas.drawRect(rect, inked);
-            canvas.drawRect(rect, grid);
-        }
-      }
-    }
-  }
-
-  /// Key-independent modules: the three 8×8 finder+separator corners, the timing
-  /// rows/cols, the dark module, and (at v2, n == 25) the single 5×5 alignment
-  /// pattern centred at (n-7, n-7). v1 has no alignment pattern.
-  bool _isFixed(int r, int c, int n) {
-    bool corner(int r0, int c0) =>
-        r >= r0 && r < r0 + 8 && c >= c0 && c < c0 + 8;
-    if (corner(0, 0) || corner(0, n - 8) || corner(n - 8, 0)) return true;
-    if (r == 6 || c == 6) return true; // timing patterns
-    if (r == n - 8 && c == 8) return true; // dark module
-    if (n >= 25) {
-      final int a = n - 7; // alignment-pattern centre (18 at v2)
-      if ((r - a).abs() <= 2 && (c - a).abs() <= 2) return true; // 5×5 ring
-    }
-    return false;
-  }
-
-  @override
-  bool shouldRepaint(_QrPainter oldDelegate) =>
-      oldDelegate.image != image || oldDelegate.view != view;
-}
-
-/// How [_QrPainter] renders: the plain scannable code, or the reusable blank
-/// skeleton (only the key-independent cells, over a highlighted module grid,
-/// printed for hand-colouring).
-enum _QrView { scan, blank }
 
 /// Calibration target presets: a human duration label paired with the
 /// wall-clock the derivation should take. Grounded in THREAT_MODEL.md — hours

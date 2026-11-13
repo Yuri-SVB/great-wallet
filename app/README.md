@@ -124,6 +124,14 @@ flutter run -d linux                 # or macos / windows
 so the supply-chain card can check the digest you paste after cloning and
 building a release anew. A working tree with changes builds without a digest.
 
+### Printable key templates
+
+`templates/` (at the repository's root) holds the blank QR templates for
+128- and 256-bit provisional keys, as SVG: print one, then copy the key
+dialog's dots onto the cells of the same colour. Mistakes may touch at most 2
+colour blocks (128-bit) or 4 (256-bit). They are generated with
+`dart run tool/qr_templates.dart` from `app/`.
+
 ### A setup file, and reminders at login
 
 The app takes a setup file path, which Save and Open start from:
