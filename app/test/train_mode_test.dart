@@ -154,7 +154,8 @@ void main() {
     await tester.pump();
     expect(trainingTold, isTrue);
     expect(find.byIcon(Icons.school), findsOneWidget);
-    expect(log(), contains('Stage 0: needs 2 maps; 2 in the deck'));
+    // Every map of the stage is a card: the 2 placed and the 7 derived.
+    expect(log(), contains('Stage 0: needs 2 maps; 9 in the deck'));
 
     FractalCanvas canvas() =>
         tester.widget<FractalCanvas>(find.byType(FractalCanvas));
@@ -289,6 +290,16 @@ void main() {
     expect(route()!.stops.first.dimmed, isTrue);
     expect(route()!.stops.skip(1).where((CanvasPathStop s) => s.dimmed),
         isEmpty);
+
+    // Map 3, derived from the two placed: a card too, and it can be trained.
+    await tester.sendKeyEvent(LogicalKeyboardKey.digit3);
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyW);
+    await tester.pump();
+    expect(log(), contains('Recall:'));
+    expect(canvas().overlays.crosses, isEmpty);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyE); // give up: practice
+    await tester.pump();
 
     // Save progress (Z) under the same key.
     await tester.sendKeyEvent(LogicalKeyboardKey.keyZ);

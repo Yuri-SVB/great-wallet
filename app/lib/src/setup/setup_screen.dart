@@ -2017,15 +2017,20 @@ press.calibrate.target    tick_soft.wav
   bool _placed(int stage, int slot) =>
       _boardPoints[stage][slot] != null && !_boardDerived[stage][slot];
 
-  /// The deck to save: the current one (or a fresh one, a card per placed
-  /// map), every placed map in it, and the session's routes as its cues.
+  /// Whether stage [stage]'s slot [slot] holds a map to recall: placed, or
+  /// derived once `Sh_i` is fixed. Any `r_i` of a stage's maps rebuild it, so
+  /// every one of them is a card and can be trained.
+  bool _isMap(int stage, int slot) => _boardChunks[stage][slot] != null;
+
+  /// The deck to save: the current one (or a fresh one, a card per map), every
+  /// map of the setup in it, and the session's routes as its cues.
   Deck _deckForSave(int deepest) {
     final Cues start = _cuesOf(_defaultRoute);
     final List<List<int>> placed = <List<int>>[
       for (int i = 0; i <= deepest; i++)
         <int>[
           for (int s = 1; s <= _maxSlot; s++)
-            if (_placed(i, s)) s,
+            if (_isMap(i, s)) s,
         ],
     ];
     Deck deck = _deck ?? buildDeck(maps: placed, cues: start);
@@ -3059,7 +3064,7 @@ press.calibrate.target    tick_soft.wav
     if (!_training || deck == null || !_isBoardSlot) return null;
     final (int, int) key = (_activeStage, _slotIndex);
     final MemCard? card = deck.map(key.$1, key.$2);
-    if (card == null || !_placed(key.$1, key.$2)) return null;
+    if (card == null || !_isMap(key.$1, key.$2)) return null;
     return card.copyWith(cues: _cuesOf(_routeOf(key)));
   }
 
@@ -3279,7 +3284,7 @@ press.calibrate.target    tick_soft.wav
         for (final MemCard c in _deck?.cards ?? const <MemCard>[])
           if (c.kind == CardKind.point &&
               c.stageIndex <= _orbitDeepestStage &&
-              _placed(c.stageIndex, c.slot))
+              _isMap(c.stageIndex, c.slot))
             c.copyWith(cues: _cuesOf(_routeOf((c.stageIndex, c.slot)))),
       ];
 
@@ -4710,13 +4715,12 @@ press.calibrate.target    tick_soft.wav
       }
     });
     _setOrbitStage(deepest);
-    // A new setup: its deck as saved, and no training since.
+    // A new setup: its deck as saved — with a card for every map, the derived
+    // ones included — and no training since.
+    setState(() => _deck = _deckForSave(deepest));
     _deckDirty = false;
     _review.clear();
-    if (_training) {
-      setState(() => _deck ??= _deckForSave(deepest));
-      _logProgress();
-    }
+    if (_training) _logProgress();
     return null;
   }
 
