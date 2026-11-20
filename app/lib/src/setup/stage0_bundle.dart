@@ -103,6 +103,10 @@ class Stage0Header {
   List<int> get _aad => utf8.encode(jsonEncode(_json()));
 }
 
+/// The bundle's default `m`: the lightest profile, whatever the setup's, so
+/// the clear header tells nothing of the setup's profile.
+const Argon2Profile kStage0DefaultProfile = Argon2Profile.basic;
+
 /// The bundle's file name: the setup file's, with this after it.
 const String kStage0Suffix = '.stage0';
 

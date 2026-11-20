@@ -6786,8 +6786,9 @@ press.calibrate.target    tick_soft.wav
   /// Retire the provisional key (Graduation's green light): seal stage 0's
   /// bundle — σ and stage 0's card records under `Sh₀`, hardened by the
   /// bundle's own `D` passes at `m` ([Stage0Bundle]) — next to the setup file,
-  /// then wipe the setup file. `m` defaults to the setup's profile, `D` to
-  /// about two minutes; both are yours to set, and are stored in the clear.
+  /// then wipe the setup file. `m` defaults to Basic, so the bundle's clear
+  /// part shows nothing of the setup's profile; `D` to about two minutes.
+  /// Both are yours to set, and are stored in the clear.
   Future<void> _retireKey() async {
     final Uint8List? o0 = _stageOrbit(0);
     final Uint8List? sh = _stageShBytes(0);
@@ -6799,11 +6800,11 @@ press.calibrate.target    tick_soft.wav
     final String setupPath = _vaultPath.text.trim();
     final TextEditingController pathInput = TextEditingController(
         text: setupPath.isEmpty ? '' : '$setupPath$kStage0Suffix');
+    Argon2Profile profile = kStage0DefaultProfile;
+    // A pass's time is known only at the setup's profile; elsewhere it is timed.
+    final double? known = profile == _profile ? _passSeconds : null;
     final TextEditingController passesInput = TextEditingController(
-        text: _passSeconds == null
-            ? ''
-            : '${Stage0Bundle.defaultPasses(_passSeconds!)}');
-    Argon2Profile profile = _profile;
+        text: known == null ? '' : '${Stage0Bundle.defaultPasses(known)}');
     final DialogRoute<bool> route = DialogRoute<bool>(
       context: context,
       builder: (BuildContext ctx) => StatefulBuilder(

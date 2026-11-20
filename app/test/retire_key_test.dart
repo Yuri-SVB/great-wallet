@@ -84,7 +84,8 @@ void main() {
     final OrbitVault vault = OrbitVault(
       sigma: sigmaHex,
       iterations: 4,
-      profile: Argon2Profile.basic,
+      // Not the bundle's default: its m must not echo the setup's.
+      profile: Argon2Profile.advanced,
       stages: <OrbitVaultStage>[
         OrbitVaultStage(required: 2, orbit: null, points: placed),
       ],
