@@ -13,8 +13,8 @@ import 'package:great_wallet_app/src/formosa/pass_vault.dart';
 
 /// F4: a vault created from six generated sentences and a provisional key,
 /// an entry added, locked, then opened again with four of them, and with the
-/// key; the key retired at the green light, and a new one added. Argon2id
-/// runs for real, light.
+/// key; the key retired at the green light, and a new one added; the entry
+/// copied into a second vault. Argon2id runs for real, light.
 void main() {
   final formosa.ThemeSet themes = loadThemes(Directory('../formosa/themes'));
   const KdfParams light =
@@ -252,12 +252,24 @@ void main() {
       for (final MemCard c in now().cards) jsonEncode(c.toJson()),
     ], before);
 
-    // At the green light (here ε = 1), the key is retired; then a new one.
-    await tester.pumpWidget(MaterialApp(
-      home:
-          Scaffold(body: FormosaScreen(themes: themes, kdf: light, epsilon: 1)),
-    ));
+    // ε set to 100 % for this vault: the green light, and the key retired;
+    // then a new one.
+    await tester.tap(find.text('T and ε…'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.widgetWithText(TextField, 'T (days)'), '3');
+    await tester.enterText(find.widgetWithText(TextField, 'ε (%)'), '100');
     await tester.pump();
+    expect(
+        find.descendant(
+            of: find.byType(AlertDialog),
+            matching: find.textContaining('green light.')),
+        findsOneWidget,
+        reason: 'previewed as typed');
+    await tester.tap(find.text('Set'));
+    await tester.pump();
+    await settle();
+    expect(now().gapSeconds, const Duration(days: 3).inSeconds);
+    expect(now().epsilon, 1);
     expect(find.textContaining('green light.'), findsOneWidget);
     await tester.tap(find.text('Retire the provisional key…'));
     await tester.pumpAndSettle();
@@ -277,5 +289,37 @@ void main() {
     await tester.tap(find.text('Done'));
     await tester.pumpAndSettle();
     expect(now().provisional, isNotNull);
+
+    // Mail held, the vault locked, a second vault made: Mail pasted into it.
+    await tester.tap(find.byTooltip('Hold to copy into another vault'));
+    await tester.pump();
+    expect(find.textContaining('1 entry held'), findsOneWidget);
+    expect(find.text('Paste 1 entry'), findsNothing, reason: 'its own vault');
+    await tester.tap(find.text('Lock'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('1 entry held'), findsOneWidget,
+        reason: 'held across the lock');
+    final String path2 = '${dir.path}/other.vault';
+    await tester.enterText(find.widgetWithText(TextField, 'Vault file'), path2);
+    await tester.tap(find.text('New vault'));
+    await tester.pumpAndSettle();
+    for (int i = 0; i < 6; i++) {
+      await tester.tap(find.text('System random').at(i));
+      await tester.pump();
+    }
+    await tester.tap(find.text('Create'));
+    await tester.pump();
+    for (int i = 0; i < 10 && keyDialog.evaluate().isEmpty; i++) {
+      await settle();
+    }
+    await tester.tap(find.text('Done'));
+    await tester.pumpAndSettle();
+    expect(find.text('Mail'), findsNothing);
+    await tester.tap(find.text('Paste 1 entry'));
+    await tester.pump();
+    await settle();
+    expect(find.text('Mail'), findsOneWidget);
+    expect(find.textContaining('1 entry copied from $path.'), findsOneWidget);
+    expect(find.textContaining('held'), findsNothing, reason: 'pasted once');
   });
 }

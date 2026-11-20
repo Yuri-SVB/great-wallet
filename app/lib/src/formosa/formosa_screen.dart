@@ -89,9 +89,9 @@ class FormosaScreen extends StatefulWidget {
   /// The cards' schedule (the device's clock by default).
   final MemSchedule schedule;
 
-  /// The graduation gate: the provisional key may be retired once the chance
-  /// of recalling fewer than `k` sentences after [gateGap] is at most
-  /// [epsilon].
+  /// The graduation gate's defaults: the provisional key may be retired once
+  /// the chance of recalling fewer than `k` sentences after [gateGap] is at
+  /// most [epsilon]. Each vault can set its own (T and ε…).
   final Duration gateGap;
   final double epsilon;
 
@@ -127,6 +127,11 @@ class _FormosaScreenState extends State<FormosaScreen> {
   OpenVault? _vault;
   final Set<String> _shown = <String>{};
 
+  // Entries held to copy into another vault, and the file they are from: in
+  // memory only, across a lock, until pasted or discarded.
+  final List<VaultEntry> _held = <VaultEntry>[];
+  String? _heldFrom;
+
   // The clipboard, cleared [_kClipboardClear] after a copy if still ours.
   Timer? _clipTimer;
 
@@ -148,6 +153,8 @@ class _FormosaScreenState extends State<FormosaScreen> {
 
   static const Duration _kClipboardClear = Duration(seconds: 30);
   static const int _kByteValues = 256;
+  static const double _kPercentScale = 100;
+  static const double _kGateFieldWidth = 160;
   static const double _kGap = 12;
   static const double _kWidth = 720;
   static const double _kDiceWidth = 860;
@@ -173,6 +180,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
   @override
   void dispose() {
     _clipTimer?.cancel();
+    _discardHeld();
     _path.dispose();
     for (final TextEditingController c in _inputs.values) {
       c.dispose();
@@ -756,9 +764,10 @@ class _FormosaScreenState extends State<FormosaScreen> {
   /// The graduation gate for [h] at now + `T`: the chance of recalling fewer
   /// than `k` of its sentences, each by its forgetting curve (one never
   /// graded counts as forgotten), and whether it is at most `ε`.
-  ({double failure, bool passes}) _gate(VaultHeader h) {
+  ({double failure, bool passes}) _gate(VaultHeader h,
+      {Duration? gap, double? epsilon}) {
     final MemSchedule schedule = widget.schedule;
-    final DateTime at = schedule.clock.now().add(widget.gateGap);
+    final DateTime at = schedule.clock.now().add(gap ?? _gapOf(h));
     final double failure = failureChance(<double>[
       for (final VaultSlot s in h.slots)
         if (h.cardOf(s.id) case final MemCard c when c.isGraded)
@@ -766,7 +775,36 @@ class _FormosaScreenState extends State<FormosaScreen> {
         else
           0,
     ], h.k);
-    return (failure: failure, passes: failure <= widget.epsilon);
+    return (failure: failure, passes: failure <= (epsilon ?? _epsilonOf(h)));
+  }
+
+  /// [h]'s gate settings: its own, else the defaults.
+  Duration _gapOf(VaultHeader h) =>
+      h.gapSeconds == null ? widget.gateGap : Duration(seconds: h.gapSeconds!);
+  double _epsilonOf(VaultHeader h) => h.epsilon ?? widget.epsilon;
+
+  /// Set the open vault's `T` and `ε`, the gate previewed as you type; an
+  /// empty field returns to the default.
+  Future<void> _setGate() async {
+    final OpenVault v = _vault!;
+    final VaultHeader h = v.header;
+    final ({int? gapSeconds, double? epsilon})? set =
+        await showDialog<({int? gapSeconds, double? epsilon})>(
+      context: context,
+      builder: (BuildContext _) => _GateDialog(
+        header: h,
+        defaultGap: widget.gateGap,
+        defaultEpsilon: widget.epsilon,
+        preview: (Duration gap, double epsilon) =>
+            _gate(h, gap: gap, epsilon: epsilon),
+      ),
+    );
+    if (set == null || !mounted) return;
+    setState(() => v.header =
+        h.withGate(gapSeconds: set.gapSeconds, epsilon: set.epsilon));
+    await _save();
+    _say('Graduation: T ${durationText(_gapOf(v.header))}, '
+        'ε ${chanceText(_epsilonOf(v.header))}.');
   }
 
   /// Retire the provisional key, at the green light: a confirmation, then
@@ -783,7 +821,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
         title: const Text('Retire the provisional key'),
         content: SizedBox(
           width: _kWidth,
-          child: Text('Green light: after ${durationText(widget.gateGap)}, '
+          child: Text('Green light: after ${durationText(_gapOf(h))}, '
               '${chanceText(_gate(h).failure)} chance of recalling fewer than '
               '${h.k} of the ${h.n} sentences.\n\n'
               'From now on only ${h.k} sentences open the vault. It is '
@@ -873,6 +911,80 @@ class _FormosaScreenState extends State<FormosaScreen> {
     _say('${e.label}: removed.');
   }
 
+  // --- copying entries between vaults -------------------------------------------
+
+  static String _entriesText(int n) => '$n entr${n == 1 ? 'y' : 'ies'}';
+
+  /// Whether [e], of the open vault, is held.
+  bool _isHeld(VaultEntry e) =>
+      _heldFrom == _path.text.trim() &&
+      _held.any((VaultEntry h) => h.id == e.id);
+
+  /// Hold [e] to copy it into another vault, or let it go. Holding from
+  /// another vault than the held entries' lets those go first.
+  void _toggleHold(VaultEntry e) {
+    final String path = _path.text.trim();
+    setState(() {
+      if (_heldFrom != path) _discardHeld();
+      _heldFrom = path;
+      _isHeld(e)
+          ? _held.removeWhere((VaultEntry h) => h.id == e.id)
+          : _held.add(e);
+      if (_held.isEmpty) _heldFrom = null;
+    });
+  }
+
+  void _discardHeld() {
+    _held.clear();
+    _heldFrom = null;
+  }
+
+  /// The held entries copied into the open vault, each with a new id and no
+  /// card (not memorised here). Nothing is removed from the other vault.
+  Future<void> _paste() async {
+    final OpenVault v = _vault!;
+    final int stamp = DateTime.now().microsecondsSinceEpoch;
+    final int n = _held.length;
+    final String from = _heldFrom!;
+    setState(() {
+      for (int i = 0; i < n; i++) {
+        final VaultEntry e = _held[i];
+        v.contents.entries.add(VaultEntry(
+            id: '$stamp-$i',
+            label: e.label,
+            secret: e.secret,
+            note: e.note,
+            mnemonic: e.mnemonic));
+      }
+      _discardHeld();
+    });
+    await _save();
+    _say('${_entriesText(n)} copied from $from.');
+  }
+
+  /// The held entries: pasted into the open vault (not their own), or
+  /// discarded.
+  Widget _heldBar() {
+    final int n = _held.length;
+    final bool canPaste =
+        _view == _View.entries && _heldFrom != _path.text.trim();
+    return Wrap(
+      spacing: _kGap,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: <Widget>[
+        Text('${_entriesText(n)} held to copy into another vault, in memory '
+            'only: lock, open the other vault, then paste.'),
+        if (canPaste)
+          FilledButton(
+              onPressed: _busy == null ? _paste : null,
+              child: Text('Paste ${_entriesText(n)}')),
+        TextButton(
+            onPressed: () => setState(_discardHeld),
+            child: const Text('Discard')),
+      ],
+    );
+  }
+
   Future<void> _addEntry() async {
     final VaultEntry? e = await showDialog<VaultEntry>(
       context: context,
@@ -937,6 +1049,10 @@ class _FormosaScreenState extends State<FormosaScreen> {
                   style: Theme.of(context).textTheme.titleLarge),
               const SizedBox(height: _kGap),
               body,
+              if (_held.isNotEmpty) ...<Widget>[
+                const SizedBox(height: _kGap),
+                _heldBar(),
+              ],
               if (_busy != null) ...<Widget>[
                 const SizedBox(height: _kGap),
                 Text(_busy!),
@@ -1197,8 +1313,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        Text('${v.contents.entries.length} entr'
-            '${v.contents.entries.length == 1 ? 'y' : 'ies'} · any '
+        Text('${_entriesText(v.contents.entries.length)} · any '
             '${v.header.k} of ${v.header.n} sentences open it.'),
         for (final VaultEntry e in v.contents.entries)
           ListTile(
@@ -1231,6 +1346,13 @@ class _FormosaScreenState extends State<FormosaScreen> {
                   icon: Icon(_entryCard(e) == null
                       ? Icons.school_outlined
                       : Icons.school),
+                ),
+                IconButton(
+                  tooltip: _isHeld(e)
+                      ? 'Held: let it go'
+                      : 'Hold to copy into another vault',
+                  onPressed: () => _toggleHold(e),
+                  icon: Icon(_isHeld(e) ? Icons.outbox : Icons.outbox_outlined),
                 ),
                 IconButton(
                   tooltip: 'Remove',
@@ -1267,23 +1389,29 @@ class _FormosaScreenState extends State<FormosaScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        Text('Graduation: after ${durationText(widget.gateGap)}, '
+        Text('Graduation: after ${durationText(_gapOf(h))}, '
             '${chanceText(g.failure)} chance of recalling fewer than ${h.k} of '
-            'the ${h.n} sentences (ε ${chanceText(widget.epsilon)}): '
+            'the ${h.n} sentences (ε ${chanceText(_epsilonOf(h))}): '
             '${g.passes ? 'green light' : 'not yet'}.'),
         Text(kept
             ? 'The provisional key opens the vault alone, until you retire it.'
             : 'No provisional key: only ${h.k} sentences open the vault.'),
         const SizedBox(height: _kGap / 2),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: kept
-              ? OutlinedButton(
+        Wrap(
+          spacing: _kGap,
+          children: <Widget>[
+            OutlinedButton(
+                onPressed: _busy == null ? _setGate : null,
+                child: const Text('T and ε…')),
+            if (kept)
+              OutlinedButton(
                   onPressed: _busy == null && g.passes ? _retireKey : null,
                   child: const Text('Retire the provisional key…'))
-              : OutlinedButton(
+            else
+              OutlinedButton(
                   onPressed: _busy == null ? _addKey : null,
                   child: const Text('Add a provisional key…')),
+          ],
         ),
       ],
     );
@@ -1719,4 +1847,123 @@ class _KeyEntryDialogState extends State<_KeyEntryDialog> {
           FilledButton(onPressed: _typed, child: const Text('Open')),
         ],
       );
+}
+
+/// The gate's `T` (days) and `ε` (%) for one vault, the gate previewed as
+/// you type. Pops the settings to keep (null for a default), or null.
+class _GateDialog extends StatefulWidget {
+  const _GateDialog({
+    required this.header,
+    required this.defaultGap,
+    required this.defaultEpsilon,
+    required this.preview,
+  });
+
+  final VaultHeader header;
+  final Duration defaultGap;
+  final double defaultEpsilon;
+  final ({double failure, bool passes}) Function(Duration gap, double epsilon)
+      preview;
+
+  @override
+  State<_GateDialog> createState() => _GateDialogState();
+}
+
+class _GateDialogState extends State<_GateDialog> {
+  late final TextEditingController _days = TextEditingController(
+      text: widget.header.gapSeconds == null
+          ? ''
+          : '${widget.header.gapSeconds! / Duration.secondsPerDay}');
+  late final TextEditingController _percent = TextEditingController(
+      text: widget.header.epsilon == null
+          ? ''
+          : '${widget.header.epsilon! * _FormosaScreenState._kPercentScale}');
+
+  @override
+  void dispose() {
+    _days.dispose();
+    _percent.dispose();
+    super.dispose();
+  }
+
+  /// A positive number in [c], or null (empty: the default).
+  static double? _positive(TextEditingController c) {
+    final double? v = double.tryParse(c.text.trim());
+    return v != null && v > 0 ? v : null;
+  }
+
+  bool _invalid(TextEditingController c) =>
+      c.text.trim().isNotEmpty && _positive(c) == null;
+
+  @override
+  Widget build(BuildContext context) {
+    final double? days = _positive(_days);
+    final double? pct = _positive(_percent);
+    final Duration gap = days == null
+        ? widget.defaultGap
+        : Duration(seconds: (days * Duration.secondsPerDay).round());
+    final double eps = pct == null
+        ? widget.defaultEpsilon
+        : pct / _FormosaScreenState._kPercentScale;
+    final ({double failure, bool passes}) g = widget.preview(gap, eps);
+    final VaultHeader h = widget.header;
+    Widget field(TextEditingController c, String label, String hint) =>
+        SizedBox(
+          width: _FormosaScreenState._kGateFieldWidth,
+          child: TextField(
+            controller: c,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            onChanged: (_) => setState(() {}),
+            decoration: InputDecoration(
+              isDense: true,
+              border: const OutlineInputBorder(),
+              labelText: label,
+              hintText: hint,
+              errorText: _invalid(c) ? 'a positive number' : null,
+            ),
+          ),
+        );
+    return AlertDialog(
+      title: const Text('Graduation: T and ε'),
+      content: SizedBox(
+        width: _FormosaScreenState._kWidth,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            const Text('The provisional key may be retired once the chance of '
+                'recalling fewer than k sentences after T is at most ε. Each '
+                'sentence counts by its forgetting curve; one never graded '
+                'counts as forgotten. An empty field keeps the default.'),
+            const SizedBox(height: _FormosaScreenState._kGap),
+            Wrap(
+              spacing: _FormosaScreenState._kGap,
+              children: <Widget>[
+                field(_days, 'T (days)', durationText(widget.defaultGap)),
+                field(_percent, 'ε (%)', chanceText(widget.defaultEpsilon)),
+              ],
+            ),
+            const SizedBox(height: _FormosaScreenState._kGap),
+            Text('After ${durationText(gap)}, ${chanceText(g.failure)} chance '
+                'of recalling fewer than ${h.k} of the ${h.n} sentences: '
+                '${g.passes ? 'green light' : 'not yet'}.'),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel')),
+        FilledButton(
+          onPressed: _invalid(_days) || _invalid(_percent)
+              ? null
+              : () => Navigator.of(context).pop((
+                    gapSeconds: days == null ? null : gap.inSeconds,
+                    epsilon: pct == null ? null : eps,
+                  )),
+          child: const Text('Set'),
+        ),
+      ],
+    );
+  }
 }

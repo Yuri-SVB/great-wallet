@@ -237,6 +237,29 @@ void main() {
         throwsArgumentError);
   });
 
+  test('the gate\'s T and ε are kept in the clear, through a rewrap', () async {
+    final Opened o = await PassVault.open(
+        await make(),
+        <int, List<int>>{
+          for (final int id in <int>[1, 2, 3, 4]) id: sentences[id]!
+        },
+        derive: counted);
+    expect(o.vault.header.gapSeconds, isNull, reason: 'the defaults');
+    o.vault.header = o.vault.header
+        .withGate(gapSeconds: const Duration(days: 3).inSeconds, epsilon: 1e-3);
+    final VaultHeader saved = PassVault.header(await PassVault.save(o.vault));
+    expect(saved.gapSeconds, const Duration(days: 3).inSeconds);
+    expect(saved.epsilon, 1e-3);
+    final (Uint8List rewrapped, OpenVault _) = await PassVault.rewrap(o.vault,
+        slots: slots.where((VaultSlot s) => s.id != 6).toList(),
+        k: 4,
+        derive: counted);
+    expect(PassVault.header(rewrapped).epsilon, 1e-3);
+    o.vault.header = o.vault.header.withGate();
+    expect(PassVault.header(await PassVault.save(o.vault)).epsilon, isNull,
+        reason: 'back to the defaults');
+  });
+
   test('the clear part cannot be altered unseen', () async {
     final Map<String, dynamic> json =
         jsonDecode(utf8.decode(await make())) as Map<String, dynamic>;

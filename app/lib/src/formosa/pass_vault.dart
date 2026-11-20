@@ -180,6 +180,8 @@ class VaultHeader {
     required this.wraps,
     this.cards = const <MemCard>[],
     this.provisional,
+    this.gapSeconds,
+    this.epsilon,
   });
 
   final KdfParams kdf;
@@ -194,23 +196,37 @@ class VaultHeader {
   /// The provisional key's wrapping of the data key, until it is retired.
   final KeyWrap? provisional;
 
+  /// The graduation gate's target gap `T`, in seconds, and its threshold
+  /// `ε`, as you set them; null: the app's defaults.
+  final int? gapSeconds;
+  final double? epsilon;
+
   /// This header with [cards] in place of its own.
-  VaultHeader withCards(List<MemCard> cards) => VaultHeader(
-      kdf: kdf,
-      k: k,
-      slots: slots,
-      wraps: wraps,
-      cards: cards,
-      provisional: provisional);
+  VaultHeader withCards(List<MemCard> cards) => _copy(cards: cards);
 
   /// This header with [provisional] in place of its own.
-  VaultHeader withProvisional(KeyWrap? provisional) => VaultHeader(
-      kdf: kdf,
-      k: k,
-      slots: slots,
-      wraps: wraps,
-      cards: cards,
-      provisional: provisional);
+  VaultHeader withProvisional(KeyWrap? provisional) =>
+      _copy(provisional: (provisional,));
+
+  /// This header with the gate's [gapSeconds] and [epsilon] (null: the
+  /// defaults) in place of its own.
+  VaultHeader withGate({int? gapSeconds, double? epsilon}) =>
+      _copy(gate: (gapSeconds, epsilon));
+
+  VaultHeader _copy({
+    List<MemCard>? cards,
+    (KeyWrap?,)? provisional,
+    (int?, double?)? gate,
+  }) =>
+      VaultHeader(
+          kdf: kdf,
+          k: k,
+          slots: slots,
+          wraps: wraps,
+          cards: cards ?? this.cards,
+          provisional: provisional == null ? this.provisional : provisional.$1,
+          gapSeconds: gate == null ? gapSeconds : gate.$1,
+          epsilon: gate == null ? epsilon : gate.$2);
 
   /// Slot [slot]'s card, if it has one.
   MemCard? cardOf(int slot) {
@@ -255,6 +271,8 @@ class VaultHeader {
             'nonce': _hex(p.nonce),
             'key': base64Encode(p.sealed),
           },
+        if (gapSeconds != null) 'T': gapSeconds,
+        if (epsilon != null) 'eps': epsilon,
       };
 
   List<int> get _aad => utf8.encode(jsonEncode(toJson()));
@@ -424,7 +442,7 @@ abstract final class PassVault {
         dataKey: v._dataKey,
         derive: derive,
         rng: rng,
-        previous: v.header.cards,
+        previous: v.header,
         onProgress: onProgress);
     // A retired sentence leaves the vault entirely.
     v.contents.sentences
@@ -484,7 +502,7 @@ abstract final class PassVault {
         dataKey: dataKey,
         derive: derive,
         rng: rng,
-        previous: v.header.cards,
+        previous: v.header,
         onProgress: onProgress);
     final OpenVault next = OpenVault(header, v.contents, dataKey);
     return (await save(next, random: rng), next);
@@ -537,7 +555,7 @@ abstract final class PassVault {
     required SecretKey dataKey,
     required VaultKdf derive,
     required Random rng,
-    List<MemCard> previous = const <MemCard>[],
+    VaultHeader? previous,
     void Function(int done, int total)? onProgress,
   }) async {
     if (k < minK || k > slots.length) {
@@ -585,14 +603,16 @@ abstract final class PassVault {
     // Each slot's card: the one it had, or a new one for a new sentence.
     final List<MemCard> cards = <MemCard>[
       for (final VaultSlot s in slots)
-        <MemCard?>[
-              for (final MemCard c in previous)
-                if (c.factId == sentenceFact(s.id)) c,
-            ].firstOrNull ??
-            MemCard.fact(sentenceFact(s.id)),
+        previous?.cardOf(s.id) ?? MemCard.fact(sentenceFact(s.id)),
     ];
     return VaultHeader(
-        kdf: kdf, k: k, slots: slots, wraps: wraps, cards: cards);
+        kdf: kdf,
+        k: k,
+        slots: slots,
+        wraps: wraps,
+        cards: cards,
+        gapSeconds: previous?.gapSeconds,
+        epsilon: previous?.epsilon);
   }
 
   /// The file for [v]: its contents re-encrypted under its data key, with
@@ -770,6 +790,11 @@ abstract final class PassVault {
           (salt: _unhex(salt), nonce: _unhex(nonce), sealed: base64Decode(key)),
         _ => throw bad,
       };
+      final Object? gap = json['T'], eps = json['eps'];
+      if ((gap != null && (gap is! int || gap <= 0)) ||
+          (eps != null && (eps is! num || eps <= 0))) {
+        throw bad;
+      }
       return (
         VaultHeader(
             kdf: KdfParams.fromJson(json['kdf']),
@@ -777,7 +802,9 @@ abstract final class PassVault {
             slots: s,
             wraps: w,
             cards: _cardsOf(json['cards']),
-            provisional: p),
+            provisional: p,
+            gapSeconds: gap as int?,
+            epsilon: (eps as num?)?.toDouble()),
         _unhex(nonce),
         base64Decode(ct),
       );
