@@ -158,7 +158,9 @@ void main() {
     // Every map of the stage is a card: the 2 placed and the 7 derived.
     expect(log(), contains('Stage 0: needs 2 maps; 9 in the deck'));
     // Nothing graded yet: the gate is not met.
-    expect(log(), contains('chance of recalling fewer than 2 of its 9 maps'));
+    // No map set as studied yet, and no fact graded: the gate is not met.
+    expect(log(), contains('no maps set as studied'));
+    expect(log(), contains('facts not yet holding'));
     expect(log(), contains('Graduation: not yet'));
 
     // Graduation (Train board X): the stage at the gate, T and ε to set.
@@ -169,7 +171,8 @@ void main() {
     await tester.sendKeyEvent(LogicalKeyboardKey.keyX);
     await tester.pumpAndSettle();
     expect(find.text('Graduation'), findsOneWidget);
-    expect(find.textContaining('Stage 0: after '), findsOneWidget);
+    expect(find.textContaining('Stage 0: no maps set as studied'),
+        findsOneWidget);
     expect(find.widgetWithText(TextField, 'T (days)'), findsOneWidget);
     expect(find.widgetWithText(TextField, 'ε (%)'), findsOneWidget);
     expect(find.text('Wipe the setup file…'), findsNothing);
@@ -191,6 +194,12 @@ void main() {
     await tester.enterText(find.widgetWithText(TextField, 'Answer'), 'SIGN-1');
     await tester.tap(find.text('Add card'));
     await tester.pumpAndSettle();
+    // The maps studied: none graded yet, so nothing is prefilled; tick 1 and 2.
+    await tester.ensureVisible(find.widgetWithText(FilterChip, '1'));
+    await tester.tap(find.widgetWithText(FilterChip, '1'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilterChip, '2'));
+    await tester.pumpAndSettle();
     expect(find.text('Export salt'), findsOneWidget);
     await tester.tap(find.text('Done'));
     await tester.pumpAndSettle();
@@ -198,6 +207,24 @@ void main() {
     // Train: the supply chain's card on a third row, by click; the salt's at
     // stage 0, slot 0.
     expect(find.widgetWithText(OutlinedButton, 'Supply chain'), findsOneWidget);
+    for (final String tab in <String>['m', 'D', 'N', 'Maps of stage 0']) {
+      expect(find.widgetWithText(OutlinedButton, tab), findsOneWidget,
+          reason: tab);
+    }
+    // The gate now counts the 2 maps studied.
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyW);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyR);
+    await tester.pump();
+    expect(log(), contains('fewer than 2 of the 2 maps you study'));
+    // The selection card, from the third row.
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Maps of stage 0'));
+    await tester.pumpAndSettle();
+    expect(find.text('Maps you study, stage 0'), findsOneWidget);
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
     await tester.sendKeyEvent(LogicalKeyboardKey.digit0);
     await tester.pumpAndSettle();
     expect(find.text('Salt (Namtso)'), findsOneWidget);

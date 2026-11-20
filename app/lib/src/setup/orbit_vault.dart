@@ -2,7 +2,7 @@ import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
     show Deck;
 
 import '../ffi/core_bindings.dart' show Argon2Profile, kOrbitPointLen;
-import 'fact_cards.dart' show CustomFact;
+import 'fact_cards.dart' show CustomFact, kMapsPerStage;
 
 /// The serializable **orbit provisional key** — everything needed to restore a
 /// *settled* orbit setup **without re-running the memory-hard advance**: the
@@ -42,6 +42,7 @@ class OrbitVault {
     this.gapSeconds,
     this.epsilon,
     this.facts = const <CustomFact>[],
+    this.studied = const <List<int>>[],
   });
 
   /// On-disk format version written by this build.
@@ -112,6 +113,10 @@ class OrbitVault {
   /// Your own fact cards: prompts and answers. Their schedules are in [deck].
   final List<CustomFact> facts;
 
+  /// Per stage (by index), the maps you study — the selection cards'
+  /// answers; empty where none is set.
+  final List<List<int>> studied;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
         'v': formatVersion,
         kindKey: kind,
@@ -130,6 +135,7 @@ class OrbitVault {
           'facts': <Map<String, dynamic>>[
             for (final CustomFact f in facts) f.toJson(),
           ],
+        if (studied.any((List<int> s) => s.isNotEmpty)) 'studied': studied,
       };
 
   /// Rebuild a vault from decoded JSON. Throws a generic [FormatException] on any
@@ -176,7 +182,26 @@ class OrbitVault {
       gapSeconds: _optionalPositive(json, 'gapSeconds')?.round(),
       epsilon: _optionalPositive(json, 'epsilon'),
       facts: _facts(json['facts']),
+      studied: _studied(json['studied'], rawStages.length),
     );
+  }
+
+  /// The studied-maps section: absent, or per stage a list of distinct slots
+  /// in 1..[kMapsPerStage]; no more lists than [stages].
+  static List<List<int>> _studied(Object? raw, int stages) {
+    if (raw == null) return const <List<int>>[];
+    if (raw is! List || raw.length > stages) {
+      throw const FormatException('bad vault');
+    }
+    return <List<int>>[
+      for (final Object? s in raw)
+        if (s is List &&
+            s.every((Object? v) => v is int && v >= 1 && v <= kMapsPerStage) &&
+            s.toSet().length == s.length)
+          <int>[for (final Object? v in s) v! as int]
+        else
+          throw const FormatException('bad vault'),
+    ];
   }
 
   /// The facts section: absent, or a list of [CustomFact]s.

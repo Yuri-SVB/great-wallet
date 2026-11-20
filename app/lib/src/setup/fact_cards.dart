@@ -6,7 +6,7 @@
 library;
 
 import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
-    show CardKind, MemCard;
+    show CardKind, MemCard, MemSchedule;
 
 /// The Namtso salt's card (always on): its date re-harvested, or σ itself.
 const String kSaltFact = 'salt';
@@ -22,6 +22,31 @@ const List<String> kParameterFacts = <String>[
   kIterationsFact,
   kStagesFact,
 ];
+
+/// The maps (fractal slots) of a stage, numbered from 1.
+const int kMapsPerStage = 9;
+
+/// The prefix of the selection cards' ids, `maps:<stage>`: which of a stage's
+/// maps you study, so a map that looks like another is not the one tried.
+const String kSelectionPrefix = 'maps:';
+
+/// The selection card of [stage].
+String selectionFact(int stage) => '$kSelectionPrefix$stage';
+
+/// The stage a selection card is for, or null for any other fact.
+int? selectionStage(String factId) => factId.startsWith(kSelectionPrefix)
+    ? int.tryParse(factId.substring(kSelectionPrefix.length))
+    : null;
+
+/// Whether the maps ticked, [given], are exactly the ones studied, [studied].
+bool selectionMatches(Set<int> given, Set<int> studied) =>
+    given.length == studied.length && given.containsAll(studied);
+
+/// Whether a fact card holds until [at]: its chance of recall then, by the
+/// forgetting curve, is at least the chance when due (`r*`). A fact is one
+/// answer with no forgiveness, so it gates graduation this way, not by `ε`.
+bool factHolds(MemSchedule schedule, MemCard card, DateTime at) =>
+    (schedule.recall(card, at) ?? 0) >= schedule.forgetting.retentionAtDue;
 
 /// The supply-chain card (optional): the release's commit digest, pasted
 /// after cloning, building and running it anew.
@@ -85,6 +110,7 @@ bool isReviewedFact(MemCard card) =>
     card.kind == CardKind.fact &&
     (card.factId == kSaltFact ||
         kParameterFacts.contains(card.factId) ||
+        card.factId.startsWith(kSelectionPrefix) ||
         card.factId == kProvenanceFact ||
         card.factId.startsWith(kCustomPrefix));
 
@@ -96,6 +122,8 @@ String factName(MemCard card, Map<String, CustomFact> custom) =>
       kIterationsFact => 'Derivation steps (D)',
       kStagesFact => 'Deep stages (N)',
       kProvenanceFact => 'Supply chain',
+      final String id when selectionStage(id) != null =>
+        'Maps you study, stage ${selectionStage(id)}',
       final String id => custom[id]?.prompt ?? id,
     };
 

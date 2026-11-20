@@ -270,6 +270,11 @@ class _SetupScreenState extends State<SetupScreen>
   /// setup; their schedules are in the deck.
   final Map<String, CustomFact> _customFacts = <String, CustomFact>{};
 
+  /// Per stage, the maps you study (set in Cards): the selection cards'
+  /// answers, and the only maps the graduation gate counts. Saved with the
+  /// setup.
+  final Map<int, Set<int>> _studied = <int, Set<int>>{};
+
   /// The fact card *next due map* last opened, so the next press moves past
   /// it (even when it was cancelled); null when it last went to a map.
   String? _lastDueFact;
@@ -320,7 +325,10 @@ class _SetupScreenState extends State<SetupScreen>
   /// Every stage of the open setup at the graduation gate, [gap] from now,
   /// against [epsilon].
   List<StageGate> _gatesWith(Duration gap, double epsilon) => graduationGates(
-        Deck(_trainCards),
+        Deck(<MemCard>[
+          for (final MemCard c in _trainCards)
+            if (_studied[c.stageIndex]?.contains(c.slot) ?? false) c,
+        ]),
         <int>[for (int i = 0; i <= _orbitDeepestStage; i++) _requiredOf(i)],
         _schedule.clock.now().add(gap),
         _schedule,
@@ -328,10 +336,37 @@ class _SetupScreenState extends State<SetupScreen>
       );
 
   /// A stage at the gate, in words.
-  static String _gateText(StageGate g, Duration gap) =>
-      'after ${durationText(gap)}, ${chanceText(g.failure)} chance of '
-      'recalling fewer than ${g.required} of its ${g.maps} maps — '
-      '${g.passes ? 'passes' : 'not yet'}';
+  String _gateText(StageGate g, Duration gap) => g.maps == 0 &&
+          (_studied[g.stage]?.isEmpty ?? true)
+      ? 'no maps set as studied — tick them in Cards (${_hint(_Cmd.cards)})'
+      : 'after ${durationText(gap)}, ${chanceText(g.failure)} chance of '
+          'recalling fewer than ${g.required} of the ${g.maps} maps you study '
+          '— ${g.passes ? 'passes' : 'not yet'}';
+
+  /// The fact cards graduation needs — the salt's, the setup's parameters and
+  /// each stage's selection — that do not hold [gap] from now ([factHolds]),
+  /// by name. A stage with no maps set as studied has no selection card, so
+  /// it is named too.
+  List<String> _factsShort(Duration gap) {
+    final DateTime at = _schedule.clock.now().add(gap);
+    final List<MemCard> cards = _deck?.cards ?? const <MemCard>[];
+    return <String>[
+      for (final String id in <String>[
+        kSaltFact,
+        ...kParameterFacts,
+        for (int i = 0; i <= _orbitDeepestStage; i++) selectionFact(i),
+      ])
+        if (!cards.any(
+            (MemCard c) => c.factId == id && factHolds(_schedule, c, at)))
+          factName(MemCard.fact(id), _customFacts),
+    ];
+  }
+
+  /// The facts short of holding, in words: why the green light waits.
+  static String _factsText(List<String> short) =>
+      'facts not yet holding for the gap (each needs its chance of recall '
+      'after it at ${percentText(kRetentionAtDue)} or more): '
+      '${short.join(', ')}';
 
   /// Stops were shown or the route changed during this attempt: practice.
   bool _attemptAided = false;
@@ -379,8 +414,8 @@ class _SetupScreenState extends State<SetupScreen>
   int _slotIndex = 0;
 
   /// Highest secondary slot index — a fixed row of ten tabs (`0..9`), one per
-  /// digit key.
-  static const int _maxSlot = 9;
+  /// digit key: the salt, then the stage's maps.
+  static const int _maxSlot = kMapsPerStage;
 
   /// The **orbit** stage cursor (`0..`[_maxStage]). Stage 0 is rooted by σ; a
   /// deep stage is entered by the forward memory-hard advance
@@ -1004,8 +1039,7 @@ press.calibrate.target    tick_soft.wav
                               children: <Widget>[
                                 _stageTabs(),
                                 _slotTabs(),
-                                if (_training && _provenanceOn)
-                                  _factTabs(),
+                                if (_training) _factTabs(),
                               ],
                             ),
                           ),
@@ -1123,31 +1157,64 @@ press.calibrate.target    tick_soft.wav
     );
   }
 
-  /// The third row (Train): the supply-chain card, opened by clicking it.
+  /// The third row (Train): the cards without a map of their own — the
+  /// setup's parameters `m`, `D` and `N`, the active stage's selection (once
+  /// set) and the supply chain's (when on) — each opened by clicking it.
   Widget _factTabs() {
-    const String help = 'Supply chain: could you rebuild this app yourself? '
-        'Paste the release\'s commit digest after cloning and building it '
-        'anew. Click to review.';
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 6),
+    Widget tab(String id, IconData icon, String label, String help) {
+      MemCard? card;
+      for (final MemCard c in _deck?.cards ?? const <MemCard>[]) {
+        if (c.factId == id) card = c;
+      }
+      final MemCard? found = card;
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: _kFactTabGap),
         child: MouseRegion(
           onEnter: (_) => _explain(help),
           onExit: (_) => _explain(null),
           child: OutlinedButton.icon(
-            onPressed: () {
-              final MemCard card = _deck!.cards
-                  .firstWhere((MemCard c) => c.factId == kProvenanceFact);
-              unawaited(_reviewFact(card));
-            },
-            icon: const Icon(Icons.verified_outlined),
-            label: const Text('Supply chain'),
+            onPressed:
+                found == null ? null : () => unawaited(_reviewFact(found)),
+            icon: Icon(icon),
+            label: Text(label),
           ),
+        ),
+      );
+    }
+
+    final int stage = _activeStage;
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: _kFactTabGap * 2),
+        child: Wrap(
+          children: <Widget>[
+            tab(kProfileFact, Icons.memory, 'm',
+                'Memory profile (m): which Argon2 profile this setup derives '
+                'with, as for a hard reset. Click to review.'),
+            tab(kIterationsFact, Icons.repeat, 'D',
+                'Derivation steps (D): the Argon2 iterations each stage runs, '
+                'as for a hard reset. Click to review.'),
+            tab(kStagesFact, Icons.layers, 'N',
+                'Deep stages (N): how many stages this setup has beyond '
+                'stage 0. Click to review.'),
+            if (_studied[stage]?.isNotEmpty ?? false)
+              tab(selectionFact(stage), Icons.checklist, 'Maps of stage $stage',
+                  'Which maps of stage $stage you study: two maps can look '
+                  'alike. Click to review.'),
+            if (_provenanceOn)
+              tab(kProvenanceFact, Icons.verified_outlined, 'Supply chain',
+                  'Supply chain: could you rebuild this app yourself? Paste '
+                  'the release\'s commit digest after cloning, building and '
+                  'running it anew. Click to review.'),
+          ],
         ),
       ),
     );
   }
+
+  /// Space around each tab of the third row.
+  static const double _kFactTabGap = 3;
 
   // --- salt slot (`#0`) content ---------------------------------------------
 
@@ -2187,6 +2254,8 @@ press.calibrate.target    tick_soft.wav
     for (final String id in <String>[
       kSaltFact,
       ...kParameterFacts,
+      for (final MapEntry<int, Set<int>> e in _studied.entries)
+        if (e.value.isNotEmpty) selectionFact(e.key),
       ..._customFacts.keys,
     ]) {
       if (!out.cards.any((MemCard c) => c.factId == id)) {
@@ -3453,6 +3522,13 @@ press.calibrate.target    tick_soft.wav
           answer: _orbitDeepestStage,
           practice: practice),
       kProvenanceFact => ProvenanceDialog(practice: practice),
+      final String id when _studied[selectionStage(id)] != null =>
+        SelectionDialog(
+          stage: selectionStage(id)!,
+          maps: kMapsPerStage,
+          studied: _studied[selectionStage(id)]!,
+          practice: practice,
+        ),
       _ when custom != null =>
         CustomFactDialog(fact: custom, practice: practice),
       _ => null,
@@ -3559,10 +3635,12 @@ press.calibrate.target    tick_soft.wav
           '${due.isEmpty ? '' : '; due: map${due.length == 1 ? '' : 's'} '
               '${due.join(', ')}'}.');
     }
-    _toast(gates.every((StageGate g) => g.passes)
-        ? 'Green light: every stage passes the graduation gate — you may '
-            'shred the provisional key (${_hint(_Cmd.wipe)} wipes the setup '
-            'file).'
+    final List<String> short = _factsShort(_gap);
+    if (short.isNotEmpty) _toast('Graduation: ${_factsText(short)}.');
+    _toast(gates.every((StageGate g) => g.passes) && short.isEmpty
+        ? 'Green light: every stage passes the graduation gate and every '
+            'fact holds — you may shred the provisional key '
+            '(${_hint(_Cmd.wipe)} wipes the setup file).'
         : 'Graduation: not yet (ε ${chanceText(_epsilon)}; '
             '${_hint(_Cmd.graduation)} sets it and the gap).');
   }
@@ -3596,7 +3674,9 @@ press.calibrate.target    tick_soft.wav
             final double eps =
                 pct != null && pct > 0 ? pct / _kPercentScale : _epsilon;
             final List<StageGate> gates = _gatesWith(gap, eps);
-            final bool green = gates.every((StageGate g) => g.passes);
+            final List<String> short = _factsShort(gap);
+            final bool green =
+                gates.every((StageGate g) => g.passes) && short.isEmpty;
 
             Future<void> apply() async {
               if (days != null && days > 0 && derivation != null &&
@@ -3673,8 +3753,10 @@ press.calibrate.target    tick_soft.wav
                       Text(
                         'A stage graduates when the chance of recalling fewer '
                         'than its required maps, after the gap T, is at most '
-                        'ε. Any of its maps count, so a few recalled very '
-                        'well pass as well as more recalled less well. '
+                        'ε. The maps you study count, so a few recalled very '
+                        'well pass as well as more recalled less well. Each '
+                        'fact — the salt, m, D, N and the maps you study per '
+                        'stage — must also hold for T. '
                         'Derivation (hard reset): '
                         '${derivation == null ? 'unknown — calibrate on the '
                             'Setup board' : durationText(derivation)}.',
@@ -3692,11 +3774,14 @@ press.calibrate.target    tick_soft.wav
                       const SizedBox(height: 12),
                       for (final StageGate g in gates)
                         Text('Stage ${g.stage}: ${_gateText(g, gap)}.'),
+                      if (short.isNotEmpty)
+                        Text('${_factsText(short)}.'),
                       const SizedBox(height: 12),
                       Text(
                         green
-                            ? 'Green light: every stage passes — you may '
-                                'shred the provisional key.'
+                            ? 'Green light: every stage passes and every '
+                                'fact holds — you may shred the provisional '
+                                'key.'
                             : 'Not yet: keep training, or grade honestly '
                                 'lower where recall falls short — reviews '
                                 'come sooner.',
@@ -4200,6 +4285,7 @@ press.calibrate.target    tick_soft.wav
     _mapsChanged((int _, int __) => true);
     _deck = null;
     _customFacts.clear();
+    _studied.clear();
     _dropPaths();
     _boardCanonicalView = false;
   }
@@ -4926,6 +5012,10 @@ press.calibrate.target    tick_soft.wav
       epsilon:
           _epsilon == GraduationParams.defaultEpsilon ? null : _epsilon,
       facts: _customFacts.values.toList(),
+      studied: <List<int>>[
+        for (int i = 0; i <= deepest; i++)
+          (_studied[i] ?? const <int>{}).toList()..sort(),
+      ],
       sigma: _sigmaCtrl.text.trim().replaceAll(RegExp(r'\s'), ''),
       iterations: _iterations,
       profile: _profile,
@@ -5113,6 +5203,12 @@ press.calibrate.target    tick_soft.wav
         ..clear()
         ..addAll(<String, CustomFact>{
           for (final CustomFact f in vault.facts) f.id: f,
+        });
+      _studied
+        ..clear()
+        ..addAll(<int, Set<int>>{
+          for (int i = 0; i < vault.studied.length; i++)
+            if (vault.studied[i].isNotEmpty) i: vault.studied[i].toSet(),
         });
       if (_deck != null) _deck = _withAlwaysOnFacts(_deck!);
       for (int i = 1; i <= deepest; i++) {
@@ -6206,10 +6302,41 @@ press.calibrate.target    tick_soft.wav
   /// Width of the cards manager.
   static const double _kCardsWidth = 520;
 
+  /// Width of the stage labels before the studied-maps checkboxes.
+  static const double _kStudiedLabelWidth = 64;
+
+  /// [deck] with stage [stage]'s selection card as [_studied] now has it: a
+  /// fresh card when the maps changed (its answer is new), none when no map
+  /// is set.
+  Deck _withSelectionCard(Deck deck, int stage) {
+    final String id = selectionFact(stage);
+    final Deck without =
+        Deck(<MemCard>[for (final MemCard c in deck.cards) if (c.factId != id) c]);
+    return (_studied[stage]?.isEmpty ?? true)
+        ? without
+        : without.withCard(MemCard.fact(id));
+  }
+
   /// The cards manager (Main board X): the salt's card, the supply chain's
   /// (on or off, with what it is), and your own (added and removed here).
   Future<void> _showCardsManager() async {
-    setState(() => _deck ??= _deckForSave(_orbitDeepestStage));
+    final int deepest = _orbitDeepestStage;
+    setState(() {
+      _deck ??= _deckForSave(deepest);
+      // A stage with no maps set as studied starts from the maps you graded.
+      for (int i = 0; i <= deepest; i++) {
+        if (_studied[i]?.isNotEmpty ?? false) continue;
+        final Set<int> graded = <int>{
+          for (final MemCard c in _deck!.cards)
+            if (c.kind == CardKind.point && c.stageIndex == i && c.due != null)
+              c.slot,
+        };
+        if (graded.isEmpty) continue;
+        _studied[i] = graded;
+        _deck = _withSelectionCard(_deck!, i);
+        _deckDirty = true;
+      }
+    });
     final TextEditingController prompt = TextEditingController();
     final TextEditingController answer = TextEditingController();
     final DialogRoute<void> route = DialogRoute<void>(
@@ -6256,6 +6383,12 @@ press.calibrate.target    tick_soft.wav
                   for (final MemCard c in _deck!.cards)
                     if (c.factId != id) c,
                 ]);
+              });
+
+          void study(int stage, int slot, bool on) => change(() {
+                final Set<int> maps = _studied.putIfAbsent(stage, () => <int>{});
+                on ? maps.add(slot) : maps.remove(slot);
+                _deck = _withSelectionCard(_deck!, stage);
               });
 
           void provenance(bool on) => change(() {
@@ -6306,6 +6439,36 @@ press.calibrate.target    tick_soft.wav
                         value: _provenanceOn,
                         onChanged: provenance,
                       ),
+                      const Divider(),
+                      const Text('The maps you study, per stage: the gate '
+                          'counts only these, and each stage has a card to '
+                          'recall which they are (prefilled with the maps '
+                          'you graded).'),
+                      for (int i = 0; i <= deepest; i++)
+                        Row(
+                          children: <Widget>[
+                            SizedBox(
+                              width: _kStudiedLabelWidth,
+                              child: Text('Stage $i'),
+                            ),
+                            Expanded(
+                              child: Wrap(
+                                children: <Widget>[
+                                  for (int j = 1; j <= kMapsPerStage; j++)
+                                    FilterChip(
+                                      visualDensity: VisualDensity.compact,
+                                      label: Text('$j'),
+                                      selected:
+                                          _studied[i]?.contains(j) ?? false,
+                                      onSelected: _isMap(i, j)
+                                          ? (bool on) => study(i, j, on)
+                                          : null,
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
                       const Divider(),
                       Text('Your own cards (${_customFacts.length} of '
                           '$kMaxCustomFacts)'),

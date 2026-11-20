@@ -421,6 +421,63 @@ class _CountDialogState extends State<CountDialog> {
       );
 }
 
+/// A stage's selection card: which of its [maps] maps you study, ticked from
+/// memory and compared with [studied].
+class SelectionDialog extends StatefulWidget {
+  const SelectionDialog({
+    super.key,
+    required this.stage,
+    required this.maps,
+    required this.studied,
+    this.practice,
+  });
+
+  final int stage;
+  final int maps;
+  final Set<int> studied;
+  final String? practice;
+
+  @override
+  State<SelectionDialog> createState() => _SelectionDialogState();
+}
+
+class _SelectionDialogState extends State<SelectionDialog> {
+  final Set<int> _ticked = <int>{};
+
+  String _list(Set<int> s) => (s.toList()..sort()).join(', ');
+
+  @override
+  Widget build(BuildContext context) => FactReviewFrame(
+        title: factName(MemCard.fact(selectionFact(widget.stage)),
+            const <String, CustomFact>{}),
+        about: 'Tick the maps of stage ${widget.stage} you study — the ones '
+            'whose points you recall. Two maps can look alike: knowing which '
+            'ones are yours keeps you from trying the wrong one.',
+        practice: widget.practice,
+        body: Wrap(
+          spacing: _kGap / 2,
+          children: <Widget>[
+            for (int j = 1; j <= widget.maps; j++)
+              FilterChip(
+                label: Text('$j'),
+                selected: _ticked.contains(j),
+                onSelected: (bool on) => setState(
+                    () => on ? _ticked.add(j) : _ticked.remove(j)),
+              ),
+          ],
+        ),
+        check: () async {
+          final bool hit = selectionMatches(_ticked, widget.studied);
+          return FactCheck(
+            hit: hit,
+            message: hit
+                ? 'Right.'
+                : 'Missed — you study maps ${_list(widget.studied)}.',
+          );
+        },
+      );
+}
+
 /// The Namtso salt's card: its date, re-harvested and compared with the
 /// stored σ, or σ itself; and, optionally, a burial's date and label,
 /// unburied and compared with the setup's orbit points (informative only).

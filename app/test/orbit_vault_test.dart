@@ -138,6 +138,30 @@ void main() {
       expect(OrbitVault.fromJson(sample().toJson()).facts, isEmpty);
     });
 
+    test('the maps studied per stage round-trip; bad ones are refused', () {
+      final OrbitVault v = OrbitVault(
+        sigma: 'DEADBEEF',
+        iterations: 5,
+        profile: Argon2Profile.basic,
+        stages: sample().stages,
+        studied: const <List<int>>[<int>[1, 2, 4], <int>[]],
+      );
+      final OrbitVault back = OrbitVault.fromJson(v.toJson());
+      expect(back.studied, <List<int>>[<int>[1, 2, 4], <int>[]]);
+      expect(sample().toJson().containsKey('studied'), isFalse);
+      for (final Object bad in <Object>[
+        <Object>[<int>[0]],
+        <Object>[<int>[kMapsPerStage + 1]],
+        <Object>[<int>[2, 2]],
+        <Object>[<int>[], <int>[], <int>[1]], // more lists than stages
+        'x',
+      ]) {
+        final Map<String, dynamic> json = sample().toJson()..['studied'] = bad;
+        expect(() => OrbitVault.fromJson(json), throwsFormatException,
+            reason: 'studied = $bad');
+      }
+    });
+
     test('a non-positive or non-numeric setting is refused', () {
       for (final Object bad in <Object>[0, -1, 'x']) {
         final Map<String, dynamic> json = sample().toJson()..['epsilon'] = bad;
