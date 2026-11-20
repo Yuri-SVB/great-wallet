@@ -4,6 +4,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart'
     show defaultTargetPlatform, kIsWeb, TargetPlatform;
+import 'package:cryptography/cryptography.dart' show SecretKey;
 import 'package:flutter/material.dart';
 import 'package:dragon_dice_ui/dragon_dice_ui.dart'
     show DiceCue, DiceRolls, DragonDiceWizard, digestBits;
@@ -275,6 +276,22 @@ class _SetupScreenState extends State<SetupScreen>
   /// answers, and the only maps the graduation gate counts. Saved with the
   /// setup.
   final Map<int, Set<int>> _studied = <int, Set<int>>{};
+
+  /// Stage 0's bundle, while one is open in place of a setup file: its path
+  /// and clear header (its maps render from θ₀ until σ is back), and — once
+  /// stage 0's points opened it — its key, so a save reseals it without
+  /// deriving again.
+  String? _bundlePath;
+  Stage0Header? _bundleHeader;
+  SecretKey? _bundleKey;
+  bool _bundleOpening = false;
+
+  /// Leave stage 0's bundle (a reset, another file, a wipe).
+  void _closeBundle() {
+    _bundlePath = null;
+    _bundleHeader = null;
+    _bundleKey = null;
+  }
 
   /// The fact card *next due map* last opened, so the next press moves past
   /// it (even when it was cancelled); null when it last went to a map.
@@ -605,7 +622,7 @@ class _SetupScreenState extends State<SetupScreen>
   /// Rewrites of the setup file at random times while the app runs, so its
   /// file times do not tell when a training session saved it.
   late final CoverWrites _coverWrites = CoverWrites(write: () async {
-    final String path = _vaultPath.text.trim();
+    final String path = _bundlePath ?? _vaultPath.text.trim();
     if (path.isEmpty || _vaultBusy) return;
     await _fileLocked(() => rewriteSame(path));
   });
@@ -2254,7 +2271,8 @@ press.calibrate.target    tick_soft.wav
     Deck out = deck;
     for (final String id in <String>[
       kSaltFact,
-      ...kParameterFacts,
+      // Stage 0's bundle holds no answer for m, D or N: they stay out of it.
+      if (_bundlePath == null) ...kParameterFacts,
       for (final MapEntry<int, Set<int>> e in _studied.entries)
         if (e.value.isNotEmpty) selectionFact(e.key),
       ..._customFacts.keys,
@@ -3035,10 +3053,18 @@ press.calibrate.target    tick_soft.wav
   /// Board reservoirs `(o, p, q)` for the active stage's slot [slot] (board
   /// `θ_i_(slot-1)`), or null when the stage's `o_i` is unavailable. Cheap
   /// (`orbitRoot`/`theta`).
-  ({int o, int p, int q})? _boardPrm(int slot) {
-    final Uint8List? oi = _stageOrbit(_activeStage);
-    if (oi == null) return null;
-    return OrbitProtocol(widget.core).orbitParams(oi, slot - 1);
+  ({int o, int p, int q})? _boardPrm(int slot) => _mapPrm(_activeStage, slot);
+
+  /// Map [slot]'s `(o, p, q)` at [stage]: from its `o_i`, or — for stage 0
+  /// with σ unknown and stage 0's bundle open — from the bundle's θ₀.
+  ({int o, int p, int q})? _mapPrm(int stage, int slot) {
+    final Uint8List? oi = _stageOrbit(stage);
+    if (oi != null) return OrbitProtocol(widget.core).orbitParams(oi, slot - 1);
+    final Stage0Header? b = _bundleHeader;
+    if (stage != 0 || b == null || slot < 1 || slot > b.theta.length) {
+      return null;
+    }
+    return OrbitProtocol.paramsOf(b.theta[slot - 1]);
   }
 
   /// Discovery params for resolving a canonical island's *shape* — the engine's
@@ -3837,6 +3863,10 @@ press.calibrate.target    tick_soft.wav
   /// Save the training progress into the setup file, under the key that
   /// opened it: the key must open the file it replaces.
   Future<void> _saveProgress() async {
+    if (_bundleKey != null) {
+      await _resealBundle();
+      return;
+    }
     final String path = _vaultPath.text.trim();
     if (path.isEmpty) {
       _sounds.play(UiSound.denyInput);
@@ -4171,7 +4201,16 @@ press.calibrate.target    tick_soft.wav
     final List<int> chosen =
         placed.length > r ? placed.sublist(0, r) : placed;
     final Uint8List? oi = _stageOrbit(stage);
-    if (oi == null) return;
+    if (oi == null) {
+      // Stage 0's bundle, σ not back yet: its r₀ points now try to open it.
+      if (stage == 0 &&
+          _bundleHeader != null &&
+          _bundleKey == null &&
+          !_bundleOpening) {
+        unawaited(_openBundleWithPoints());
+      }
+      return;
+    }
     final OrbitProtocol orbit = OrbitProtocol(widget.core);
     // Interpolate Sh_i over the chosen slots at abscissa = slot index.
     final List<int> xs = <int>[for (final int s in chosen) s];
@@ -4303,17 +4342,16 @@ press.calibrate.target    tick_soft.wav
     // Cache key: stage 0 keys on the σ text (so no `orbitRoot` hash runs on a
     // pan/zoom rebuild); deep stages key on `stage#slot` alone, since their `o_i`
     // is stable until an advance / σ change — both of which reset [_boardKey].
-    final String key =
-        stage == 0 ? '0#$slot#${_sigmaCtrl.text.trim()}' : '$stage#$slot';
+    final String key = stage == 0
+        ? '0#$slot#${_sigmaCtrl.text.trim()}#${_bundleHeader != null}'
+        : '$stage#$slot';
     if (key != _boardKey) {
       _boardKey = key;
-      final Uint8List? oi = _stageOrbit(stage);
-      if (oi == null) {
+      final ({int o, int p, int q})? prm = _mapPrm(stage, slot);
+      if (prm == null) {
         _boardReservoirs = null;
         _boardParams = null;
       } else {
-        final ({int o, int p, int q}) prm =
-            OrbitProtocol(widget.core).orbitParams(oi, slot - 1);
         final StageReservoirs res =
             StageReservoirs(o: prm.o, p: prm.p, q: prm.q);
         final ({double o, double p, double q}) dk = res.displayKey;
@@ -5290,8 +5328,156 @@ press.calibrate.target    tick_soft.wav
     final Uint8List? keyBytes = await _enterKey(
         title: 'Open setup file', action: 'Load', askPath: true);
     if (!mounted || keyBytes == null) return;
+    // No key: the path is stage 0's bundle ([_enterKey]).
+    if (keyBytes.isEmpty) {
+      await _openBundleFile(_vaultPath.text.trim());
+      return;
+    }
+    setState(_closeBundle);
     await _loadWithBytes(_vaultPath.text.trim(), keyBytes);
   }
+
+  /// Whether the file at [path] is stage 0's bundle (it opens without a key).
+  static bool _isBundleFile(String path) {
+    try {
+      final File f = File(path);
+      return f.existsSync() && Stage0Bundle.isBundle(f.readAsBytesSync());
+    } on FileSystemException {
+      return false;
+    }
+  }
+
+  /// Open stage 0's bundle at [path] in place of a setup file: the setup on
+  /// screen gives way, stage 0's maps render from the bundle's θ₀, and placing
+  /// r₀ of their points (Setup board) opens it.
+  Future<void> _openBundleFile(String path) async {
+    final Stage0Header header;
+    try {
+      header = Stage0Bundle.header(await File(path).readAsBytes());
+    } on Object {
+      _sounds.play(UiSound.denyInput);
+      _toast('That file is not stage 0\'s bundle.');
+      return;
+    }
+    if (!mounted) return;
+    if (_training) _switchMode(training: false);
+    _reset();
+    setState(() {
+      _closeBundle();
+      _bundlePath = path;
+      _bundleHeader = header;
+      _vaultPath.clear(); // a Save then asks its own path: never this file
+      _deck = null;
+      _studied.clear();
+      _boardKey = '';
+    });
+    _selectSlot(1);
+    _toast('Stage 0\'s bundle: its maps show from its clear part. Recall '
+        '${_requiredOf(0)} of them — place their points (Setup board › '
+        '${_layout.keys[_Cmd.placeByClick.slot]}, place by click) — and it '
+        'opens (${header.passes} Argon2 passes).');
+  }
+
+  /// Stage 0's placed points as the key: derive it (the bundle's `D` passes)
+  /// and open the bundle. Opened, σ and stage 0's cards are back and stage 0
+  /// derives from σ as in any setup; not opened, the points are cleared to
+  /// try others.
+  Future<void> _openBundleWithPoints() async {
+    final String? path = _bundlePath;
+    final Stage0Header? header = _bundleHeader;
+    final Uint8List? sh = _stageShBytes(0);
+    if (path == null || header == null || sh == null) return;
+    setState(() => _bundleOpening = true);
+    _toast('Opening stage 0\'s bundle: ${header.passes} Argon2 passes…');
+    Stage0Contents? contents;
+    SecretKey? key;
+    try {
+      key = await Stage0Bundle.deriveKey(header, sh, _harden);
+      contents =
+          await Stage0Bundle.openWithKey(await File(path).readAsBytes(), key);
+    } on Object {
+      contents = null;
+    } finally {
+      sh.fillRange(0, sh.length, 0);
+    }
+    if (!mounted) return;
+    setState(() => _bundleOpening = false);
+    final Stage0Contents? c = contents;
+    if (c == null || _bundlePath != path) {
+      _sounds.play(UiSound.denyMiss);
+      _toast('Those points do not open stage 0\'s bundle: they are cleared — '
+          'place others.');
+      setState(_clearOrbitPlacements);
+      return;
+    }
+    setState(() {
+      _bundleKey = key;
+      _sigmaCtrl.text = c.sigma;
+      _studied
+        ..clear()
+        ..addAll(<int, Set<int>>{
+          if (c.studied.isNotEmpty) 0: c.studied.toSet(),
+        });
+      _deck = _withAlwaysOnFacts(Deck(c.cards));
+      _deckDirty = false;
+      _boardKey = '';
+    });
+    _recomputeExtraShares(0); // σ is back: the other maps derive, K₀ too
+    _sounds.play(UiSound.exportOk);
+    _toast('Stage 0\'s bundle is open: σ and stage 0\'s cards are back. Train '
+        '(F3) reviews them; Train board › '
+        '${_layout.keys[_Cmd.saveProgress.slot]} (save progress) reseals it.');
+  }
+
+  /// The bundle's hardening: [GreatWallCore.hardenKey].
+  Future<Uint8List> _harden(Uint8List input, Argon2Profile p, int n) =>
+      widget.core.hardenKey(input, profile: p, passes: n);
+
+  /// Reseal stage 0's bundle with its open key: σ, stage 0's cards (its maps,
+  /// its selection, the salt's) and the maps studied.
+  Future<void> _resealBundle() async {
+    final String? path = _bundlePath;
+    final Stage0Header? header = _bundleHeader;
+    final SecretKey? key = _bundleKey;
+    if (path == null || header == null || key == null) return;
+    setState(() => _vaultBusy = true);
+    String? error;
+    try {
+      final Uint8List file = await Stage0Bundle.reseal(
+          header, _stage0Contents(_deckForSave(0)), key);
+      await _fileLocked(() async {
+        final File tmp = File('$path.tmp');
+        await tmp.writeAsBytes(file, flush: true);
+        await tmp.rename(path);
+      });
+    } on Object catch (e) {
+      error = '$e';
+    }
+    if (!mounted) return;
+    setState(() => _vaultBusy = false);
+    if (error != null) {
+      _sounds.play(UiSound.denyInput);
+      _toast('Could not reseal stage 0\'s bundle: $error');
+      return;
+    }
+    setState(() => _deckDirty = false);
+    _sounds.play(UiSound.exportOk);
+    _toast('Stage 0\'s bundle resealed.');
+  }
+
+  /// What stage 0's bundle holds, from [deck]: σ, stage 0's map cards, its
+  /// selection and the salt's card, and the maps of stage 0 studied.
+  Stage0Contents _stage0Contents(Deck deck) => Stage0Contents(
+        sigma: _sigmaCtrl.text.trim().replaceAll(RegExp(r'\s'), ''),
+        cards: <MemCard>[
+          for (final MemCard c in deck.cards)
+            if ((c.kind == CardKind.point && c.stageIndex == 0) ||
+                c.factId == selectionFact(0) ||
+                c.factId == kSaltFact)
+              c,
+        ],
+        studied: (_studied[0] ?? const <int>{}).toList()..sort(),
+      );
 
   /// The setup file path for a save, asked with the current one filled in
   /// (Enter takes it, Esc cancels); null if cancelled. The one taken becomes
@@ -5409,6 +5595,12 @@ press.calibrate.target    tick_soft.wav
 
         void loadHex() {
           if (!pathTaken()) return;
+          // Stage 0's bundle opens without a key: its points are the key.
+          if (askPath && _isBundleFile(pathInput.text.trim())) {
+            keyBytes = Uint8List(0);
+            Navigator.of(ctx).pop();
+            return;
+          }
           try {
             keyBytes = SetupCrypto.hexToKey(hexInput.text);
           } on FormatException catch (e) {
@@ -6718,24 +6910,14 @@ press.calibrate.target    tick_soft.wav
       final int d = passes;
       _toast('Sealing stage 0: $d passes…');
       final Uint8List file = await Stage0Bundle.seal(
-        contents: Stage0Contents(
-          sigma: _sigmaCtrl.text.trim().replaceAll(RegExp(r'\s'), ''),
-          cards: <MemCard>[
-            for (final MemCard c in _trainCards)
-              if (c.stageIndex == 0) c,
-            for (final MemCard c in _deck?.cards ?? const <MemCard>[])
-              if (c.factId == selectionFact(0)) c,
-          ],
-          studied: (_studied[0] ?? const <int>{}).toList()..sort(),
-        ),
+        contents: _stage0Contents(_deckForSave(_orbitDeepestStage)),
         shBytes: sh,
         profile: profile,
         passes: d,
         theta: <Uint8List>[
           for (int j = 0; j < kMapsPerStage; j++) widget.core.theta(o0, j),
         ],
-        harden: (Uint8List input, Argon2Profile p, int n) =>
-            widget.core.hardenKey(input, profile: p, passes: n),
+        harden: _harden,
       );
       final File tmp = File('$path.tmp');
       await tmp.writeAsBytes(file, flush: true);
@@ -6754,7 +6936,11 @@ press.calibrate.target    tick_soft.wav
   }
 
   Future<void> _wipeWizard() async {
-    final String path = _vaultPath.text.trim();
+    // The setup file, or stage 0's bundle when it is what is open.
+    final String setup = _vaultPath.text.trim();
+    final bool bundle = setup.isEmpty && _bundlePath != null;
+    final String path = bundle ? _bundlePath! : setup;
+    final String what = bundle ? 'Stage 0\'s bundle' : 'The setup file';
     int left = _kWipePresses;
     await _dialog(
       _Cue.wipe,
@@ -6774,7 +6960,7 @@ press.calibrate.target    tick_soft.wav
                   width: _kWipeDialogWidth,
                   child: Text(
                     '${path.isEmpty ? 'No setup file is set: only the setup on '
-                        'screen is cleared' : 'The setup file $path is '
+                        'screen is cleared' : '$what $path is '
                         'overwritten and deleted, and the setup on screen '
                         'cleared'}${_busy ? ', the running advance halted' : ''}. '
                     'This cannot be undone. On flash storage the overwrite is '
@@ -6869,6 +7055,7 @@ press.calibrate.target    tick_soft.wav
 
   void _reset() {
     _resolvePrompt(false); // drop any pending console confirmation
+    _closeBundle();
     _brightness.reset();
     _viewport.viewport = _initialViewport;
     _exportLabel.clear();

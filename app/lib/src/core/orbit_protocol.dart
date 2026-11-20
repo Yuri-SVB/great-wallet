@@ -63,9 +63,14 @@ class OrbitProtocol {
   /// u64s are carried in Dart `int`s as raw 64-bit patterns (the same convention
   /// the rest of the FFI uses — e.g. `q = -1` is `0xFFFF…FFFF`), so they marshal
   /// to the engine's `Uint64` params unchanged.
-  ({int o, int p, int q}) orbitParams(Uint8List oI, int j) {
-    final Uint8List h = core.theta(oI, j);
-    final ByteData bd = ByteData.sublistView(h);
+  ({int o, int p, int q}) orbitParams(Uint8List oI, int j) =>
+      paramsOf(core.theta(oI, j));
+
+  /// A map's `(o, p, q)` from its θ (the [GreatWallCore.theta] digest) — so
+  /// stage 0's bundle, which carries θ₀ in the clear, renders its maps
+  /// without σ.
+  static ({int o, int p, int q}) paramsOf(Uint8List theta) {
+    final ByteData bd = ByteData.sublistView(theta);
     return (
       o: bd.getUint64(0, Endian.big),
       p: bd.getUint64(8, Endian.big),

@@ -140,7 +140,9 @@ abstract final class Stage0Bundle {
   static Uint8List keyInput(Uint8List salt, Uint8List shBytes) =>
       Uint8List.fromList(<int>[..._tag, ...salt, ...shBytes]);
 
-  static Future<SecretKey> _key(
+  /// The bundle's key: `Sh₀` ([shBytes]) hardened as [h] says. Held while a
+  /// bundle is open, so a save reseals it without deriving again.
+  static Future<SecretKey> deriveKey(
       Stage0Header h, Uint8List shBytes, Harden harden) async {
     final Uint8List input = keyInput(h.salt, shBytes);
     try {
@@ -175,6 +177,16 @@ abstract final class Stage0Bundle {
       salt: _bytes(rng, _saltLen),
       theta: theta,
     );
+    return reseal(h, contents, await deriveKey(h, shBytes, harden),
+        random: rng);
+  }
+
+  /// The bundle file for [contents] under an open bundle's [key] and header
+  /// [h]: a save, with a fresh nonce and no new derivation.
+  static Future<Uint8List> reseal(
+      Stage0Header h, Stage0Contents contents, SecretKey key,
+      {Random? random}) async {
+    final Random rng = random ?? Random.secure();
     final List<int> json = utf8.encode(jsonEncode(contents.toJson()));
     if (_lengthLen + json.length > paddedSize) {
       throw const FormatException('Stage 0 holds too much to seal.');
@@ -184,9 +196,7 @@ abstract final class Stage0Bundle {
     plain.setRange(_lengthLen, _lengthLen + json.length, json);
     try {
       final SecretBox box = await _aes.encrypt(plain,
-          secretKey: await _key(h, shBytes, harden),
-          nonce: _bytes(rng, _nonceLen),
-          aad: h._aad);
+          secretKey: key, nonce: _bytes(rng, _nonceLen), aad: h._aad);
       return Uint8List.fromList(utf8.encode(jsonEncode(<String, dynamic>{
         ...h._json(),
         'nonce': _hex(box.nonce),
@@ -215,7 +225,13 @@ abstract final class Stage0Bundle {
   /// [FormatException] when the points are wrong or the file was altered —
   /// GCM makes them indistinguishable.
   static Future<Stage0Contents> open(
-      Uint8List file, Uint8List shBytes, Harden harden) async {
+          Uint8List file, Uint8List shBytes, Harden harden) async =>
+      openWithKey(
+          file, await deriveKey(_parse(file).$1, shBytes, harden));
+
+  /// Open a bundle [file] with its [key] ([deriveKey]); throws as [open].
+  static Future<Stage0Contents> openWithKey(
+      Uint8List file, SecretKey key) async {
     const FormatException unreadable =
         FormatException('These points do not open the bundle.');
     final (Stage0Header h, List<int> nonce, List<int> sealed) = _parse(file);
@@ -226,8 +242,7 @@ abstract final class Stage0Bundle {
     );
     List<int> plain;
     try {
-      plain = await _aes.decrypt(box,
-          secretKey: await _key(h, shBytes, harden), aad: h._aad);
+      plain = await _aes.decrypt(box, secretKey: key, aad: h._aad);
     } on SecretBoxAuthenticationError {
       throw unreadable;
     }

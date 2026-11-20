@@ -4,9 +4,11 @@ import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:great_wall_ux/great_wall_ux.dart';
 import 'package:great_wallet_app/src/core/great_wall_core.dart';
 import 'package:great_wallet_app/src/core/orbit_protocol.dart';
 import 'package:great_wallet_app/src/ffi/core_bindings.dart';
+import 'package:great_wallet_app/src/ffi/fixed.dart';
 import 'package:great_wallet_app/src/ffi/library_loader.dart';
 import 'package:great_wallet_app/src/setup/fact_cards.dart';
 import 'package:great_wallet_app/src/setup/orbit_vault.dart';
@@ -191,6 +193,66 @@ void main() {
     expect(back.cards.map((MemCard m) => m.id),
         containsAll(<String>['point:0:1', 'point:0:2', 'fact:${selectionFact(0)}']));
     expect(File(path).existsSync(), isTrue, reason: 'the wipe was left');
+
+    // --- without the key: open the bundle, recall 2 maps, σ comes back -------
+    String log() => tester
+        .widgetList<Text>(find.byType(Text))
+        .map((Text t) => t.data ?? '')
+        .join('\n');
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyQ);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyE);
+    await tester.pumpAndSettle();
+    await tester.enterText(
+        find.widgetWithText(TextField, 'File path'), '$path$kStage0Suffix');
+    await tester.tap(find.widgetWithText(FilledButton, 'Load'));
+    await tester.pump();
+    await settle();
+    expect(log(), contains('its maps show from its clear part'));
+    // Setup board (Alt+W) › place by click (F), on maps 1 and 2.
+    for (final OrbitVaultPoint pt in placed) {
+      await tester.sendKeyEvent(pt.slot == 1
+          ? LogicalKeyboardKey.digit1
+          : LogicalKeyboardKey.digit2);
+      await tester.pump();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyW);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+      await tester.pump();
+      tester.widget<FractalCanvas>(find.byType(FractalCanvas)).onSelect!(
+          FractalSelection(
+              re: fixedToDouble(pt.reRaw),
+              im: fixedToDouble(pt.imRaw),
+              pixelX: 0,
+              pixelY: 0));
+      await tester.pump();
+    }
+    for (int i = 0; i < 30 && !log().contains('bundle is open'); i++) {
+      await settle();
+    }
+    expect(log(), contains('bundle is open'));
+    // Train (F3) › save progress (Z) reseals it, with no new derivation.
+    await tester.sendKeyEvent(LogicalKeyboardKey.f3);
+    await tester.pump();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyW);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyZ);
+    await tester.pump();
+    await settle();
+    expect(log(), contains('bundle resealed'));
+    final Stage0Contents? again = await tester.runAsync(() => Stage0Bundle.open(
+        File('$path$kStage0Suffix').readAsBytesSync(),
+        sh,
+        (Uint8List input, Argon2Profile p, int n) =>
+            c.hardenKey(input, profile: p, passes: n)));
+    expect(again!.sigma, sigmaHex);
+    expect(again.cards.map((MemCard m) => m.id), contains('fact:$kSaltFact'));
 
     await tester.pumpWidget(const SizedBox());
     await settle();
