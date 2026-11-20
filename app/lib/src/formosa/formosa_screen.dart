@@ -10,6 +10,8 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
+    show Clock, Grade, MemCard, MemSchedule;
 import 'package:dragon_dice_ui/dragon_dice_ui.dart'
     show DiceRolls, DragonDiceWizard, digestBits;
 import 'package:flutter/material.dart';
@@ -17,7 +19,21 @@ import 'package:flutter/services.dart';
 import 'package:formosa/formosa.dart' as formosa;
 import 'package:formosa_ui/formosa_ui.dart' show TableTab;
 
+import '../command/command_board.dart' show DeadGlyph, SweatGlyph;
+import '../setup/card_stats.dart' show dateText;
+import '../setup/fact_review.dart' show FactCheck, FactReviewFrame;
 import 'pass_vault.dart';
+
+/// The device's clock, for F4's cards.
+class FormosaClock implements Clock {
+  const FormosaClock();
+
+  @override
+  DateTime now() => DateTime.now();
+}
+
+/// F4's schedule: SM-2 as the setup's cards, on the device's clock.
+const MemSchedule kFormosaSchedule = MemSchedule(FormosaClock());
 
 /// Where the formosa package's themes are bundled.
 const String _kThemesAssets = 'packages/formosa/themes/';
@@ -49,6 +65,7 @@ class FormosaScreen extends StatefulWidget {
     this.onFunctionKey,
     this.derive = argon2idKdf,
     this.kdf = const KdfParams(),
+    this.schedule = kFormosaSchedule,
   });
 
   /// The Formosa themes; loaded from the app's bundle when null.
@@ -61,6 +78,9 @@ class FormosaScreen extends StatefulWidget {
   /// (RFC 9106's first recommendation; Advanced changes them).
   final VaultKdf derive;
   final KdfParams kdf;
+
+  /// The cards' schedule (the device's clock by default).
+  final MemSchedule schedule;
 
   @override
   State<FormosaScreen> createState() => _FormosaScreenState();
@@ -418,16 +438,30 @@ class _FormosaScreenState extends State<FormosaScreen> {
       final Opened o =
           await PassVault.open(_file!, entered, derive: widget.derive);
       if (!mounted) return;
+      setState(() => _busy = null);
+      final ({Map<int, Grade> graded, List<int> early})? g =
+          await _gradeEntered(o.vault, entered.keys, o.wrong);
+      if (g == null || !mounted) return;
       setState(() {
         _vault = o.vault;
         _clearInputs();
         _view = _View.entries;
-        _status = o.wrong.isEmpty
-            ? 'Open.'
-            : 'Open — but sentence${o.wrong.length == 1 ? '' : 's'} '
-                '${o.wrong.join(', ')} ${o.wrong.length == 1 ? 'is' : 'are'} '
-                'not the vault\'s.';
+        _status = <String>[
+          'Open.',
+          if (o.wrong.isNotEmpty)
+            '${_slotsText(o.wrong)} not the vault\'s: graded again.',
+          for (final Grade grade in Grade.values)
+            if (<int>[
+              for (final MapEntry<int, Grade> e in g.graded.entries)
+                if (e.value == grade && !o.wrong.contains(e.key)) e.key,
+            ]..sort()
+                case final List<int> slots when slots.isNotEmpty)
+              '${_slotsText(slots)} graded ${grade.name}.',
+          if (g.early.isNotEmpty)
+            '${_slotsText(g.early)} not due yet: practice.',
+        ].join(' ');
       });
+      await _save();
     } on FormatException {
       _say('These sentences do not open the vault.');
     } finally {
@@ -435,7 +469,188 @@ class _FormosaScreenState extends State<FormosaScreen> {
     }
   }
 
+  /// Grade the sentences [entered] at an opening, as you grade them: each
+  /// right and due takes your grade; each wrong one only Again, whether due or
+  /// not — a forgotten sentence must come back soon; each right before due is
+  /// practice, its schedule untouched. Those not entered are not reviewed.
+  /// Returns the slots by what they got, or null if the screen went away.
+  Future<({Map<int, Grade> graded, List<int> early})?> _gradeEntered(
+      OpenVault v, Iterable<int> entered, List<int> wrong) async {
+    final MemSchedule schedule = widget.schedule;
+    final DateTime now = schedule.clock.now();
+    final List<int> early = <int>[];
+    final List<int> due = <int>[];
+    for (final int slot in (List<int>.of(entered)..sort())) {
+      final MemCard? c = v.header.cardOf(slot);
+      if (c == null) continue;
+      if (wrong.contains(slot) || c.isDue(now)) {
+        due.add(slot);
+      } else {
+        early.add(slot);
+      }
+    }
+    Map<int, Grade> graded = <int, Grade>{};
+    if (due.isNotEmpty) {
+      final Map<int, Grade>? g = await showDialog<Map<int, Grade>>(
+        context: context,
+        barrierDismissible: false,
+        builder: (BuildContext _) =>
+            _GradeSentencesDialog(due: due, wrong: wrong, early: early),
+      );
+      if (g == null || !mounted) return null;
+      graded = g;
+    }
+    v.header = v.header.withCards(<MemCard>[
+      for (final MemCard c in v.header.cards)
+        if (_slotOfCard(c) case final int slot when graded.containsKey(slot))
+          schedule.grade(c, graded[slot]!)
+        else
+          c,
+    ]);
+    return (graded: graded, early: early);
+  }
+
+  static int? _slotOfCard(MemCard c) {
+    const String prefix = 'sentence:';
+    return c.factId.startsWith(prefix)
+        ? int.tryParse(c.factId.substring(prefix.length))
+        : null;
+  }
+
+  static String _slotsText(List<int> slots) => slots.length == 1
+      ? 'Sentence ${slots.single}'
+      : 'Sentences ${(List<int>.of(slots)..sort()).join(', ')}';
+
+  /// When slot [slot]'s card is next due, in words.
+  String _dueText(VaultHeader h, int slot) {
+    final MemCard? c = h.cardOf(slot);
+    final DateTime? due = c?.due;
+    if (c == null) return '';
+    return due == null || !due.isAfter(widget.schedule.clock.now())
+        ? 'due'
+        : 'next review ${dateText(due)}';
+  }
+
+  // --- sentences: added or retired, then rewrapped ------------------------------
+
+  String? _addTheme;
+  List<int>? _added;
+
+  Future<void> _generateAdded({required bool dice}) async {
+    final formosa.Mnemonic m = _themes![_addTheme ?? _sentenceThemes.first];
+    final List<int>? bits = dice
+        ? await _rollBits(kSentenceBits, 'A new sentence, $kSentenceBits bits')
+        : m.rawBits(m.generateRaw());
+    if (bits == null || !mounted) return;
+    setState(() => _added = bits);
+  }
+
+  Future<void> _rewrap(List<VaultSlot> slots, String done) async {
+    final OpenVault v = _vault!;
+    setState(() {
+      _busy = 'Rewrapping for every ${v.header.k} of ${slots.length} '
+          'sentences…';
+      _progress = 0;
+    });
+    try {
+      final (Uint8List file, OpenVault next) = await PassVault.rewrap(v,
+          slots: slots,
+          k: v.header.k,
+          derive: widget.derive, onProgress: (int d, int t) {
+        if (mounted) setState(() => _progress = d / t);
+      });
+      await _write(file);
+      if (!mounted) return;
+      setState(() {
+        _vault = next;
+        _status = done;
+      });
+    } on Object catch (e) {
+      _say('Could not rewrap: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = null;
+          _progress = null;
+        });
+      }
+    }
+  }
+
+  Future<void> _keepAdded() async {
+    final OpenVault v = _vault!;
+    final List<int>? bits = _added;
+    if (bits == null) return;
+    final int id = v.header.slots
+            .map((VaultSlot s) => s.id)
+            .fold(0, (int a, int b) => max(a, b)) +
+        1;
+    v.contents.sentences[id] = bits;
+    final String theme = _addTheme ?? _sentenceThemes.first;
+    setState(() => _added = null);
+    await _rewrap(<VaultSlot>[...v.header.slots, VaultSlot(id, theme)],
+        'Sentence $id added: learn it — it has a card of its own.');
+  }
+
+  Future<void> _retire(VaultSlot s) async {
+    final OpenVault v = _vault!;
+    if (v.header.n <= v.header.k) {
+      _say('Retiring it would leave fewer than ${v.header.k} sentences.');
+      return;
+    }
+    await _rewrap(<VaultSlot>[
+      for (final VaultSlot o in v.header.slots)
+        if (o.id != s.id) o,
+    ], 'Sentence ${s.id} retired: it no longer opens the vault.');
+  }
+
   // --- entries ----------------------------------------------------------------
+
+  /// Entry [e]'s card, if you memorise it.
+  MemCard? _entryCard(VaultEntry e) {
+    for (final MemCard c in _vault!.contents.cards) {
+      if (c.factId == entryFact(e.id)) return c;
+    }
+    return null;
+  }
+
+  Future<void> _toggleMemorise(VaultEntry e) async {
+    final List<MemCard> cards = _vault!.contents.cards;
+    final bool on = _entryCard(e) == null;
+    setState(() {
+      cards.removeWhere((MemCard c) => c.factId == entryFact(e.id));
+      if (on) cards.add(MemCard.fact(entryFact(e.id)));
+    });
+    await _save();
+    _say(on
+        ? '${e.label}: memorised — Next due reviews it.'
+        : '${e.label}: no longer memorised.');
+  }
+
+  /// Review the entry cards due, longest-due first.
+  Future<void> _nextDue() async {
+    final OpenVault v = _vault!;
+    final List<MemCard> due = widget.schedule.queue(v.contents.cards).due;
+    if (due.isEmpty) {
+      _say('No entry is due.');
+      return;
+    }
+    final MemCard card = due.first;
+    final VaultEntry e = v.contents.entries
+        .firstWhere((VaultEntry x) => entryFact(x.id) == card.factId);
+    final Grade? g = await showDialog<Grade>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext _) => _SecretReviewDialog(entry: e),
+    );
+    if (g == null || !mounted) return;
+    final int at = v.contents.cards.indexOf(card);
+    final MemCard next = widget.schedule.grade(card, g);
+    setState(() => v.contents.cards[at] = next);
+    await _save();
+    _say('${e.label}: graded ${g.name}.'
+        '${next.due == null ? '' : ' Next review ${dateText(next.due!)}.'}');
+  }
 
   Future<void> _copy(VaultEntry e) async {
     await Clipboard.setData(ClipboardData(text: e.secret));
@@ -451,7 +666,11 @@ class _FormosaScreenState extends State<FormosaScreen> {
   }
 
   Future<void> _remove(VaultEntry e) async {
-    setState(() => _vault!.contents.entries.remove(e));
+    setState(() {
+      _vault!.contents.entries.remove(e);
+      _vault!.contents.cards
+          .removeWhere((MemCard c) => c.factId == entryFact(e.id));
+    });
     await _save();
     _say('${e.label}: removed.');
   }
@@ -734,7 +953,8 @@ class _FormosaScreenState extends State<FormosaScreen> {
                     decoration: InputDecoration(
                       isDense: true,
                       border: const OutlineInputBorder(),
-                      labelText: 'Sentence ${s.id} (${s.theme})',
+                      labelText: 'Sentence ${s.id} (${s.theme}) · '
+                          '${_dueText(h, s.id)}',
                       suffixIcon: Icon(_bitsOf(s) != null
                           ? Icons.check_circle_outline
                           : Icons.radio_button_unchecked),
@@ -802,6 +1022,15 @@ class _FormosaScreenState extends State<FormosaScreen> {
                       : Icons.visibility),
                 ),
                 IconButton(
+                  tooltip: _entryCard(e) == null
+                      ? 'Memorise it (a CPNF card)'
+                      : 'Memorised: stop reviewing it',
+                  onPressed: () => _toggleMemorise(e),
+                  icon: Icon(_entryCard(e) == null
+                      ? Icons.school_outlined
+                      : Icons.school),
+                ),
+                IconButton(
                   tooltip: 'Remove',
                   onPressed: () => _remove(e),
                   icon: const Icon(Icons.delete_outline),
@@ -814,12 +1043,118 @@ class _FormosaScreenState extends State<FormosaScreen> {
           spacing: _kGap,
           children: <Widget>[
             FilledButton(onPressed: _addEntry, child: const Text('Add entry')),
+            OutlinedButton(
+                onPressed: _busy == null ? _nextDue : null,
+                child: const Text('Next due')),
             OutlinedButton(onPressed: _lock, child: const Text('Lock')),
           ],
         ),
+        const Divider(height: _kGap * 3),
+        _sentencesPanel(v),
       ],
     );
   }
+
+  /// The master secret's sentences: when each is next due, retiring one,
+  /// adding one — each change rewraps the vault.
+  Widget _sentencesPanel(OpenVault v) {
+    final VaultHeader h = v.header;
+    final formosa.Mnemonic? m =
+        _added == null ? null : _themes![_addTheme ?? _sentenceThemes.first];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        Text('Sentences: any ${h.k} of ${h.n} open the vault. Each is reviewed '
+            'when you enter it to open it.'),
+        for (final VaultSlot s in h.slots)
+          ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            title: Text('Sentence ${s.id} (${s.theme})'),
+            subtitle: Text(_dueText(h, s.id)),
+            trailing: TextButton(
+              onPressed: _busy == null && h.n > h.k ? () => _retire(s) : null,
+              child: const Text('Retire'),
+            ),
+          ),
+        Wrap(
+          spacing: _kGap,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: <Widget>[
+            const Text('Add a sentence'),
+            DropdownButton<String>(
+              value: _addTheme ?? _sentenceThemes.first,
+              items: <DropdownMenuItem<String>>[
+                for (final String t in _sentenceThemes)
+                  DropdownMenuItem<String>(value: t, child: Text(t)),
+              ],
+              onChanged: (String? t) => setState(() {
+                _addTheme = t;
+                _added = null;
+              }),
+            ),
+            TextButton(
+                onPressed: () => _generateAdded(dice: false),
+                child: const Text('System random')),
+            TextButton(
+                onPressed: () => _generateAdded(dice: true),
+                child: const Text('Dragon Dice')),
+          ],
+        ),
+        if (m != null) ...<Widget>[
+          SelectableText(m.toRawSentence(_added!)),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: FilledButton(
+              onPressed: _busy == null ? _keepAdded : null,
+              child: const Text('Keep it, and rewrap'),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+/// An entry's card: its secret typed from memory, matched exactly.
+class _SecretReviewDialog extends StatefulWidget {
+  const _SecretReviewDialog({required this.entry});
+
+  final VaultEntry entry;
+
+  @override
+  State<_SecretReviewDialog> createState() => _SecretReviewDialogState();
+}
+
+class _SecretReviewDialogState extends State<_SecretReviewDialog> {
+  final TextEditingController _typed = TextEditingController();
+
+  @override
+  void dispose() {
+    _typed.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => FactReviewFrame(
+        title: widget.entry.label,
+        about: 'Type its secret from memory: only an exact match counts.',
+        body: TextField(
+          controller: _typed,
+          autofocus: true,
+          obscureText: true,
+          decoration: const InputDecoration(
+            isDense: true,
+            border: OutlineInputBorder(),
+            labelText: 'Secret',
+          ),
+        ),
+        check: () async {
+          final bool hit = _typed.text == widget.entry.secret;
+          return FactCheck(
+              hit: hit, message: hit ? 'Right.' : 'Missed — it is not that.');
+        },
+      );
 }
 
 /// Adding an entry: its label and note, and its secret — typed, or a Formosa
@@ -961,6 +1296,111 @@ class _EntryDialogState extends State<_EntryDialog> {
             ));
           },
           child: const Text('Add'),
+        ),
+      ],
+    );
+  }
+}
+
+/// Grading the sentences of an opening: each right and due one takes the
+/// grade you give it — how hard it came, not only whether it came; each wrong
+/// one only Again. Every one is graded before going on.
+class _GradeSentencesDialog extends StatefulWidget {
+  const _GradeSentencesDialog({
+    required this.due,
+    required this.wrong,
+    required this.early,
+  });
+
+  /// The slots to grade (right and due, or wrong), those wrong, and those
+  /// right before due (practice, shown only).
+  final List<int> due;
+  final List<int> wrong;
+  final List<int> early;
+
+  @override
+  State<_GradeSentencesDialog> createState() => _GradeSentencesDialogState();
+}
+
+class _GradeSentencesDialogState extends State<_GradeSentencesDialog> {
+  late final Map<int, Grade> _grades = <int, Grade>{
+    for (final int s in widget.due)
+      if (widget.wrong.contains(s)) s: Grade.again,
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final Color ink = Theme.of(context).colorScheme.onSurface;
+    Widget glyph(Grade g) => switch (g) {
+          Grade.again => DeadGlyph(colour: ink),
+          Grade.hard => SweatGlyph(colour: ink),
+          Grade.good => const Icon(Icons.sentiment_satisfied),
+          Grade.easy => const Icon(Icons.sentiment_very_satisfied),
+        };
+    return AlertDialog(
+      title: const Text('Grade the sentences'),
+      content: SizedBox(
+        width: _FormosaScreenState._kWidth,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              const Text('How hard did each come back? If in doubt, the lower '
+                  'grade: a sentence remembered only after a long effort is '
+                  'Hard, or Again.'),
+              for (final int s in widget.due)
+                Padding(
+                  padding: const EdgeInsets.symmetric(
+                      vertical: _FormosaScreenState._kGap / 2),
+                  child: Wrap(
+                    spacing: _FormosaScreenState._kGap,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: <Widget>[
+                      Text('Sentence $s'),
+                      if (widget.wrong.contains(s))
+                        const Text('not the vault\'s: Again')
+                      else
+                        SegmentedButton<Grade>(
+                          emptySelectionAllowed: true,
+                          segments: <ButtonSegment<Grade>>[
+                            for (final Grade g in Grade.values)
+                              ButtonSegment<Grade>(
+                                  value: g,
+                                  icon: glyph(g),
+                                  label: Text(switch (g) {
+                                    Grade.again => 'Again',
+                                    Grade.hard => 'Hard',
+                                    Grade.good => 'Good',
+                                    Grade.easy => 'Easy',
+                                  })),
+                          ],
+                          selected: <Grade>{
+                            if (_grades[s] case final Grade g) g,
+                          },
+                          onSelectionChanged: (Set<Grade> v) => setState(() {
+                            v.isEmpty
+                                ? _grades.remove(s)
+                                : _grades[s] = v.first;
+                          }),
+                        ),
+                    ],
+                  ),
+                ),
+              if (widget.early.isNotEmpty)
+                Text('Not due yet, so practice: sentence'
+                    '${widget.early.length == 1 ? '' : 's'} '
+                    '${widget.early.join(', ')}.'),
+            ],
+          ),
+        ),
+      ),
+      actions: <Widget>[
+        FilledButton(
+          onPressed: _grades.length == widget.due.length
+              ? () => Navigator.of(context).pop(_grades)
+              : null,
+          child: const Text('Done'),
         ),
       ],
     );

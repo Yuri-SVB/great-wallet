@@ -24,10 +24,31 @@ import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
+    show MemCard;
 import 'package:cryptography/cryptography.dart';
 
 /// Bits in a raw Formosa sentence (formosa's `kRawSentenceBits`).
 const int kSentenceBits = 33;
+
+/// The fact id of slot [slot]'s sentence card, and of entry [id]'s card.
+String sentenceFact(int slot) => 'sentence:$slot';
+String entryFact(String id) => 'entry:$id';
+
+List<Map<String, dynamic>> _cardsJson(List<MemCard> cards) =>
+    <Map<String, dynamic>>[for (final MemCard c in cards) c.toJson()];
+
+List<MemCard> _cardsOf(Object? json) {
+  if (json == null) return <MemCard>[];
+  if (json is! List) throw const FormatException('bad cards');
+  return <MemCard>[
+    for (final Object? c in json)
+      if (c is Map<String, dynamic>)
+        MemCard.fromJson(c)
+      else
+        throw const FormatException('bad cards'),
+  ];
+}
 
 /// Argon2id settings. The default is RFC 9106's first recommendation
 /// (2 GiB, one pass, four lanes), per wrapping.
@@ -145,11 +166,29 @@ class VaultHeader {
     required this.k,
     required this.slots,
     required this.wraps,
+    this.cards = const <MemCard>[],
   });
 
   final KdfParams kdf;
   final int k;
   final List<VaultSlot> slots;
+
+  /// The sentences' cards, one per slot ([sentenceFact]): in the clear, so the
+  /// app tells which are due without opening the vault — F4 has no
+  /// wrench-attack goal.
+  final List<MemCard> cards;
+
+  /// This header with [cards] in place of its own.
+  VaultHeader withCards(List<MemCard> cards) =>
+      VaultHeader(kdf: kdf, k: k, slots: slots, wraps: wraps, cards: cards);
+
+  /// Slot [slot]'s card, if it has one.
+  MemCard? cardOf(int slot) {
+    for (final MemCard c in cards) {
+      if (c.factId == sentenceFact(slot)) return c;
+    }
+    return null;
+  }
 
   /// Each wrapping of the data key: its slots (ascending ids), salt, nonce
   /// and sealed key.
@@ -167,6 +206,7 @@ class VaultHeader {
         'v': PassVault.formatVersion,
         'kdf': kdf.toJson(),
         'k': k,
+        'cards': _cardsJson(cards),
         'slots': <Map<String, dynamic>>[
           for (final VaultSlot s in slots) s.toJson()
         ],
@@ -187,11 +227,18 @@ class VaultHeader {
 /// What the vault holds inside: each slot's sentence (its 33 bits) and the
 /// entries.
 class VaultContents {
-  VaultContents({required this.sentences, List<VaultEntry>? entries})
-      : entries = entries ?? <VaultEntry>[];
+  VaultContents({
+    required this.sentences,
+    List<VaultEntry>? entries,
+    List<MemCard>? cards,
+  })  : entries = entries ?? <VaultEntry>[],
+        cards = cards ?? <MemCard>[];
 
   final Map<int, List<int>> sentences;
   final List<VaultEntry> entries;
+
+  /// The entries' cards ([entryFact]), for the entries you memorise.
+  final List<MemCard> cards;
 
   Map<String, dynamic> toJson() => <String, dynamic>{
         'sentences': <String, String>{
@@ -201,6 +248,7 @@ class VaultContents {
         'entries': <Map<String, dynamic>>[
           for (final VaultEntry e in entries) e.toJson(),
         ],
+        'cards': _cardsJson(cards),
       };
 
   factory VaultContents.fromJson(Object? json) {
@@ -217,6 +265,7 @@ class VaultContents {
       entries: <VaultEntry>[
         for (final Object? e in entries) VaultEntry.fromJson(e)
       ],
+      cards: _cardsOf(json['cards']),
     );
   }
 }
@@ -226,7 +275,8 @@ class VaultContents {
 class OpenVault {
   OpenVault(this.header, this.contents, this._dataKey);
 
-  final VaultHeader header;
+  /// Replaced as its cards are graded; a save writes it.
+  VaultHeader header;
   final VaultContents contents;
   final SecretKey _dataKey;
 }
@@ -334,7 +384,11 @@ abstract final class PassVault {
         dataKey: v._dataKey,
         derive: derive,
         rng: rng,
+        previous: v.header.cards,
         onProgress: onProgress);
+    // A retired sentence leaves the vault entirely.
+    v.contents.sentences.removeWhere(
+        (int id, _) => !slots.any((VaultSlot s) => s.id == id));
     final OpenVault next = OpenVault(header, v.contents, v._dataKey);
     return (await save(next, random: rng), next);
   }
@@ -347,6 +401,7 @@ abstract final class PassVault {
     required SecretKey dataKey,
     required VaultKdf derive,
     required Random rng,
+    List<MemCard> previous = const <MemCard>[],
     void Function(int done, int total)? onProgress,
   }) async {
     if (k < minK || k > slots.length) {
@@ -391,7 +446,17 @@ abstract final class PassVault {
       ));
       onProgress?.call(wraps.length, all.length);
     }
-    return VaultHeader(kdf: kdf, k: k, slots: slots, wraps: wraps);
+    // Each slot's card: the one it had, or a new one for a new sentence.
+    final List<MemCard> cards = <MemCard>[
+      for (final VaultSlot s in slots)
+        <MemCard?>[
+              for (final MemCard c in previous)
+                if (c.factId == sentenceFact(s.id)) c,
+            ].firstOrNull ??
+            MemCard.fact(sentenceFact(s.id)),
+    ];
+    return VaultHeader(
+        kdf: kdf, k: k, slots: slots, wraps: wraps, cards: cards);
   }
 
   /// The file for [v]: its contents re-encrypted under its data key, with
@@ -560,7 +625,11 @@ abstract final class PassVault {
       ];
       return (
         VaultHeader(
-            kdf: KdfParams.fromJson(json['kdf']), k: k, slots: s, wraps: w),
+            kdf: KdfParams.fromJson(json['kdf']),
+            k: k,
+            slots: s,
+            wraps: w,
+            cards: _cardsOf(json['cards'])),
         _unhex(nonce),
         base64Decode(ct),
       );

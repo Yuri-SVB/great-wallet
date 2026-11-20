@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
+    show FakeClock, Grade, MemCard, MemSchedule;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:great_wallet_app/src/formosa/pass_vault.dart';
 
@@ -135,6 +137,47 @@ void main() {
             },
             derive: counted),
         throwsFormatException);
+  });
+
+  test('each sentence has a card in the clear; a rewrap keeps the kept ones',
+      () async {
+    final Uint8List file = await make();
+    final VaultHeader h = PassVault.header(file);
+    expect(h.cards.map((MemCard c) => c.factId),
+        <String>[for (int id = 1; id <= 6; id++) sentenceFact(id)]);
+    final Opened o = await PassVault.open(
+        file,
+        <int, List<int>>{
+          for (final int id in <int>[1, 2, 3, 4]) id: sentences[id]!
+        },
+        derive: counted);
+    final MemSchedule schedule = MemSchedule(FakeClock(DateTime.utc(2026)));
+    final MemCard graded = schedule.grade(o.vault.header.cardOf(1)!, Grade.good);
+    o.vault.header = o.vault.header.withCards(<MemCard>[
+      for (final MemCard c in o.vault.header.cards)
+        c.factId == graded.factId ? graded : c,
+    ]);
+    final List<int> added = sentence();
+    o.vault.contents.sentences[7] = added;
+    final List<VaultSlot> next = <VaultSlot>[
+      ...slots.where((VaultSlot s) => s.id != 6),
+      const VaultSlot(7, 'theme7'),
+    ];
+    final (Uint8List rewrapped, OpenVault v) =
+        await PassVault.rewrap(o.vault, slots: next, k: 4, derive: counted);
+    final VaultHeader after = PassVault.header(rewrapped);
+    expect(after.cardOf(1)!.repetitions, 1, reason: 'kept with its schedule');
+    expect(after.cardOf(7)!.repetitions, 0, reason: 'a new sentence, a new card');
+    expect(after.cardOf(6), isNull, reason: 'retired');
+    expect(v.contents.sentences.containsKey(6), isFalse);
+    final Opened back = await PassVault.open(
+        rewrapped,
+        <int, List<int>>{
+          for (final int id in <int>[1, 2, 3]) id: sentences[id]!,
+          7: added,
+        },
+        derive: counted);
+    expect(back.wrong, isEmpty);
   });
 
   test('the clear part cannot be altered unseen', () async {
