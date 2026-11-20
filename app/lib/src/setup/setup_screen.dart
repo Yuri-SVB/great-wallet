@@ -72,6 +72,7 @@ class SetupScreen extends StatefulWidget {
     required this.core,
     this.training = false,
     this.onTrainingChanged,
+    this.onFormosa,
     this.initialPath,
     this.notice,
   });
@@ -90,6 +91,9 @@ class SetupScreen extends StatefulWidget {
 
   /// Told when F2 or F3 switches the mode, so the host's tabs follow.
   final ValueChanged<bool>? onTrainingChanged;
+
+  /// F4: the host shows Formosa, the password manager.
+  final VoidCallback? onFormosa;
 
   @override
   State<SetupScreen> createState() => _SetupScreenState();
@@ -887,10 +891,11 @@ press.calibrate.target    tick_soft.wav
           _cue(_Cue.f3);
           _switchMode(training: true);
         },
-        const SingleActivator(LogicalKeyboardKey.f4): () =>
-            _gotoMode('Accelerate', _Cue.f4, here: false),
+        const SingleActivator(LogicalKeyboardKey.f4): _gotoFormosa,
         const SingleActivator(LogicalKeyboardKey.f5): () =>
-            _gotoMode('Inherit', _Cue.f5, here: false),
+            _gotoMode('Accelerate', _Cue.f5, here: false),
+        const SingleActivator(LogicalKeyboardKey.f6): () =>
+            _gotoMode('Inherit', _Cue.f6, here: false),
       };
 
   /// F2 or F3: Setup or Train, telling the host.
@@ -948,7 +953,18 @@ press.calibrate.target    tick_soft.wav
     _logProgress();
   }
 
-  /// Switch top-level mode (F4 Accelerate · F5 Inherit): not built yet; the
+  /// F4: Formosa, the password manager — the host shows it.
+  void _gotoFormosa() {
+    _cue(_Cue.f4);
+    final VoidCallback? go = widget.onFormosa;
+    if (go == null) {
+      _toast('Formosa mode is not available here.');
+      return;
+    }
+    go();
+  }
+
+  /// Switch top-level mode (F5 Accelerate · F6 Inherit): not built yet; the
   /// keys announce themselves so muscle memory is right from the start.
   void _gotoMode(String name, String cue, {required bool here}) {
     _cue(cue);
@@ -7187,6 +7203,7 @@ abstract final class _Cue {
   static const String f3 = 'key.f3';
   static const String f4 = 'key.f4';
   static const String f5 = 'key.f5';
+  static const String f6 = 'key.f6';
 
   // Alerts: a confirmation raised, the disclaimer's, a warning in the log.
   static const String alertConfirm = 'alert.confirm';
@@ -7311,6 +7328,7 @@ abstract final class _Cue {
         f3,
         f4,
         f5,
+        f6,
         alertConfirm,
         alertWarning,
         alertLog,

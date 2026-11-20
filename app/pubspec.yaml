@@ -36,6 +36,16 @@ dependencies:
   celestial_peace_nf_core:
     path: ../celestial-peace-nf-core
 
+  # Formosa: themed sentences for passwords (F4's password manager), its
+  # raw sentences for the vault's master secret, and its Table Selector
+  # (Moon Cake) widget. A flat submodule pinned by this app; only the library
+  # and its ui package are used, so Formosa's own Dragon Dice submodule is
+  # never needed — this app's serves.
+  formosa:
+    path: ../formosa
+  formosa_ui:
+    path: ../formosa/ui
+
   # Foreign-function interface helpers (calloc / free for the per-frame
   # escape-count pixel buffer). The raw dart:ffi binding to the Rust core's
   # C ABI lives in lib/src/ffi (TECH_STACK.md §"FFI: hybrid" — raw dart:ffi on
