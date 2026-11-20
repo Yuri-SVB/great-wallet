@@ -20,6 +20,18 @@ class SealedVault {
 /// a random per-file salt. The bulky ciphertext goes to a file; the only secret
 /// the user guards is the 16-byte key.
 ///
+/// **The file** is bytes indistinguishable from random: `salt ‖ nonce ‖
+/// ciphertext ‖ tag`, with nothing in the clear — no format name, no version,
+/// no settings (they are constants), no dates. A leaked file that is not
+/// deciphered must not tell an attacker when its owner will next open it
+/// (next-steps/timing-concealment-onions-and-mock-flows.md).
+///
+/// **The plaintext is padded to a random length** ([paddedMin] plus a random
+/// amount below [paddedSpread]): the payload's length (4 bytes, big-endian),
+/// the payload JSON, then zeros. So the file's size says nothing of how many
+/// stages or maps it holds, and it changes with every save. Fields to be sealed
+/// under other keys later (Star Clock) nest inside the payload.
+///
 /// The key is never an arbitrary password — always 128 bits, handled three ways
 /// (KISS): generated → byte-mode QR (hand-coloured, scanned back, never read);
 /// generated → 32 hex (blindly copied into a password manager); or supplied by
@@ -28,9 +40,6 @@ class SealedVault {
 /// **version 1 (21×21)** in byte mode at EC level L (17-byte capacity).
 class SetupCrypto {
   SetupCrypto._();
-
-  static const String magic = 'greatwall-provisional-vault';
-  static const int version = 3; // 3: 128-bit raw-byte key (2 was password/key)
 
   /// 128-bit key = 16 bytes = 32 hex digits. 16 bytes fit a byte-mode QR v1 at
   /// EC level L (capacity 17 bytes). The optional 256-bit "tin-foil" key = 32
@@ -48,33 +57,34 @@ class SetupCrypto {
   static bool isValidKeyLen(int n) =>
       n == keyLenBytes || n == keyLenBytes256;
 
+  /// The padded plaintext's length: at least this, which any payload must fit
+  /// in (with its length prefix) …
+  static const int paddedMin = 256 * 1024;
+
+  /// … plus a random amount below this.
+  static const int paddedSpread = 256 * 1024;
+
   // RFC 9106 §4 "second recommended" Argon2id parameters: 64 MiB, t=3, p=4.
+  // Constants: the file carries no settings.
   static const int _argonMemKiB = 64 * 1024;
   static const int _argonIterations = 3;
   static const int _argonParallelism = 4;
   static const int _aesKeyLen = 32; // AES-256
   static const int _saltLen = 16;
   static const int _nonceLen = 12; // 96-bit GCM nonce
+  static const int _tagLen = 16; // 128-bit GCM tag
+  static const int _lengthLen = 4; // the payload's length, big-endian
 
-  // Bounds for envelope-supplied KDF parameters (anti-DoS on load).
-  static const int _minMemKiB = 8 * 1024;
-  static const int _maxMemKiB = 2 * 1024 * 1024;
-  static const int _maxIterations = 16;
-  static const int _maxParallelism = 16;
+  /// Associated data: the format's name, authenticated though never stored.
+  static final List<int> _aad = utf8.encode('greatwall-setup-v4');
 
   static final AesGcm _aes = AesGcm.with256bits();
 
-  static Future<SecretKey> _deriveAesKey(
-    List<int> keyBytes,
-    List<int> salt, {
-    required int memKiB,
-    required int iterations,
-    required int parallelism,
-  }) {
+  static Future<SecretKey> _deriveAesKey(List<int> keyBytes, List<int> salt) {
     final Argon2id argon2 = Argon2id(
-      memory: memKiB,
-      iterations: iterations,
-      parallelism: parallelism,
+      memory: _argonMemKiB,
+      iterations: _argonIterations,
+      parallelism: _argonParallelism,
       hashLength: _aesKeyLen,
     );
     return argon2.deriveKey(
@@ -83,105 +93,86 @@ class SetupCrypto {
     );
   }
 
-  /// Encrypt a JSON [payload] (the orbit vault's) and return the ciphertext
-  /// envelope plus the key. Uses [providedKey] (the user's own entropy, 16 or
-  /// 32 bytes) if given, else generates a fresh [genLenBytes]-byte key (128-bit
-  /// by default, 32 for the 256-bit mode). The caller owns and wipes
-  /// [SealedVault.key]; the plaintext JSON is zeroed here.
+  /// Encrypt a JSON [payload] (the orbit vault's), padded to a random length,
+  /// and return the file plus the key. Uses [providedKey] (the user's own
+  /// entropy, 16 or 32 bytes) if given, else generates a fresh
+  /// [genLenBytes]-byte key (128-bit by default, 32 for the 256-bit mode). The
+  /// caller owns and wipes [SealedVault.key]; the plaintext is zeroed here.
+  /// Throws a [FormatException] if the payload does not fit [paddedMin].
   static Future<SealedVault> sealPayload(
     Map<String, dynamic> payload, {
     Uint8List? providedKey,
     int genLenBytes = keyLenBytes,
   }) async {
+    final List<int> json = utf8.encode(jsonEncode(payload));
+    if (_lengthLen + json.length > paddedMin) {
+      _zero(json);
+      throw const FormatException('The setup is too large to save.');
+    }
+    final Random rng = Random.secure();
+    final Uint8List plaintext =
+        Uint8List(paddedMin + rng.nextInt(paddedSpread)); // zeros: the padding
+    ByteData.sublistView(plaintext).setUint32(0, json.length);
+    plaintext.setRange(_lengthLen, _lengthLen + json.length, json);
+    _zero(json);
     final Uint8List key = providedKey != null
         ? Uint8List.fromList(providedKey)
         : _randomBytes(genLenBytes);
     final Uint8List salt = _randomBytes(_saltLen);
     final Uint8List nonce = _randomBytes(_nonceLen);
-    final List<int> plaintext = utf8.encode(jsonEncode(payload));
     try {
-      final SecretKey aesKey = await _deriveAesKey(
-        key,
-        salt,
-        memKiB: _argonMemKiB,
-        iterations: _argonIterations,
-        parallelism: _argonParallelism,
-      );
-      final SecretBox box =
-          await _aes.encrypt(plaintext, secretKey: aesKey, nonce: nonce);
-      final Map<String, dynamic> envelope = <String, dynamic>{
-        'f': magic,
-        'v': version,
-        'kdf': <String, dynamic>{
-          'alg': 'argon2id',
-          'm': _argonMemKiB,
-          't': _argonIterations,
-          'p': _argonParallelism,
-          'salt': base64.encode(salt),
-        },
-        'cipher': 'aes-256-gcm',
-        'nonce': base64.encode(box.nonce),
-        'ct': base64.encode(box.cipherText),
-        'tag': base64.encode(box.mac.bytes),
-      };
-      return SealedVault(
-        Uint8List.fromList(utf8.encode(jsonEncode(envelope))),
-        key,
-      );
+      final SecretKey aesKey = await _deriveAesKey(key, salt);
+      final SecretBox box = await _aes.encrypt(plaintext,
+          secretKey: aesKey, nonce: nonce, aad: _aad);
+      final BytesBuilder file = BytesBuilder(copy: false)
+        ..add(salt)
+        ..add(box.nonce)
+        ..add(box.cipherText)
+        ..add(box.mac.bytes);
+      return SealedVault(file.toBytes(), key);
     } finally {
       _zero(plaintext);
     }
   }
 
-  /// Decrypt an envelope produced by [sealPayload] back into its raw JSON
-  /// payload map, using the 16- or 32-byte [keyBytes] (from a scanned QR or
-  /// parsed hex). The caller reconstructs the vault from it. Throws a generic [FormatException] on a non-vault file,
-  /// unsupported version, wrong key, or tampering — GCM authentication makes
-  /// "wrong key" and "corrupt" indistinguishable.
+  /// Decrypt a file produced by [sealPayload] back into its raw JSON payload
+  /// map, using the 16- or 32-byte [keyBytes] (from a scanned QR or parsed
+  /// hex). The caller reconstructs the vault from it. Throws a generic
+  /// [FormatException] on a wrong key, a file that is not a setup file, or
+  /// tampering — GCM authentication makes them indistinguishable.
   static Future<Map<String, dynamic>> openPayload(
       Uint8List bytes, Uint8List keyBytes) async {
-    final Map<String, dynamic> env;
-    try {
-      env = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
-    } catch (_) {
-      throw const FormatException('Not a Great Wall vault file.');
+    const FormatException unreadable =
+        FormatException('Could not decrypt — wrong key or corrupt file.');
+    if (bytes.length < _saltLen + _nonceLen + _lengthLen + _tagLen) {
+      throw unreadable;
     }
-    if (env['f'] != magic || env['v'] != version) {
-      throw const FormatException('Unsupported or corrupt vault file.');
-    }
-    final Object? kdf = env['kdf'];
-    if (kdf is! Map<String, dynamic>) {
-      throw const FormatException('Unsupported or corrupt vault file.');
-    }
-    final int memKiB = _boundedInt(kdf['m'], _minMemKiB, _maxMemKiB);
-    final int iterations = _boundedInt(kdf['t'], 1, _maxIterations);
-    final int parallelism = _boundedInt(kdf['p'], 1, _maxParallelism);
-    final List<int> salt = _b64(kdf['salt']);
-    final List<int> nonce = _b64(env['nonce']);
-    final List<int> ct = _b64(env['ct']);
-    final List<int> tag = _b64(env['tag']);
-
-    final SecretKey aesKey = await _deriveAesKey(
-      keyBytes,
-      salt,
-      memKiB: memKiB,
-      iterations: iterations,
-      parallelism: parallelism,
+    final int ctEnd = bytes.length - _tagLen;
+    final SecretKey aesKey =
+        await _deriveAesKey(keyBytes, bytes.sublist(0, _saltLen));
+    final SecretBox box = SecretBox(
+      bytes.sublist(_saltLen + _nonceLen, ctEnd),
+      nonce: bytes.sublist(_saltLen, _saltLen + _nonceLen),
+      mac: Mac(bytes.sublist(ctEnd)),
     );
-    final SecretBox box = SecretBox(ct, nonce: nonce, mac: Mac(tag));
     List<int> plaintext;
     try {
-      plaintext = await _aes.decrypt(box, secretKey: aesKey);
+      plaintext = await _aes.decrypt(box, secretKey: aesKey, aad: _aad);
     } on SecretBoxAuthenticationError {
-      throw const FormatException(
-          'Could not decrypt — wrong key or corrupt file.');
+      throw unreadable;
     }
     try {
-      final Object? decoded = jsonDecode(utf8.decode(plaintext));
-      if (decoded is! Map<String, dynamic>) {
-        throw const FormatException('Could not decrypt — corrupt file.');
+      int length = 0;
+      for (int i = 0; i < _lengthLen; i++) {
+        length = (length << 8) | plaintext[i]; // big-endian
       }
+      if (_lengthLen + length > plaintext.length) throw unreadable;
+      final Object? decoded = jsonDecode(
+          utf8.decode(plaintext.sublist(_lengthLen, _lengthLen + length)));
+      if (decoded is! Map<String, dynamic>) throw unreadable;
       return decoded;
+    } on FormatException {
+      throw unreadable;
     } finally {
       _zero(plaintext);
     }
@@ -210,24 +201,6 @@ class SetupCrypto {
       sb.write(b.toRadixString(16).padLeft(2, '0').toUpperCase());
     }
     return sb.toString();
-  }
-
-  static int _boundedInt(Object? v, int lo, int hi) {
-    if (v is! int || v < lo || v > hi) {
-      throw const FormatException('Unsupported or corrupt vault file.');
-    }
-    return v;
-  }
-
-  static List<int> _b64(Object? v) {
-    if (v is! String) {
-      throw const FormatException('Unsupported or corrupt vault file.');
-    }
-    try {
-      return base64.decode(v);
-    } catch (_) {
-      throw const FormatException('Unsupported or corrupt vault file.');
-    }
   }
 
   static Uint8List _randomBytes(int n) {

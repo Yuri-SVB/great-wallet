@@ -91,14 +91,16 @@ void main() {
         vault.toJson(),
         providedKey: testKey,
       );
-      final String onDisk = utf8.decode(sealed.fileBytes);
+      final String onDisk = latin1.decode(sealed.fileBytes);
 
-      // The envelope's cleartext is exactly its own header — the payload
-      // contributes nothing outside `ct`, so there is no field to leak from.
-      final Map<String, dynamic> env =
-          jsonDecode(onDisk) as Map<String, dynamic>;
-      expect(env.keys.toSet(),
-          <String>{'f', 'v', 'kdf', 'cipher', 'nonce', 'ct', 'tag'});
+      // The file is salt ‖ nonce ‖ ciphertext ‖ tag: no header, nothing in
+      // the clear, padded to a random length the payload says nothing about.
+      expect(onDisk.startsWith('{'), isFalse);
+      const int overhead = 16 + 12 + 16;
+      expect(sealed.fileBytes.length,
+          greaterThanOrEqualTo(SetupCrypto.paddedMin + overhead));
+      expect(sealed.fileBytes.length,
+          lessThan(SetupCrypto.paddedMin + SetupCrypto.paddedSpread + overhead));
 
       // And nothing coercion-relevant survives in the clear: not σ, not a
       // single raw coordinate, not the payload's own field names.
@@ -143,22 +145,37 @@ void main() {
         throwsFormatException,
       );
 
-      // Flip one bit inside the base64 ciphertext. GCM authenticates the whole
+      // Flip one bit inside the ciphertext. GCM authenticates the whole
       // payload, so a doctored o_i or coordinate is as unopenable as a wrong
       // key — which is exactly why restore does no re-derivation integrity
       // check of its own.
-      final Map<String, dynamic> env = jsonDecode(utf8.decode(sealed.fileBytes))
-          as Map<String, dynamic>;
-      final Uint8List ct = base64.decode(env['ct'] as String);
-      ct[ct.length ~/ 2] ^= 0x01;
-      env['ct'] = base64.encode(ct);
-      final Uint8List tampered =
-          Uint8List.fromList(utf8.encode(jsonEncode(env)));
-
+      final Uint8List tampered = Uint8List.fromList(sealed.fileBytes);
+      tampered[tampered.length ~/ 2] ^= 0x01;
       await expectLater(
         SetupCrypto.openPayload(tampered, testKey),
         throwsFormatException,
       );
+    }, timeout: slow);
+
+    test('two saves of the same setup differ in size and in every byte',
+        () async {
+      final Map<String, dynamic> json = envelopeVault().toJson();
+      final SealedVault a =
+          await SetupCrypto.sealPayload(json, providedKey: testKey);
+      final SealedVault b =
+          await SetupCrypto.sealPayload(json, providedKey: testKey);
+      // The padding is drawn anew: equal sizes are a 1-in-paddedSpread event.
+      expect(a.fileBytes.length, isNot(b.fileBytes.length));
+      expect(a.fileBytes.sublist(0, 16), isNot(b.fileBytes.sublist(0, 16)));
+    }, timeout: slow);
+
+    test('a file that is not a setup file is refused', () async {
+      final Uint8List json = Uint8List.fromList(utf8.encode(jsonEncode(
+          <String, dynamic>{'f': 'greatwall-provisional-vault', 'v': 3})));
+      await expectLater(
+          SetupCrypto.openPayload(json, testKey), throwsFormatException);
+      await expectLater(SetupCrypto.openPayload(Uint8List(8), testKey),
+          throwsFormatException);
     }, timeout: slow);
   });
 

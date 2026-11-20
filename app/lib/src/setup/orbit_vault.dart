@@ -2,6 +2,7 @@ import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
     show Deck;
 
 import '../ffi/core_bindings.dart' show Argon2Profile, kOrbitPointLen;
+import 'fact_cards.dart' show CustomFact, kMapsPerStage;
 
 /// The serializable **orbit provisional key** — everything needed to restore a
 /// *settled* orbit setup **without re-running the memory-hard advance**: the
@@ -37,6 +38,11 @@ class OrbitVault {
     required this.stages,
     this.resume,
     this.deck,
+    this.passSeconds,
+    this.gapSeconds,
+    this.epsilon,
+    this.facts = const <CustomFact>[],
+    this.studied = const <List<int>>[],
   });
 
   /// On-disk format version written by this build.
@@ -92,6 +98,25 @@ class OrbitVault {
   /// which maps are memorised and how well, so it rides inside the encryption.
   Deck? deck;
 
+  /// The time one memory-hard pass takes on this device at [profile], in
+  /// seconds: measured by the calibration and by real passes. Null until one
+  /// was measured. With [iterations] it estimates the derivation (hard reset)
+  /// time.
+  double? passSeconds;
+
+  /// The graduation gate's target gap `T`, in seconds, and its threshold `ε`;
+  /// null for the defaults (the derivation time, and
+  /// [GraduationParams.defaultEpsilon]).
+  int? gapSeconds;
+  double? epsilon;
+
+  /// Your own fact cards: prompts and answers. Their schedules are in [deck].
+  final List<CustomFact> facts;
+
+  /// Per stage (by index), the maps you study — the selection cards'
+  /// answers; empty where none is set.
+  final List<List<int>> studied;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
         'v': formatVersion,
         kindKey: kind,
@@ -103,6 +128,14 @@ class OrbitVault {
         ],
         if (resume != null) 'resume': resume!.toJson(),
         if (deck != null) 'deck': deck!.toJson(),
+        if (passSeconds != null) 'passSeconds': passSeconds,
+        if (gapSeconds != null) 'gapSeconds': gapSeconds,
+        if (epsilon != null) 'epsilon': epsilon,
+        if (facts.isNotEmpty)
+          'facts': <Map<String, dynamic>>[
+            for (final CustomFact f in facts) f.toJson(),
+          ],
+        if (studied.any((List<int> s) => s.isNotEmpty)) 'studied': studied,
       };
 
   /// Rebuild a vault from decoded JSON. Throws a generic [FormatException] on any
@@ -145,7 +178,50 @@ class OrbitVault {
               ? rawResume
               : throw const FormatException('bad vault')),
       deck: rawDeck == null ? null : _deck(rawDeck),
+      passSeconds: _optionalPositive(json, 'passSeconds'),
+      gapSeconds: _optionalPositive(json, 'gapSeconds')?.round(),
+      epsilon: _optionalPositive(json, 'epsilon'),
+      facts: _facts(json['facts']),
+      studied: _studied(json['studied'], rawStages.length),
     );
+  }
+
+  /// The studied-maps section: absent, or per stage a list of distinct slots
+  /// in 1..[kMapsPerStage]; no more lists than [stages].
+  static List<List<int>> _studied(Object? raw, int stages) {
+    if (raw == null) return const <List<int>>[];
+    if (raw is! List || raw.length > stages) {
+      throw const FormatException('bad vault');
+    }
+    return <List<int>>[
+      for (final Object? s in raw)
+        if (s is List &&
+            s.every((Object? v) => v is int && v >= 1 && v <= kMapsPerStage) &&
+            s.toSet().length == s.length)
+          <int>[for (final Object? v in s) v! as int]
+        else
+          throw const FormatException('bad vault'),
+    ];
+  }
+
+  /// The facts section: absent, or a list of [CustomFact]s.
+  static List<CustomFact> _facts(Object? raw) {
+    if (raw == null) return const <CustomFact>[];
+    if (raw is! List) throw const FormatException('bad vault');
+    return <CustomFact>[
+      for (final Object? f in raw)
+        CustomFact.fromJson(f is Map<String, dynamic>
+            ? f
+            : throw const FormatException('bad vault')),
+    ];
+  }
+
+  /// An optional positive number, or a [FormatException] that echoes no value.
+  static double? _optionalPositive(Map<String, dynamic> json, String key) {
+    final Object? v = json[key];
+    if (v == null) return null;
+    if (v is! num || v <= 0) throw const FormatException('bad vault');
+    return v.toDouble();
   }
 
   /// Zero every stage's secret integers (the `o_i` bytes and placed point

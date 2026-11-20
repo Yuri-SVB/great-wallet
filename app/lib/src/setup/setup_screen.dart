@@ -1,15 +1,31 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart'
     show defaultTargetPlatform, kIsWeb, TargetPlatform;
+import 'package:cryptography/cryptography.dart' show SecretKey;
 import 'package:flutter/material.dart';
 import 'package:dragon_dice_ui/dragon_dice_ui.dart'
     show DiceCue, DiceRolls, DragonDiceWizard, digestBits;
 import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
-    show CardKind, Cues, Deck, MemCard, buildDeck;
+    show
+        CardKind,
+        Clock,
+        Cues,
+        Deck,
+        DeckProgress,
+        Grade,
+        GraduationParams,
+        MemCard,
+        MemSchedule,
+        PracticeReason,
+        ReviewSession,
+        StageGate,
+        StageProgress,
+        buildDeck,
+        graduationGates,
+        honestGrade;
 import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:flutter/services.dart';
 import 'package:great_wall_ux/great_wall_ux.dart';
@@ -30,9 +46,17 @@ import '../core/orbit_protocol.dart';
 import '../core/stage_params.dart';
 import '../ffi/core_bindings.dart';
 import '../ffi/fixed.dart';
+import 'card_stats.dart';
+import 'cover_writes.dart';
 import 'desktop_qr_scanner.dart';
+import 'fact_cards.dart';
+import 'fact_review.dart';
+import 'file_wipe.dart';
 import 'orbit_vault.dart';
+import 'key_qr_painter.dart';
+import 'qr_layout.dart';
 import 'setup_crypto.dart';
+import 'stage0_bundle.dart';
 
 /// Setup mode screen: build an orbit setup — place points on each stage's
 /// maps, advance between stages, and memorise them.
@@ -43,9 +67,29 @@ import 'setup_crypto.dart';
 /// the orbit's maps, the engine encodes their points, and a worker isolate runs
 /// the memory-hard advance between stages.
 class SetupScreen extends StatefulWidget {
-  const SetupScreen({super.key, required this.core});
+  const SetupScreen({
+    super.key,
+    required this.core,
+    this.training = false,
+    this.onTrainingChanged,
+    this.initialPath,
+    this.notice,
+  });
 
   final GreatWallCore core;
+
+  /// The setup file path Save and Open start from (the launch argument).
+  final String? initialPath;
+
+  /// A line for the log once the screen is up (the launch's path).
+  final String? notice;
+
+  /// Train mode (F3): the open setup's maps are recalled and graded rather
+  /// than set up (CPNF, celestial-peace-nf-core). Setup mode (F2) otherwise.
+  final bool training;
+
+  /// Told when F2 or F3 switches the mode, so the host's tabs follow.
+  final ValueChanged<bool>? onTrainingChanged;
 
   @override
   State<SetupScreen> createState() => _SetupScreenState();
@@ -139,7 +183,6 @@ class _SetupScreenState extends State<SetupScreen>
   /// shown, or copied only inside the Write/Open dialogs. [_vaultBusy] disables
   /// the controls while an encrypt/decrypt pass runs.
   final TextEditingController _vaultPath = TextEditingController();
-  final FocusNode _vaultPathFocus = FocusNode(debugLabel: 'vault-path');
   bool _vaultBusy = false;
 
   /// True while the memory-hard orbit advance `o_{i+1} = H*(u_i)` is running in a
@@ -214,6 +257,147 @@ class _SetupScreenState extends State<SetupScreen>
   /// The command board's context (Alt + a top-row board key).
   CommandContext _context = CommandContext.main;
 
+  // --- Train mode (CPNF) -----------------------------------------------------
+
+  /// Train mode: the open setup's maps are recalled, not set up.
+  late bool _training = widget.training;
+
+  /// The CPNF scheduler, on the device's clock.
+  static const MemSchedule _schedule = MemSchedule(_SystemClock());
+
+  /// Where the attempt at the shown map stands.
+  _TrainStep _step = _TrainStep.recall;
+
+  /// Your own fact cards, by fact id: prompts and answers. Saved with the
+  /// setup; their schedules are in the deck.
+  final Map<String, CustomFact> _customFacts = <String, CustomFact>{};
+
+  /// Per stage, the maps you study (set in Cards): the selection cards'
+  /// answers, and the only maps the graduation gate counts. Saved with the
+  /// setup.
+  final Map<int, Set<int>> _studied = <int, Set<int>>{};
+
+  /// Stage 0's bundle, while one is open in place of a setup file: its path
+  /// and clear header (its maps render from θ₀ until σ is back), and — once
+  /// stage 0's points opened it — its key, so a save reseals it without
+  /// deriving again.
+  String? _bundlePath;
+  Stage0Header? _bundleHeader;
+  SecretKey? _bundleKey;
+  bool _bundleOpening = false;
+
+  /// Leave stage 0's bundle (a reset, another file, a wipe).
+  void _closeBundle() {
+    _bundlePath = null;
+    _bundleHeader = null;
+    _bundleKey = null;
+  }
+
+  /// The fact card *next due map* last opened, so the next press moves past
+  /// it (even when it was cancelled); null when it last went to a map.
+  String? _lastDueFact;
+
+  /// The deck's fact cards this app reviews: the salt's, the setup's
+  /// parameters, the supply chain's (when on), and your own.
+  List<MemCard> get _factCards => <MemCard>[
+        for (final MemCard c in _deck?.cards ?? const <MemCard>[])
+          if (isReviewedFact(c) &&
+              (!c.factId.startsWith(kCustomPrefix) ||
+                  _customFacts.containsKey(c.factId)))
+            c,
+      ];
+
+  /// Whether the supply-chain card is on.
+  bool get _provenanceOn =>
+      _deck?.cards.any((MemCard c) => c.factId == kProvenanceFact) ?? false;
+
+  /// The time one memory-hard pass takes at [_profile], in seconds: from the
+  /// calibration, refined by real passes; null until one was timed.
+  double? _passSeconds;
+
+  /// The graduation gate's target gap, in seconds (null: the derivation
+  /// time), and its threshold `ε`. Saved with the setup.
+  int? _gapSeconds;
+  double _epsilon = GraduationParams.defaultEpsilon;
+
+  /// The gap until a derivation time is known.
+  static const Duration _kGapFallback = Duration(days: 7);
+
+  /// The derivation (hard reset) time: every deep stage's `D` passes, at the
+  /// time a pass was last measured; null until one was, or with no deep stage.
+  Duration? get _derivationTime {
+    final double? s = _passSeconds;
+    final int deep = _orbitDeepestStage;
+    if (s == null || deep == 0) return null;
+    return Duration(
+        microseconds:
+            (s * _iterations * deep * Duration.microsecondsPerSecond).round());
+  }
+
+  /// The gate's target gap `T`: the one set, else the derivation time, else
+  /// [_kGapFallback].
+  Duration get _gap => _gapSeconds != null
+      ? Duration(seconds: _gapSeconds!)
+      : _derivationTime ?? _kGapFallback;
+
+  /// Every stage of the open setup at the graduation gate, [gap] from now,
+  /// against [epsilon].
+  List<StageGate> _gatesWith(Duration gap, double epsilon) => graduationGates(
+        Deck(<MemCard>[
+          for (final MemCard c in _trainCards)
+            if (_studied[c.stageIndex]?.contains(c.slot) ?? false) c,
+        ]),
+        <int>[for (int i = 0; i <= _orbitDeepestStage; i++) _requiredOf(i)],
+        _schedule.clock.now().add(gap),
+        _schedule,
+        params: GraduationParams(epsilon: epsilon),
+      );
+
+  /// A stage at the gate, in words.
+  String _gateText(StageGate g, Duration gap) => g.maps == 0 &&
+          (_studied[g.stage]?.isEmpty ?? true)
+      ? 'no maps set as studied — tick them in Cards (${_hint(_Cmd.cards)})'
+      : 'after ${durationText(gap)}, ${chanceText(g.failure)} chance of '
+          'recalling fewer than ${g.required} of the ${g.maps} maps you study '
+          '— ${g.passes ? 'passes' : 'not yet'}';
+
+  /// The fact cards graduation needs — the salt's, the setup's parameters and
+  /// each stage's selection — that do not hold [gap] from now ([factHolds]),
+  /// by name. A stage with no maps set as studied has no selection card, so
+  /// it is named too.
+  List<String> _factsShort(Duration gap) {
+    final DateTime at = _schedule.clock.now().add(gap);
+    final List<MemCard> cards = _deck?.cards ?? const <MemCard>[];
+    return <String>[
+      for (final String id in <String>[
+        kSaltFact,
+        ...kParameterFacts,
+        for (int i = 0; i <= _orbitDeepestStage; i++) selectionFact(i),
+      ])
+        if (!cards.any(
+            (MemCard c) => c.factId == id && factHolds(_schedule, c, at)))
+          factName(MemCard.fact(id), _customFacts),
+    ];
+  }
+
+  /// The facts short of holding, in words: why the green light waits.
+  static String _factsText(List<String> short) =>
+      'facts not yet holding for the gap (each needs its chance of recall '
+      'after it at ${percentText(kRetentionAtDue)} or more): '
+      '${short.join(', ')}';
+
+  /// Stops were shown or the route changed during this attempt: practice.
+  bool _attemptAided = false;
+
+  /// The islands were revealed during this attempt: a find counts as Again.
+  bool _attemptHint = false;
+
+  /// This session's grading: a map graded once is practice after.
+  final ReviewSession _review = ReviewSession(_schedule);
+
+  /// The deck changed since the setup was last saved or opened.
+  bool _deckDirty = false;
+
   /// The explanation of the board button or tab under the pointer or focus,
   /// shown in the log in place of its text; null when none is.
   String? _explaining;
@@ -248,8 +432,8 @@ class _SetupScreenState extends State<SetupScreen>
   int _slotIndex = 0;
 
   /// Highest secondary slot index — a fixed row of ten tabs (`0..9`), one per
-  /// digit key.
-  static const int _maxSlot = 9;
+  /// digit key: the salt, then the stage's maps.
+  static const int _maxSlot = kMapsPerStage;
 
   /// The **orbit** stage cursor (`0..`[_maxStage]). Stage 0 is rooted by σ; a
   /// deep stage is entered by the forward memory-hard advance
@@ -425,6 +609,34 @@ class _SetupScreenState extends State<SetupScreen>
     _autoExposureWasOn = _brightness.autoExposure;
     _brightness.addListener(_onBrightnessChanged);
     unawaited(_cueFolder.start());
+    _vaultPath.text = widget.initialPath ?? '';
+    _coverWrites.start();
+    final String? notice = widget.notice;
+    if (notice != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _toast(notice);
+      });
+    }
+  }
+
+  /// Rewrites of the setup file at random times while the app runs, so its
+  /// file times do not tell when a training session saved it.
+  late final CoverWrites _coverWrites = CoverWrites(write: () async {
+    final String path = _bundlePath ?? _vaultPath.text.trim();
+    if (path.isEmpty || _vaultBusy) return;
+    await _fileLocked(() => rewriteSame(path));
+  });
+
+  /// The last write to the setup file in flight: saves and cover writes run
+  /// one after another, so a cover write never puts back the bytes a save has
+  /// just replaced.
+  Future<void> _fileChain = Future<void>.value();
+
+  /// Run [f] once every earlier write to the setup file is done.
+  Future<T> _fileLocked<T>(Future<T> Function() f) {
+    final Future<T> run = _fileChain.then((_) => f());
+    _fileChain = run.then((_) {}, onError: (Object _) {});
+    return run;
   }
 
   /// The folder the sound cues are swapped in at run time.
@@ -605,13 +817,13 @@ press.calibrate.target    tick_soft.wav
     _brightness.removeListener(_onBrightnessChanged);
     _brightness.dispose();
     unawaited(_cueFolder.dispose());
+    _coverWrites.stop();
     _sounds.dispose();
     _iterationsField.dispose();
     _exportLabel.dispose();
     _pointImport.dispose();
     _pointImportFocus.dispose();
     _vaultPath.dispose();
-    _vaultPathFocus.dispose();
     _hotkeys.dispose();
     _iterationsFocus.dispose();
     _profileFocus.dispose();
@@ -667,19 +879,77 @@ press.calibrate.target    tick_soft.wav
         const SingleActivator(LogicalKeyboardKey.escape): _focusViewer,
         const SingleActivator(LogicalKeyboardKey.f1): () =>
             _togglePanel(byKey: true),
-        const SingleActivator(LogicalKeyboardKey.f2): () =>
-            _gotoMode('Setup', _Cue.f2, here: true),
-        const SingleActivator(LogicalKeyboardKey.f3): () =>
-            _gotoMode('Train', _Cue.f3, here: false),
+        const SingleActivator(LogicalKeyboardKey.f2): () {
+          _cue(_Cue.f2);
+          _switchMode(training: false);
+        },
+        const SingleActivator(LogicalKeyboardKey.f3): () {
+          _cue(_Cue.f3);
+          _switchMode(training: true);
+        },
         const SingleActivator(LogicalKeyboardKey.f4): () =>
             _gotoMode('Accelerate', _Cue.f4, here: false),
         const SingleActivator(LogicalKeyboardKey.f5): () =>
             _gotoMode('Inherit', _Cue.f5, here: false),
       };
 
-  /// Switch top-level mode (F2 Setup · F3 Train · F4 Accelerate · F5 Inherit).
-  /// Only Setup exists in this app today; the others announce themselves so the
-  /// keys (and muscle memory) are correct from the start.
+  /// F2 or F3: Setup or Train, telling the host.
+  void _switchMode({required bool training}) {
+    if (training == _training) {
+      _toast('${training ? 'Train' : 'Setup'} (current mode).');
+      return;
+    }
+    _setTraining(training);
+    widget.onTrainingChanged?.call(training);
+  }
+
+  @override
+  void didUpdateWidget(SetupScreen old) {
+    super.didUpdateWidget(old);
+    if (widget.training != old.training && widget.training != _training) {
+      _setTraining(widget.training);
+    }
+  }
+
+  /// Enter or leave Train mode. Train shows the Train board in Setup's place
+  /// and starts a fresh attempt at the shown map; nothing of the setup
+  /// changes in it.
+  void _setTraining(bool on) {
+    setState(() {
+      _training = on;
+      _editPointMode = false;
+      _boardImportSlot = null;
+      _boardIslands = const <CanvasIsland>[];
+      _boardCanonicalView = false;
+      if (on && _context == CommandContext.setup) {
+        _context = CommandContext.train;
+      } else if (!on && _context == CommandContext.train) {
+        _context = CommandContext.setup;
+      }
+      if (on && _orbitSettled) {
+        _deck ??= _deckForSave(_orbitDeepestStage);
+      }
+      // The landmark stops are a map's cues: shown as each card sets them.
+      if (on) _showPath = true;
+    });
+    _recenter(); // Train starts every map from the default view
+    if (!on) {
+      if (_deckDirty) {
+        _toast('Training progress is not saved yet: Train board › '
+            '${_layout.keys[_Cmd.saveProgress.slot]} (save progress).');
+      }
+      return;
+    }
+    _newAttempt();
+    if (!_orbitSettled) {
+      _toast('Train: open a setup file first (${_hint(_Cmd.open)}).');
+      return;
+    }
+    _logProgress();
+  }
+
+  /// Switch top-level mode (F4 Accelerate · F5 Inherit): not built yet; the
+  /// keys announce themselves so muscle memory is right from the start.
   void _gotoMode(String name, String cue, {required bool here}) {
     _cue(cue);
     _toast(here
@@ -756,10 +1026,12 @@ press.calibrate.target    tick_soft.wav
                         ),
                         if (_busy) Positioned.fill(child: _progressOverlay()),
                         if (_editPointMode && _isBoardSlot)
-                          const Positioned(
+                          Positioned(
                             top: 56,
                             left: 12,
-                            child: _Badge('Click the new point · Esc to cancel'),
+                            child: _Badge(_training
+                                ? 'Click the leaf you recall · Esc to cancel'
+                                : 'Click the new point · Esc to cancel'),
                           ),
                         // Deep render reminder: explains the lag while the high
                         // escape-count cap is active, and how to turn it off.
@@ -785,6 +1057,7 @@ press.calibrate.target    tick_soft.wav
                               children: <Widget>[
                                 _stageTabs(),
                                 _slotTabs(),
+                                if (_training) _factTabs(),
                               ],
                             ),
                           ),
@@ -818,9 +1091,23 @@ press.calibrate.target    tick_soft.wav
       _sounds.play(UiSound.denyBlocked);
       return;
     }
+    // In Train, stage 0's slot 0 is the salt's card.
+    if (_training && _activeStage == 0 && i == 0 && _deck != null) {
+      final MemCard salt = _deck!.cards.firstWhere(
+          (MemCard c) => c.factId == kSaltFact,
+          orElse: () => MemCard.fact(kSaltFact));
+      unawaited(_reviewFact(salt));
+      return;
+    }
     if (i == _slotIndex) {
       // Re-pressing the active board slot toggles between the initial default
-      // view and the canonical view (island centred, zoomed, brightened).
+      // view and the canonical view (island centred, zoomed, brightened) —
+      // not while that island is the answer being recalled.
+      if (_answerHidden) {
+        _sounds.play(UiSound.denyBlocked);
+        _toast('The answer stays hidden while you recall.');
+        return;
+      }
       if (_isBoardSlot) _toggleBoardView();
       return;
     }
@@ -838,6 +1125,7 @@ press.calibrate.target    tick_soft.wav
     // Landing on a board resets the view, so each fractal opens centred at the
     // default zoom/brightness (the same recenter stage selection performs).
     if (_isBoardSlot) _recenter();
+    if (_training) _newAttempt();
   }
 
   /// The **secondary slot tabs** — a fixed row of ten numbered tabs (`0..9`)
@@ -886,6 +1174,65 @@ press.calibrate.target    tick_soft.wav
       ),
     );
   }
+
+  /// The third row (Train): the cards without a map of their own — the
+  /// setup's parameters `m`, `D` and `N`, the active stage's selection (once
+  /// set) and the supply chain's (when on) — each opened by clicking it.
+  Widget _factTabs() {
+    Widget tab(String id, IconData icon, String label, String help) {
+      MemCard? card;
+      for (final MemCard c in _deck?.cards ?? const <MemCard>[]) {
+        if (c.factId == id) card = c;
+      }
+      final MemCard? found = card;
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: _kFactTabGap),
+        child: MouseRegion(
+          onEnter: (_) => _explain(help),
+          onExit: (_) => _explain(null),
+          child: OutlinedButton.icon(
+            onPressed:
+                found == null ? null : () => unawaited(_reviewFact(found)),
+            icon: Icon(icon),
+            label: Text(label),
+          ),
+        ),
+      );
+    }
+
+    final int stage = _activeStage;
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: _kFactTabGap * 2),
+        child: Wrap(
+          children: <Widget>[
+            tab(kProfileFact, Icons.memory, 'm',
+                'Memory profile (m): which Argon2 profile this setup derives '
+                'with, as for a hard reset. Click to review.'),
+            tab(kIterationsFact, Icons.repeat, 'D',
+                'Derivation steps (D): the Argon2 iterations each stage runs, '
+                'as for a hard reset. Click to review.'),
+            tab(kStagesFact, Icons.layers, 'N',
+                'Deep stages (N): how many stages this setup has beyond '
+                'stage 0. Click to review.'),
+            if (_studied[stage]?.isNotEmpty ?? false)
+              tab(selectionFact(stage), Icons.checklist, 'Maps of stage $stage',
+                  'Which maps of stage $stage you study: two maps can look '
+                  'alike. Click to review.'),
+            if (_provenanceOn)
+              tab(kProvenanceFact, Icons.verified_outlined, 'Supply chain',
+                  'Supply chain: could you rebuild this app yourself? Paste '
+                  'the release\'s commit digest after cloning, building and '
+                  'running it anew. Click to review.'),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Space around each tab of the third row.
+  static const double _kFactTabGap = 3;
 
   // --- salt slot (`#0`) content ---------------------------------------------
 
@@ -1141,7 +1488,7 @@ press.calibrate.target    tick_soft.wav
     if (kb.isAltPressed) {
       if (event is! KeyDownEvent) return KeyEventResult.ignored;
       // Alt + a top-row board key: switch the board's context.
-      for (final CommandContext c in CommandContext.values) {
+      for (final CommandContext c in _contexts) {
         if (board == c.key) {
           _setContext(c);
           return KeyEventResult.handled;
@@ -1213,6 +1560,14 @@ press.calibrate.target    tick_soft.wav
       _slotIndex >= 1 &&
       _paths[(_activeStage, _slotIndex)] != null;
 
+  /// The active map's route knobs can be turned: its path is found and shown,
+  /// or, in Train, where the knobs set the targets, found.
+  bool get _routeKnobsReady =>
+      (_showPath || _training) &&
+      _isBoardSlot &&
+      _slotIndex >= 1 &&
+      _paths[(_activeStage, _slotIndex)] != null;
+
   /// Step the active map's route: ρ and the exponent by index into the
   /// engine's choices, the visible stops by one, each within its range.
   void _stepRoute({int rho = 0, int exponent = 0, int visible = 0}) {
@@ -1265,9 +1620,10 @@ press.calibrate.target    tick_soft.wav
       case _Cmd.save:
         return BoardCommand(
           name: 'Save setup',
-          help: 'Encrypts this setup to the file path under a provisional key '
-              '(a QR, a password manager or your own key): a crutch for the '
-              'memorisation window, deleted at graduation.',
+          help: 'Encrypts this setup to a file, its path asked first, under a '
+              'provisional key (a QR, a password manager, Dragon Dice or your '
+              'own key): a crutch for the memorisation window, deleted at '
+              'graduation.',
           icon: Icons.save,
           enabled: !_vaultBusy,
           run: _writeSetup,
@@ -1275,20 +1631,11 @@ press.calibrate.target    tick_soft.wav
       case _Cmd.open:
         return BoardCommand(
           name: 'Open setup',
-          help: 'Opens an encrypted setup file with its provisional key (scan '
-              'the QR or type the key).',
+          help: 'Opens an encrypted setup file: its path, then its provisional '
+              'key (scan the QR or type the key).',
           icon: Icons.folder_open,
           enabled: !_vaultBusy,
           run: _openSetup,
-        );
-      case _Cmd.templates:
-        return BoardCommand(
-          name: 'Blank QR templates',
-          help: 'Saves the 128- and 256-bit QR skeletons, to print and colour '
-              'in by hand with the key.',
-          icon: Icons.qr_code_2,
-          enabled: !_vaultBusy,
-          run: _exportBlankTemplate,
         );
       case _Cmd.volumeDown:
       case _Cmd.volumeUp:
@@ -1309,21 +1656,59 @@ press.calibrate.target    tick_soft.wav
           active: !_importHidden,
           run: _toggleSensitiveVisibility,
         );
-      case _Cmd.filePath:
-        return BoardCommand(
-          name: 'File path',
-          help: 'Shows the setup file path, where save and open look.',
-          icon: Icons.description,
-          run: _focusVaultPath,
-        );
       case _Cmd.reset:
         return BoardCommand(
-          name: 'Reset',
-          help: 'Clears the setup — σ, every point and stage — after asking. '
-              'Not while an advance runs: halt it first.',
-          icon: Icons.restart_alt,
+          name: 'New setup',
+          help: 'Starts a new setup, clearing this one — σ, every point and '
+              'stage — after asking. Not while an advance runs: halt it '
+              'first.',
+          icon: Icons.note_add,
           enabled: !_busy,
           run: _confirmReset,
+        );
+      case _Cmd.stats:
+        return BoardCommand(
+          name: 'Card stats',
+          help: 'Train: every card of the deck and, for the one picked, its '
+              'schedule and the chance of recalling it over time '
+              '(${percentText(kRetentionAtDue)} when due). ↑ ↓ pick a '
+              'card; Esc closes.',
+          icon: Icons.query_stats,
+          enabled: _trainReady,
+          run: () => unawaited(_showCardStats()),
+        );
+      case _Cmd.graduation:
+        return BoardCommand(
+          name: 'Graduation',
+          help: 'Every stage at the graduation gate: the chance of recalling '
+              'fewer than its required maps after the gap T. Sets T (the '
+              'derivation time by default) and ε '
+              '(${chanceText(GraduationParams.defaultEpsilon)} by default). '
+              'When every stage passes: the green light to shred the '
+              'provisional key.',
+          icon: Icons.school_outlined,
+          enabled: _trainReady,
+          run: () => unawaited(_showGraduation()),
+        );
+      case _Cmd.cards:
+        return BoardCommand(
+          name: 'Cards',
+          help: 'The fact cards: the salt\'s and the setup\'s parameters '
+              'm, D and N (always on), the supply chain\'s (on or off) and '
+              'your own — add or remove them '
+              '(at most $kMaxCustomFacts, $kMaxFactChars characters each).',
+          icon: Icons.style,
+          enabled: _orbitSettled,
+          run: () => unawaited(_showCardsManager()),
+        );
+      case _Cmd.wipe:
+        return BoardCommand(
+          name: 'Wipe everything',
+          help: 'Overwrites and deletes the setup file, and clears the setup on '
+              'screen, halting any advance. Asks $_kWipePresses presses of '
+              'one button: deliberate, never a slip. Cannot be undone.',
+          icon: Icons.delete_forever,
+          run: () => unawaited(_wipeWizard()),
         );
       case _Cmd.label:
         return BoardCommand(
@@ -1442,6 +1827,98 @@ press.calibrate.target    tick_soft.wav
           enabled: !_busy,
           run: () => _copyMasterSecret(full: full),
         );
+      case _Cmd.nextDue:
+        return BoardCommand(
+          name: 'Next due map',
+          help: 'Goes to the next map due for review, the longest-due first. '
+              'Any map can be trained, in any order: pick one with its digit '
+              'keys too.',
+          icon: Icons.event_available,
+          enabled: _trainReady,
+          run: _gotoNextDue,
+        );
+      case _Cmd.recall:
+        return BoardCommand(
+          name: 'Recall',
+          help: 'The next click on the map is your answer: dive from memory '
+              'to the leaf, or while stops count, to the shallowest target '
+              'or deeper, and click it. Esc cancels.',
+          icon: Icons.ads_click,
+          enabled: _trainReady &&
+              _trainCard != null &&
+              _step != _TrainStep.found,
+          active: _training && _editPointMode,
+          run: _armRecall,
+        );
+      case _Cmd.showAnswer:
+        return BoardCommand(
+          name: 'Show the answer',
+          help: 'Shows this map’s point and its route, the targets bright. '
+              'Before you answer, it counts as giving up: a graded map is '
+              'graded Again.',
+          icon: Icons.visibility,
+          enabled: _trainReady &&
+              _trainCard != null &&
+              _step == _TrainStep.recall,
+          run: _showAnswer,
+        );
+      case _Cmd.progress:
+        return BoardCommand(
+          name: 'Progress',
+          help: 'Writes in the log what is memorised and what is left, per '
+              'stage against the maps it needs, and which maps are due.',
+          icon: Icons.insights,
+          enabled: _trainReady,
+          run: _logProgress,
+        );
+      case _Cmd.gradeAgain:
+      case _Cmd.gradeHard:
+      case _Cmd.gradeGood:
+      case _Cmd.gradeEasy:
+        final Grade g = switch (c) {
+          _Cmd.gradeAgain => Grade.again,
+          _Cmd.gradeHard => Grade.hard,
+          _Cmd.gradeGood => Grade.good,
+          _ => Grade.easy,
+        };
+        return BoardCommand(
+          name: switch (g) {
+            Grade.again => 'Again',
+            Grade.hard => 'Hard',
+            Grade.good => 'Good',
+            Grade.easy => 'Easy',
+          },
+          help: switch (g) {
+            Grade.again => 'Grade the find Again: it was luck, or came after '
+                'you had given up. The map comes back tomorrow.',
+            Grade.hard => 'Grade the find Hard: you found it, with effort.',
+            Grade.good => 'Grade the find Good: you found it with reasonable '
+                'confidence.',
+            Grade.easy => 'Grade the find Easy: you found it at once.',
+          },
+          icon: switch (g) {
+            Grade.again || Grade.hard => null,
+            Grade.good => Icons.sentiment_satisfied,
+            Grade.easy => Icons.sentiment_very_satisfied,
+          },
+          glyph: switch (g) {
+            Grade.again => (Color colour) => DeadGlyph(colour: colour),
+            Grade.hard => (Color colour) => SweatGlyph(colour: colour),
+            Grade.good || Grade.easy => null,
+          },
+          enabled: _step == _TrainStep.found,
+          run: () => _grade(g),
+        );
+      case _Cmd.saveProgress:
+        return BoardCommand(
+          name: 'Save progress',
+          help: 'Saves the training progress into the setup file, under the '
+              'key that opened it: scan or type that key.',
+          icon: Icons.save,
+          enabled: _trainReady && !_vaultBusy,
+          active: _deckDirty,
+          run: () => unawaited(_saveProgress()),
+        );
       case _Cmd.prevStop:
       case _Cmd.nextStop:
         final bool next = c == _Cmd.nextStop;
@@ -1451,7 +1928,7 @@ press.calibrate.target    tick_soft.wav
               'wrapping around: zooming out, across and back in along the '
               'shortest way, the way the path’s hops are measured.',
           icon: next ? Icons.skip_next : Icons.skip_previous,
-          enabled: _routeReady,
+          enabled: _routeReady && !_answerHidden,
           run: () => _cycleStop(next ? 1 : -1),
         );
       case _Cmd.numbers:
@@ -1481,13 +1958,19 @@ press.calibrate.target    tick_soft.wav
           name: 'Frame the path',
           help: 'Flies to the view holding every stop shown.',
           icon: Icons.fit_screen,
-          enabled: _routeReady,
+          enabled: _routeReady && !_answerHidden,
           run: () {
             final (int, int) key = (_activeStage, _slotIndex);
             final _ShownPath? shown = _paths[key];
             if (shown == null) return;
+            final List<LandmarkFeature> stops =
+                _stopsShown(shown.path, _routeOf(key).visible);
+            if (stops.isEmpty) {
+              _sounds.play(UiSound.denyBlocked);
+              return;
+            }
             _sounds.play(UiSound.navZoom);
-            _frame(_visibleOf(shown.path, _routeOf(key).visible));
+            _frame(stops);
           },
         );
       case _Cmd.rhoZoom:
@@ -1499,7 +1982,7 @@ press.calibrate.target    tick_soft.wav
               ? 'Makes zooming cheaper than panning: a route with fewer stops.'
               : 'Makes panning cheaper than zooming: a route with more stops.',
           icon: zoom ? Icons.zoom_in : Icons.pan_tool,
-          enabled: _routeReady,
+          enabled: _routeKnobsReady,
           run: () => _stepRoute(rho: zoom ? 1 : -1),
         );
       case _Cmd.exponentDown:
@@ -1511,14 +1994,18 @@ press.calibrate.target    tick_soft.wav
               ? 'Penalises long hops more: shorter hops, more stops.'
               : 'Tolerates longer hops: fewer stops.',
           glyph: (Color colour) => HopGlyph(spread: !up, colour: colour),
-          enabled: _routeReady,
+          enabled: _routeKnobsReady,
           run: () => _stepRoute(exponent: up ? 1 : -1),
         );
       case _Cmd.path:
         return BoardCommand(
           name: 'Landmark path',
-          help: 'Shows or hides the landmark path of this map’s point: its '
-              'features outlined, joined by a line, numbered.',
+          help: _training
+              ? 'Shows or hides the route once answered, the stops that '
+                  'count as targets bright. While you recall it stays '
+                  'hidden: give up to see it.'
+              : 'Shows or hides the landmark path of this map’s point: its '
+                  'features outlined, joined by a line, numbered.',
           icon: Icons.route,
           active: _showPath,
           run: _toggleLandmarkPath,
@@ -1527,13 +2014,22 @@ press.calibrate.target    tick_soft.wav
       case _Cmd.stopsUp:
         final bool up = c == _Cmd.stopsUp;
         return BoardCommand(
-          name: up ? 'More stops shown' : 'Fewer stops shown',
-          help: up
-              ? 'Shows one more stop before the leaf.'
-              : 'Hides the shallowest stop shown. With none left the map is '
-                  'unaided, and its review is graded.',
+          name: _training
+              ? (up ? 'More stops count' : 'Fewer stops count')
+              : (up ? 'More stops shown' : 'Fewer stops shown'),
+          help: _training
+              ? (up
+                  ? 'Lets one more stop count as a target: a recall may stop '
+                      'one stop shallower.'
+                  : 'Makes the shallowest target the next stop down: more of '
+                      'the dive from memory. With the leaf alone the review '
+                      'is graded.')
+              : (up
+                  ? 'Shows one more stop before the leaf.'
+                  : 'Hides the shallowest stop shown. With none left the map '
+                      'is unaided, and its review is graded.'),
           icon: up ? Icons.layers : Icons.layers_clear,
-          enabled: _routeReady,
+          enabled: _routeKnobsReady,
           repeats: true,
           run: () => _stepRoute(visible: up ? 1 : -1),
         );
@@ -1637,6 +2133,12 @@ press.calibrate.target    tick_soft.wav
   /// Toggle the landmark path on the active map (Path board). The mode is
   /// announced; the path never is.
   void _toggleLandmarkPath() {
+    if (_answerHidden) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('The route stays hidden while you recall: give up '
+          '(${_hint(_Cmd.showAnswer)}) to see it.');
+      return;
+    }
     setState(() => _showPath = !_showPath);
     _sounds.play(_showPath ? UiSound.modeOn : UiSound.modeOff);
     final bool computing = _showPath &&
@@ -1734,15 +2236,20 @@ press.calibrate.target    tick_soft.wav
   bool _placed(int stage, int slot) =>
       _boardPoints[stage][slot] != null && !_boardDerived[stage][slot];
 
-  /// The deck to save: the current one (or a fresh one, a card per placed
-  /// map), every placed map in it, and the session's routes as its cues.
+  /// Whether stage [stage]'s slot [slot] holds a map to recall: placed, or
+  /// derived once `Sh_i` is fixed. Any `r_i` of a stage's maps rebuild it, so
+  /// every one of them is a card and can be trained.
+  bool _isMap(int stage, int slot) => _boardChunks[stage][slot] != null;
+
+  /// The deck to save: the current one (or a fresh one, a card per map), every
+  /// map of the setup in it, and the session's routes as its cues.
   Deck _deckForSave(int deepest) {
     final Cues start = _cuesOf(_defaultRoute);
     final List<List<int>> placed = <List<int>>[
       for (int i = 0; i <= deepest; i++)
         <int>[
           for (int s = 1; s <= _maxSlot; s++)
-            if (_placed(i, s)) s,
+            if (_isMap(i, s)) s,
         ],
     ];
     Deck deck = _deck ?? buildDeck(maps: placed, cues: start);
@@ -1755,7 +2262,26 @@ press.calibrate.target    tick_soft.wav
       final MemCard? card = deck.map(key.$1, key.$2);
       if (card != null) deck = deck.withCard(card.copyWith(cues: _cuesOf(r)));
     });
-    return deck;
+    return _withAlwaysOnFacts(deck);
+  }
+
+  /// [deck] with the fact cards that are always on: the salt's, the setup's
+  /// parameters (`m`, `D`, `N`), and one for each of your own.
+  Deck _withAlwaysOnFacts(Deck deck) {
+    Deck out = deck;
+    for (final String id in <String>[
+      kSaltFact,
+      // Stage 0's bundle holds no answer for m, D or N: they stay out of it.
+      if (_bundlePath == null) ...kParameterFacts,
+      for (final MapEntry<int, Set<int>> e in _studied.entries)
+        if (e.value.isNotEmpty) selectionFact(e.key),
+      ..._customFacts.keys,
+    ]) {
+      if (!out.cards.any((MemCard c) => c.factId == id)) {
+        out = out.withCard(MemCard.fact(id));
+      }
+    }
+    return out;
   }
 
   /// Set [key]'s route. A new ρ or exponent searches again, with every stop
@@ -1766,18 +2292,9 @@ press.calibrate.target    tick_soft.wav
     final _Route next = reroute
         ? (rho: route.rho, exponent: route.exponent, visible: null)
         : route;
-    setState(() {
-      _routes[key] = next;
-      final _ShownPath? p = _paths[key];
-      if (!reroute && p != null) {
-        _paths[key] = (
-          path: p.path,
-          rho: p.rho,
-          exponent: p.exponent,
-          overlay: _canvasPathOf(p.path, next.visible),
-        );
-      }
-    });
+    // Recalling, a route change changes the targets: the attempt is practice.
+    if (_answerHidden) _attemptAided = true;
+    setState(() => _routes[key] = next);
   }
 
   /// The landmark-path overlay of [slot]'s point on the active stage, or null
@@ -1794,22 +2311,44 @@ press.calibrate.target    tick_soft.wav
       unawaited(_computePath(key, slot));
     }
     final CanvasPath? overlay = shown?.overlay;
-    if (overlay == null) return null;
-    // The same stops (so their traced outlines are kept), drawn as set.
+    // In Train the route stays hidden while recalled.
+    if (overlay == null || !_showPath || _answerHidden) return null;
+    // The same stops (so their traced outlines are kept). Setup draws those
+    // shown; Train the whole route, the stops that are not targets dimmed.
+    final List<CanvasPathStop> stops = overlay.stops;
+    final int first = _firstTarget(stops.length, route.visible);
     return CanvasPath(
-      stops: overlay.stops,
+      stops: _training
+          ? <CanvasPathStop>[
+              for (int i = 0; i < stops.length; i++)
+                CanvasPathStop(
+                  re: stops[i].re,
+                  im: stops[i].im,
+                  cells: stops[i].cells,
+                  dimmed: i < first,
+                ),
+            ]
+          : stops.sublist(first),
       showNumbers: _showNumbers,
       showLine: _showLines,
     );
   }
 
-  /// The stops of [path] drawn with [visible] stops before the leaf (null:
-  /// all), the shallowest hidden first.
-  static List<LandmarkFeature> _visibleOf(LandmarkPath path, int? visible) {
-    final int before = path.stops.length - 1;
-    final int shown = visible == null ? before : visible.clamp(0, before);
-    return path.stops.skip(before - shown).toList();
+  /// Index of the shallowest stop shown, or in Train the shallowest target,
+  /// of a route of [count] stops (the leaf last) with [visible] stops before
+  /// the leaf (null: all).
+  static int _firstTarget(int count, int? visible) {
+    final int before = count - 1;
+    return before - (visible ?? before).clamp(0, before);
   }
+
+  /// The stops of [path] to fly to or frame: those drawn. In Setup, those
+  /// shown with [visible] stops before the leaf (null: all), the shallowest
+  /// hidden first; in Train, once answered, the whole route.
+  List<LandmarkFeature> _stopsShown(LandmarkPath path, int? visible) =>
+      _training
+          ? path.stops
+          : path.stops.sublist(_firstTarget(path.stops.length, visible));
 
   /// How much larger than the framed stops a frame is, and the fewest cells
   /// of a stop it spans: a stop fills about a third of the view.
@@ -1874,8 +2413,12 @@ press.calibrate.target    tick_soft.wav
     final _ShownPath? shown = _paths[key];
     if (shown == null) return;
     final int? visible = _routeOf(key).visible;
-    final List<LandmarkFeature> stops = _visibleOf(shown.path, visible);
+    final List<LandmarkFeature> stops = _stopsShown(shown.path, visible);
     final int n = stops.length;
+    if (n == 0) {
+      _sounds.play(UiSound.denyBlocked);
+      return;
+    }
     final ({(int, int) key, LandmarkPath path, int? visible, int index})? at =
         _stopAt;
     final bool fresh = at == null ||
@@ -1941,20 +2484,20 @@ press.calibrate.target    tick_soft.wav
               path: found,
               rho: route.rho,
               exponent: route.exponent,
-              overlay: _canvasPathOf(found, _routeOf(key).visible),
+              overlay: _canvasPathOf(found),
             );
     });
     if (found == null && _showPath) _toast('No landmark path for this point.');
   }
 
   /// A landmark path as an overlay: each stop at its barycentre, its feature
-  /// highlighted from its own cells. With [visible] set, only that many stops
-  /// before the leaf are drawn, the shallowest hidden first. The cells are
-  /// shared, so wiping the path blanks the overlay too.
-  CanvasPath _canvasPathOf(LandmarkPath path, int? visible) {
+  /// highlighted from its own cells; every stop, which of them are drawn is
+  /// [_pathOverlay]'s. The cells are shared, so wiping the path blanks the
+  /// overlay too.
+  CanvasPath _canvasPathOf(LandmarkPath path) {
     return CanvasPath(
       stops: <CanvasPathStop>[
-        for (final LandmarkFeature f in _visibleOf(path, visible))
+        for (final LandmarkFeature f in path.stops)
           CanvasPathStop(
             re: fixedToDouble(f.barycentreRe),
             im: fixedToDouble(f.barycentreIm),
@@ -1976,7 +2519,9 @@ press.calibrate.target    tick_soft.wav
   /// stops) and the stops visible before the leaf. Both route sliders give
   /// more stops to the right. Words only: the values are the engine's.
   Widget? _routePanel() {
-    if (!_showPath || !_isBoardSlot || _slotIndex < 1) return null;
+    if ((!_showPath && !_training) || !_isBoardSlot || _slotIndex < 1) {
+      return null;
+    }
     final (int, int) key = (_activeStage, _slotIndex);
     final _ShownPath? shown = _paths[key];
     if (shown == null) return null;
@@ -2030,7 +2575,8 @@ press.calibrate.target    tick_soft.wav
                     exponent: v,
                     visible: route.visible,
                   ))),
-          row('no stops', 'all shown', visible, before,
+          row(_training ? 'leaf only' : 'no stops',
+              _training ? 'all count' : 'all shown', visible, before,
               (int v) => _setRoute(key, (
                     rho: route.rho,
                     exponent: route.exponent,
@@ -2093,10 +2639,19 @@ press.calibrate.target    tick_soft.wav
       _setOrbitStage(index);
       return;
     }
+    // Train recalls the open setup's stages; it never advances.
+    if (_training) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Train covers the stages of the open setup.');
+      return;
+    }
     // Forward into the immediate next stage: run the memory-hard advance
-    // o_{index} = H*(u_{index-1}) from the (now complete) preceding stage.
+    // o_{index} = H*(u_{index-1}) from the (now complete) preceding stage, or
+    // continue it from where it was halted.
     if (index == _orbitReachableCeiling + 1) {
-      unawaited(_advanceOrbitInto(index));
+      unawaited(_canResumeAdvance
+          ? _resumeOrbitAdvance()
+          : _advanceOrbitInto(index));
       return;
     }
     _sounds.play(UiSound.denyBlocked);
@@ -2178,6 +2733,7 @@ press.calibrate.target    tick_soft.wav
       // stage bar and Halt can stop it. `oFrom` is NOT wiped here — for stage 0
       // it is a fresh derivation from σ, but for a deep stage it *is*
       // `_orbitO[from]`, which the setup still needs.
+      final Stopwatch timer = Stopwatch()..start();
       final OrbitAdvanceJob job = await widget.core.startOrbitAdvance(
         oFrom,
         shBytes,
@@ -2185,6 +2741,7 @@ press.calibrate.target    tick_soft.wav
         profile: _profile,
         onProgress: (int done, int total) {
           if (!mounted) return;
+          _timePasses(timer, done);
           setState(() {
             _advanceDone = done;
             _advanceTotal = total;
@@ -2222,6 +2779,8 @@ press.calibrate.target    tick_soft.wav
       }
     }
     if (!mounted) return;
+    // Halted by a wipe: nothing is kept, and the wipe says so.
+    if (cancelled && _wiping) return;
     if (cancelled) {
       // The checkpoint survives the halt — that is the whole point of it.
       final int done = _advanceCheckpoint?.pass ?? 0;
@@ -2229,7 +2788,8 @@ press.calibrate.target    tick_soft.wav
       setState(() {});
       _toast(done > 0
           ? 'Advance into Stage $target halted after $done/$steps passes — '
-              'kept. Resume (${_hint(_Cmd.halt)}) continues from there; Write '
+              'kept. Resume (${_hint(_Cmd.halt)}) or selecting Stage $target '
+              'continues from there; Write '
               '(${_hint(_Cmd.save)}) keeps it across sessions (the file then '
               'holds the partial derivation — guard it). Changing D, or '
               're-placing a point in a shallower stage, discards it.'
@@ -2251,6 +2811,14 @@ press.calibrate.target    tick_soft.wav
     _setOrbitStage(target);
     _sounds.play(UiSound.stageReady);
     _toast('Advanced to stage $target — place its points.');
+  }
+
+  /// Refine [_passSeconds] from a running advance: [passes] done in [timer]'s
+  /// time.
+  void _timePasses(Stopwatch timer, int passes) {
+    if (passes <= 0) return;
+    _passSeconds =
+        timer.elapsedMicroseconds / Duration.microsecondsPerSecond / passes;
   }
 
   /// Continue a halted advance from its preserved checkpoint, running only the
@@ -2285,6 +2853,7 @@ press.calibrate.target    tick_soft.wav
     ({Uint8List k, Uint8List next})? adv;
     bool cancelled = false;
     try {
+      final Stopwatch timer = Stopwatch()..start();
       final OrbitAdvanceJob job = await widget.core.resumeOrbitAdvance(
         k,
         cp.digest,
@@ -2293,6 +2862,7 @@ press.calibrate.target    tick_soft.wav
         profile: _profile,
         onProgress: (int done, int total) {
           if (!mounted) return;
+          _timePasses(timer, done - cp.pass);
           setState(() {
             _advanceDone = done;
             _advanceTotal = total;
@@ -2327,6 +2897,7 @@ press.calibrate.target    tick_soft.wav
       }
     }
     if (!mounted) return;
+    if (cancelled && _wiping) return;
     if (cancelled) {
       final int done = _advanceCheckpoint?.pass ?? 0;
       _sounds.play(UiSound.navStage);
@@ -2364,6 +2935,7 @@ press.calibrate.target    tick_soft.wav
       _boardKey = ''; // force the render cache to rebuild for the new stage
     });
     _recenter();
+    if (_training) _newAttempt();
   }
 
   /// Whether the keyboard focus is currently inside an editable text field, so
@@ -2409,6 +2981,10 @@ press.calibrate.target    tick_soft.wav
       // cannot encode the mode stays armed to retry.
       onSelect: _editPointMode
           ? (FractalSelection sel) {
+              if (_training) {
+                _attemptAt(sel);
+                return;
+              }
               if (_placeableBoardSlot && _placePrimaryAt(_slotIndex, sel)) {
                 setState(() => _editPointMode = false);
               }
@@ -2422,7 +2998,9 @@ press.calibrate.target    tick_soft.wav
   /// once the island spans enough pixels it becomes a square frame around its
   /// cells (the switch has hysteresis — see [_updateBoardMarkerMode]).
   CanvasOverlays _boardOverlays(int slot) {
-    final ({int reRaw, int imRaw})? pt = _boardPoints[_activeStage][slot];
+    final ({int reRaw, int imRaw})? point = _boardPoints[_activeStage][slot];
+    // In Train mode the point is the answer: hidden until answered.
+    final ({int reRaw, int imRaw})? pt = _answerHidden ? null : point;
     final _BoardDeco? deco = pt == null ? null : _boardDecoFor(slot);
     final bool square = _boardMarkerSquare && deco != null;
     final List<CrossMarker> crosses = <CrossMarker>[];
@@ -2451,7 +3029,10 @@ press.calibrate.target    tick_soft.wav
           ),
       ],
       crosses: crosses,
-      path: _showPath && pt != null ? _pathOverlay(slot) : null,
+      // In Train the route is found even while hidden: it sets the targets.
+      path: (_showPath || _training) && point != null
+          ? _pathOverlay(slot)
+          : null,
     );
   }
 
@@ -2472,10 +3053,18 @@ press.calibrate.target    tick_soft.wav
   /// Board reservoirs `(o, p, q)` for the active stage's slot [slot] (board
   /// `θ_i_(slot-1)`), or null when the stage's `o_i` is unavailable. Cheap
   /// (`orbitRoot`/`theta`).
-  ({int o, int p, int q})? _boardPrm(int slot) {
-    final Uint8List? oi = _stageOrbit(_activeStage);
-    if (oi == null) return null;
-    return OrbitProtocol(widget.core).orbitParams(oi, slot - 1);
+  ({int o, int p, int q})? _boardPrm(int slot) => _mapPrm(_activeStage, slot);
+
+  /// Map [slot]'s `(o, p, q)` at [stage]: from its `o_i`, or — for stage 0
+  /// with σ unknown and stage 0's bundle open — from the bundle's θ₀.
+  ({int o, int p, int q})? _mapPrm(int stage, int slot) {
+    final Uint8List? oi = _stageOrbit(stage);
+    if (oi != null) return OrbitProtocol(widget.core).orbitParams(oi, slot - 1);
+    final Stage0Header? b = _bundleHeader;
+    if (stage != 0 || b == null || slot < 1 || slot > b.theta.length) {
+      return null;
+    }
+    return OrbitProtocol.paramsOf(b.theta[slot - 1]);
   }
 
   /// Discovery params for resolving a canonical island's *shape* — the engine's
@@ -2540,6 +3129,11 @@ press.calibrate.target    tick_soft.wav
       return;
     }
     _sounds.play(UiSound.focus);
+    // Recalling, the islands are a hint: a find then counts as Again.
+    if (_answerHidden && !_attemptHint) {
+      _attemptHint = true;
+      _toast('Islands shown: a find in this attempt counts as Again.');
+    }
     // Point the leaf source at this board so the decode/enumerate run on the
     // same fractal that is on screen.
     widget.core.leafSource.reservoirs =
@@ -2711,6 +3305,604 @@ press.calibrate.target    tick_soft.wav
 
   static double _log2(double x) => math.log(x) / math.ln2;
 
+  // --- Train mode (CPNF) -----------------------------------------------------
+
+  /// The board's contexts in this mode: Train shows its board in Setup's
+  /// place.
+  List<CommandContext> get _contexts =>
+      _training ? kTrainContexts : kSetupContexts;
+
+  /// Train mode with an open setup and its deck.
+  bool get _trainReady => _training && _orbitSettled && _deck != null;
+
+  /// The shown map's card, with its cues as the route is now set; null when
+  /// the shown slot is not a map of the deck.
+  MemCard? get _trainCard {
+    final Deck? deck = _deck;
+    if (!_training || deck == null || !_isBoardSlot) return null;
+    final (int, int) key = (_activeStage, _slotIndex);
+    final MemCard? card = deck.map(key.$1, key.$2);
+    if (card == null || !_isMap(key.$1, key.$2)) return null;
+    return card.copyWith(cues: _cuesOf(_routeOf(key)));
+  }
+
+  /// The shown map's point is hidden: Train mode, before an answer.
+  bool get _answerHidden => _training && _step == _TrainStep.recall;
+
+  /// A fresh attempt at the shown map: its point hidden again.
+  void _newAttempt() {
+    setState(() {
+      _step = _TrainStep.recall;
+      _attemptAided = false;
+      _attemptHint = false;
+      _editPointMode = false;
+    });
+  }
+
+  /// Why an attempt at [card] now is practice, in words, or null if it is
+  /// graded ([ReviewSession.practiceReasonFor]).
+  String? _practiceReason(MemCard card) => _practiceText(
+      _review.practiceReasonFor(card, aided: _attemptAided), card);
+
+  /// [r], why an attempt at [card] is practice, in words.
+  static String? _practiceText(PracticeReason? r, MemCard card) => switch (r) {
+        null => null,
+        PracticeReason.stopsShown => 'stops count as targets',
+        PracticeReason.routeChanged => 'the route changed during the attempt',
+        PracticeReason.gradedThisSession => 'graded already this session',
+        PracticeReason.notDue => 'not due until ${dateText(card.due!)}',
+      };
+
+  /// The shown map's route, for its targets: its stops (the leaf last) and
+  /// the index of the shallowest target; null while it is searched for, or
+  /// if the point has none.
+  ({List<LandmarkFeature> stops, int first})? get _trainRoute {
+    final (int, int) key = (_activeStage, _slotIndex);
+    final _ShownPath? shown = _paths[key];
+    final _Route route = _routeOf(key);
+    if (shown == null ||
+        shown.rho != route.rho ||
+        shown.exponent != route.exponent) {
+      return null;
+    }
+    final List<LandmarkFeature> stops = shown.path.stops;
+    return (stops: stops, first: _firstTarget(stops.length, route.visible));
+  }
+
+  /// Whether the raw point ([reRaw], [imRaw]) lies on one of [f]'s cells.
+  static bool _onFeature(LandmarkFeature f, int reRaw, int imRaw) {
+    final int cell = f.cellRaw;
+    if (cell <= 0) return false;
+    // From the corner of cell (0, 0): its centre less half a cell.
+    final int dx = reRaw - f.cellsOriginRe + cell ~/ 2;
+    final int dy = imRaw - f.cellsOriginIm + cell ~/ 2;
+    if (dx < 0 || dy < 0) return false;
+    final int col = dx ~/ cell;
+    final int row = dy ~/ cell;
+    if (col >= f.cellsWidth || row >= f.cellsHeight) return false;
+    return f.cells[row * f.cellsWidth + col] != 0;
+  }
+
+  /// Arm the recall: the next click on the map is the answer.
+  void _armRecall() {
+    final MemCard? card = _trainCard;
+    if (card == null || _step == _TrainStep.found) return;
+    if (_step == _TrainStep.answered) _newAttempt();
+    setState(() => _editPointMode = true);
+    final String? practice = _practiceReason(card);
+    final ({List<LandmarkFeature> stops, int first})? r = _trainRoute;
+    final String what = r != null && r.first < r.stops.length - 1
+        ? 'dive from memory to stop ${r.first + 1} of ${r.stops.length} or '
+            'deeper and click it'
+        : 'zoom to the leaf you remember and click it';
+    _toast('Recall: $what '
+        '(${practice == null ? 'graded' : 'practice: $practice'}). '
+        'Esc cancels.');
+  }
+
+  /// A click while recalling: the leaf there against the map's point, and,
+  /// while stops count as targets, the stops of its route.
+  void _attemptAt(FractalSelection sel) {
+    final MemCard? card = _trainCard;
+    final ({int o, int p, int q})? prm = _boardPrm(_slotIndex);
+    final List<int>? truth = _boardChunks[_activeStage][_slotIndex];
+    if (card == null || prm == null || truth == null) return;
+    final int reRaw = fixedFromDouble(sel.re);
+    final int imRaw = fixedFromDouble(sel.im);
+    final CoreDecodeResult d = widget.core
+        .decodePoint(reRaw: reRaw, imRaw: imRaw, o: prm.o, p: prm.p, q: prm.q);
+    bool leaf = d.valid && d.bits.length == truth.length;
+    for (int i = 0; leaf && i < truth.length; i++) {
+      leaf = d.bits[i] == truth[i];
+    }
+    Entropy.wipe(d.bits);
+    // The deepest stop of the route clicked, the leaf aside.
+    final (int, int) map = (_activeStage, _slotIndex);
+    final ({List<LandmarkFeature> stops, int first})? r = _trainRoute;
+    int? reached;
+    if (!leaf && r != null) {
+      for (int i = r.stops.length - 2; i >= 0 && reached == null; i--) {
+        if (_onFeature(r.stops[i], reRaw, imRaw)) reached = i;
+      }
+    }
+    if (!leaf && reached == null) {
+      // Stops count, but the route is still being found: it may be one.
+      if (r == null &&
+          _routeOf(map).visible != 0 &&
+          _pathsPending.contains(map)) {
+        _sounds.play(UiSound.denyBlocked);
+        _toast('The route is still being found — click again in a moment.');
+        return; // still armed
+      }
+      if (!d.valid) {
+        _sounds.play(UiSound.denyMiss);
+        _toast('No encodable leaf there — zoom in and click closer.');
+        return; // still armed
+      }
+    }
+    final bool stopHit = reached != null && reached >= r!.first;
+    final bool hit = leaf || stopHit;
+    final String? practice = _practiceReason(card);
+    setState(() {
+      _editPointMode = false;
+      _step = leaf && practice == null && !_attemptHint
+          ? _TrainStep.found
+          : _TrainStep.answered;
+      _showPath = true; // answered: the route is drawn
+    });
+    // While stops count, the way down: hide one more.
+    final String fewer = r != null && r.first < r.stops.length - 1
+        ? ' ${_hint(_Cmd.stopsDown)} makes one fewer count.'
+        : '';
+    if (!hit) {
+      _sounds.play(UiSound.denyMiss);
+      final String short = reached == null
+          ? ''
+          : 'Reached stop ${reached + 1}; the targets start at stop '
+              '${r!.first + 1}. ';
+      if (practice != null) {
+        _toast('${short}Missed (practice: $practice). The answer is shown.');
+        return;
+      }
+      final MemCard next = _record(card, Grade.again);
+      _toast('${short}Missed: graded Again, next review ${_dueText(next)}. '
+          'The answer is shown.');
+      return;
+    }
+    _sounds.play(UiSound.selectPoint);
+    if (stopHit) {
+      _toast('Found stop ${reached + 1} of ${r.stops.length} '
+          '(practice: $practice).$fewer');
+      return;
+    }
+    if (practice != null) {
+      _toast('Found it (practice: $practice).$fewer');
+      return;
+    }
+    if (_attemptHint) {
+      final MemCard next =
+          _record(card, honestGrade(succeeded: true, usedHint: true));
+      _toast('Found, after revealing the islands: graded Again, next review '
+          '${_dueText(next)}.');
+      return;
+    }
+    String key(_Cmd c) => _layout.keys[c.slot];
+    _toast('Found it. Grade it: ${key(_Cmd.gradeHard)} Hard, '
+        '${key(_Cmd.gradeGood)} Good, ${key(_Cmd.gradeEasy)} Easy — or '
+        '${key(_Cmd.gradeAgain)} Again if it was luck or came after giving '
+        'up.');
+  }
+
+  /// Grade the find with the user's [g].
+  void _grade(Grade g) {
+    final MemCard? card = _trainCard;
+    if (card == null || _step != _TrainStep.found) return;
+    final MemCard next = _record(card, honestGrade(succeeded: true, proposed: g));
+    setState(() => _step = _TrainStep.answered);
+    _toast('Graded ${g.name}: next review ${_dueText(next)}. Save progress '
+        '(${_layout.keys[_Cmd.saveProgress.slot]}) to keep it.');
+  }
+
+  /// When [card] is due, in words.
+  String _dueText(MemCard card) {
+    final DateTime? due = card.due;
+    return due == null ? 'now' : 'on ${dateText(due)}';
+  }
+
+  /// Grade [card] with [g] in the deck; the graded card.
+  MemCard _record(MemCard card, Grade g) {
+    final MemCard next = _review.record(card, g);
+    setState(() {
+      _deck = _deck!.withCard(next);
+      _deckDirty = true;
+    });
+    return next;
+  }
+
+  /// Review the fact [card] in its dialog, and grade it as answered there.
+  Future<void> _reviewFact(MemCard card) async {
+    final String? practice =
+        _practiceText(_review.practiceReasonFor(card), card);
+    final CustomFact? custom = _customFacts[card.factId];
+    final Widget? dialog = switch (card.factId) {
+      kSaltFact => SaltDialog(
+          sigma: _sigmaCtrl.text,
+          orbits: <List<int>?>[for (final Uint8List? o in _orbitO) o],
+          harvest: (DateTime d) => const NamtsoHarvester()
+              .start(date: d, explorer: _explorerCtrl.text.trim())
+              .result,
+          unbury: (String label, DateTime d) => const NamtsoHarvester()
+              .unbury(
+                  label: label, date: d, explorer: _explorerCtrl.text.trim())
+              .result,
+          practice: practice,
+        ),
+      kProfileFact => ProfileDialog(
+          labels: _profileLabels,
+          answer: _profiles.indexOf(_profile),
+          practice: practice,
+        ),
+      kIterationsFact => CountDialog(
+          factId: kIterationsFact, answer: _iterations, practice: practice),
+      kStagesFact => CountDialog(
+          factId: kStagesFact,
+          answer: _orbitDeepestStage,
+          practice: practice),
+      kProvenanceFact => ProvenanceDialog(practice: practice),
+      final String id when _studied[selectionStage(id)] != null =>
+        SelectionDialog(
+          stage: selectionStage(id)!,
+          maps: kMapsPerStage,
+          studied: _studied[selectionStage(id)]!,
+          practice: practice,
+        ),
+      _ when custom != null =>
+        CustomFactDialog(fact: custom, practice: practice),
+      _ => null,
+    };
+    if (dialog == null) return;
+    final Grade? g = await _dialog(
+      _Cue.fact,
+      () => showDialog<Grade>(
+        context: context,
+        barrierDismissible: false,
+        builder: (BuildContext _) => dialog,
+      ),
+    );
+    if (!mounted || g == null || practice != null) return;
+    final MemCard next = _record(card, g);
+    _sounds.play(g == Grade.again ? UiSound.denyMiss : UiSound.selectPoint);
+    _toast('${factName(card, _customFacts)}: graded ${g.name}, next review '
+        '${_dueText(next)}. Save progress '
+        '(${_layout.keys[_Cmd.saveProgress.slot]}) to keep it.');
+  }
+
+  /// Show the shown map's point. Before an answer, on a graded attempt, it
+  /// is giving up: Again.
+  void _showAnswer() {
+    final MemCard? card = _trainCard;
+    if (card == null || _step != _TrainStep.recall) return;
+    final bool gaveUp = _practiceReason(card) == null;
+    setState(() {
+      _step = _TrainStep.answered;
+      _editPointMode = false;
+      _showPath = true; // given up: the route is drawn
+    });
+    _sounds.play(UiSound.navZoom);
+    if (!gaveUp) {
+      _toast('The answer is shown.');
+      return;
+    }
+    final MemCard next = _record(card, Grade.again);
+    _toast('Gave up: graded Again, next review ${_dueText(next)}. The answer '
+        'is shown.');
+  }
+
+  /// The deck's map cards of this setup, with their cues as now set.
+  List<MemCard> get _trainCards => <MemCard>[
+        for (final MemCard c in _deck?.cards ?? const <MemCard>[])
+          if (c.kind == CardKind.point &&
+              c.stageIndex <= _orbitDeepestStage &&
+              _isMap(c.stageIndex, c.slot))
+            c.copyWith(cues: _cuesOf(_routeOf((c.stageIndex, c.slot)))),
+      ];
+
+  /// Go to the next due map after the shown one, the longest-due first.
+  void _gotoNextDue() {
+    final List<MemCard> due =
+        _schedule.queue(<MemCard>[..._trainCards, ..._factCards]).due;
+    if (due.isEmpty) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Nothing is due.');
+      return;
+    }
+    final String? fact = _lastDueFact;
+    final int at = due.indexWhere((MemCard c) => fact != null
+        ? c.factId == fact
+        : c.kind == CardKind.point &&
+            c.stageIndex == _activeStage &&
+            c.slot == _slotIndex);
+    final MemCard next = due[(at + 1) % due.length];
+    if (next.kind == CardKind.fact) {
+      _lastDueFact = next.factId;
+      unawaited(_reviewFact(next));
+      return;
+    }
+    _lastDueFact = null;
+    if (next.stageIndex != _activeStage) _setOrbitStage(next.stageIndex);
+    if (next.slot != _slotIndex) {
+      _selectSlot(next.slot);
+    } else {
+      _recenter();
+      _newAttempt();
+    }
+    final String? practice = _practiceReason(next);
+    _toast('Stage ${next.stageIndex}, map ${next.slot}: '
+        '${practice == null ? 'graded' : 'practice, $practice'}.');
+  }
+
+  /// Write what is memorised and what is left, per stage, in the log.
+  void _logProgress() {
+    final Deck? deck = _deck;
+    if (deck == null) return;
+    final int deepest = _orbitDeepestStage;
+    final DeckProgress progress = deck.progress(
+        <int>[for (int i = 0; i <= deepest; i++) _requiredOf(i)], _schedule);
+    final DateTime now = _schedule.clock.now();
+    final List<MemCard> cards = _trainCards;
+    final List<StageGate> gates = _gatesWith(_gap, _epsilon);
+    for (int i = 0; i <= deepest; i++) {
+      final StageProgress p = progress.stages[i];
+      final List<int> due = <int>[
+        for (final MemCard c in cards)
+          if (c.stageIndex == i && c.isDue(now)) c.slot,
+      ]..sort();
+      _toast('Stage $i: needs ${p.required} maps; ${p.maps} in the deck, '
+          '${p.unaided} without stops; ${_gateText(gates[i], _gap)}'
+          '${due.isEmpty ? '' : '; due: map${due.length == 1 ? '' : 's'} '
+              '${due.join(', ')}'}.');
+    }
+    final List<String> short = _factsShort(_gap);
+    if (short.isNotEmpty) _toast('Graduation: ${_factsText(short)}.');
+    _toast(gates.every((StageGate g) => g.passes) && short.isEmpty
+        ? 'Green light: every stage passes the graduation gate and every '
+            'fact holds — you may shred the provisional key '
+            '(${_hint(_Cmd.wipe)} wipes the setup file).'
+        : 'Graduation: not yet (ε ${chanceText(_epsilon)}; '
+            '${_hint(_Cmd.graduation)} sets it and the gap).');
+  }
+
+  /// Width of the graduation dialog, and of its number fields.
+  static const double _kGraduationWidth = 520;
+  static const double _kGraduationFieldWidth = 160;
+
+  /// The graduation dialog (Train board X): every stage at the gate, the
+  /// target gap `T` and the threshold `ε` to set — a gap below the derivation
+  /// time asked first — and, when every stage passes, the green light with a
+  /// way to the wipe.
+  Future<void> _showGraduation() async {
+    final Duration? derivation = _derivationTime;
+    final TextEditingController gapInput = TextEditingController(
+        text: _gapSeconds == null
+            ? ''
+            : (_gapSeconds! / Duration.secondsPerDay).toString());
+    final TextEditingController epsInput = TextEditingController(
+        text: (_epsilon * _kPercentScale).toString());
+    bool wipe = false;
+    final DialogRoute<void> route = DialogRoute<void>(
+        context: context,
+        builder: (BuildContext ctx) => StatefulBuilder(
+          builder: (BuildContext ctx, void Function(void Function()) setLocal) {
+            final double? days = double.tryParse(gapInput.text.trim());
+            final double? pct = double.tryParse(epsInput.text.trim());
+            final Duration gap = days != null && days > 0
+                ? Duration(seconds: (days * Duration.secondsPerDay).round())
+                : derivation ?? _kGapFallback;
+            final double eps =
+                pct != null && pct > 0 ? pct / _kPercentScale : _epsilon;
+            final List<StageGate> gates = _gatesWith(gap, eps);
+            final List<String> short = _factsShort(gap);
+            final bool green =
+                gates.every((StageGate g) => g.passes) && short.isEmpty;
+
+            Future<void> apply() async {
+              if (days != null && days > 0 && derivation != null &&
+                  gap < derivation) {
+                final bool go = await showDialog<bool>(
+                      context: ctx,
+                      builder: (BuildContext c) => AlertDialog(
+                        title: const Text('Shorter than a derivation'),
+                        content: Text(
+                          'A gap of ${durationText(gap)} is shorter than a '
+                          'derivation (${durationText(derivation)}). If '
+                          're-deriving is the only way to review, reviewing '
+                          'that often takes two or more setups cycling at '
+                          'the same time. Set it anyway?',
+                        ),
+                        actions: <Widget>[
+                          TextButton(
+                            onPressed: () => Navigator.of(c).pop(false),
+                            child: const Text('Cancel'),
+                          ),
+                          FilledButton(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: Theme.of(c).colorScheme.error,
+                              foregroundColor: Theme.of(c).colorScheme.onError,
+                            ),
+                            onPressed: () => Navigator.of(c).pop(true),
+                            child: const Text('Set it'),
+                          ),
+                        ],
+                      ),
+                    ) ??
+                    false;
+                if (!go) return;
+              }
+              setState(() {
+                _gapSeconds = days != null && days > 0 ? gap.inSeconds : null;
+                _epsilon = eps;
+                _deckDirty = true;
+              });
+              if (ctx.mounted) Navigator.of(ctx).pop();
+              _logProgress();
+            }
+
+            Widget field(TextEditingController c, String label, String hint) =>
+                SizedBox(
+                  width: _kGraduationFieldWidth,
+                  child: TextField(
+                    controller: c,
+                    keyboardType:
+                        const TextInputType.numberWithOptions(decimal: true),
+                    onChanged: (_) => setLocal(() {}),
+                    decoration: InputDecoration(
+                      isDense: true,
+                      border: const OutlineInputBorder(),
+                      labelText: label,
+                      hintText: hint,
+                    ),
+                  ),
+                );
+
+            return CallbackShortcuts(
+              bindings: <ShortcutActivator, VoidCallback>{
+                const SingleActivator(LogicalKeyboardKey.escape): () =>
+                    Navigator.of(ctx).pop(),
+              },
+              child: AlertDialog(
+                title: const Text('Graduation'),
+                content: SizedBox(
+                  width: _kGraduationWidth,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: <Widget>[
+                      Text(
+                        'A stage graduates when the chance of recalling fewer '
+                        'than its required maps, after the gap T, is at most '
+                        'ε. The maps you study count, so a few recalled very '
+                        'well pass as well as more recalled less well. Each '
+                        'fact — the salt, m, D, N and the maps you study per '
+                        'stage — must also hold for T. '
+                        'Derivation (hard reset): '
+                        '${derivation == null ? 'unknown — calibrate on the '
+                            'Setup board' : durationText(derivation)}.',
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        children: <Widget>[
+                          field(gapInput, 'T (days)',
+                              'derivation time'),
+                          const SizedBox(width: 12),
+                          field(epsInput, 'ε (%)',
+                              chanceText(GraduationParams.defaultEpsilon)),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      for (final StageGate g in gates)
+                        Text('Stage ${g.stage}: ${_gateText(g, gap)}.'),
+                      if (short.isNotEmpty)
+                        Text('${_factsText(short)}.'),
+                      const SizedBox(height: 12),
+                      Text(
+                        green
+                            ? 'Green light: every stage passes and every '
+                                'fact holds — you may shred the provisional '
+                                'key.'
+                            : 'Not yet: keep training, or grade honestly '
+                                'lower where recall falls short — reviews '
+                                'come sooner.',
+                        style: TextStyle(
+                          color: green
+                              ? Theme.of(ctx).colorScheme.primary
+                              : null,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                actions: <Widget>[
+                  if (green)
+                    TextButton(
+                      onPressed: _press(_Cue.graduationWipe, () {
+                        wipe = true;
+                        Navigator.of(ctx).pop();
+                      }),
+                      child: const Text('Retire the provisional key…'),
+                    ),
+                  TextButton(
+                    onPressed: _press(
+                        _Cue.graduationCancel, () => Navigator.of(ctx).pop()),
+                    child: const Text('Cancel'),
+                  ),
+                  FilledButton(
+                    onPressed: _press(_Cue.graduationApply, () {
+                      unawaited(apply());
+                    }),
+                    child: const Text('Apply'),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+    );
+    await _dialog(_Cue.graduation, () => Navigator.of(context).push(route));
+    // The fields are still drawn while the dialog animates out: free them
+    // after.
+    unawaited(route.completed.whenComplete(() {
+      gapInput.dispose();
+      epsInput.dispose();
+    }));
+    if (wipe && mounted) await _retireKey();
+  }
+
+  /// ε is entered and shown as a percentage.
+  static const double _kPercentScale = 100;
+
+  /// Save the training progress into the setup file, under the key that
+  /// opened it: the key must open the file it replaces.
+  Future<void> _saveProgress() async {
+    if (_bundleKey != null) {
+      await _resealBundle();
+      return;
+    }
+    final String path = _vaultPath.text.trim();
+    if (path.isEmpty) {
+      _sounds.play(UiSound.denyInput);
+      _toast('Open the setup file first (${_hint(_Cmd.open)}).');
+      return;
+    }
+    final Uint8List? key =
+        await _enterKey(title: 'Save training progress', action: 'Save');
+    if (!mounted || key == null) return;
+    setState(() => _vaultBusy = true);
+    String? error;
+    try {
+      await SetupCrypto.openPayload(await File(path).readAsBytes(), key);
+    } catch (_) {
+      error = 'That key does not open the setup file: nothing saved. A '
+          'setup never saved goes through ${_hint(_Cmd.save)} first.';
+    }
+    if (error == null) {
+      final ({String? error, Uint8List? key}) r =
+          await _saveOrbitVaultToFile(path, providedKey: key);
+      error = r.error;
+      if (r.key != null) _wipeBytes(r.key!);
+    }
+    _wipeBytes(key);
+    if (!mounted) return;
+    setState(() => _vaultBusy = false);
+    if (error != null) {
+      _sounds.play(UiSound.denyInput);
+      _toast(error);
+      return;
+    }
+    setState(() => _deckDirty = false);
+    _sounds.play(UiSound.exportOk);
+    _toast('Training progress saved, under the same key.');
+  }
+
   /// Arm a manual point placement for the current board slot — the board peer of
   /// [_changePointManual]: the next canvas click sets slot [_slotIndex]'s point.
   void _armBoardManual() {
@@ -2789,6 +3981,9 @@ press.calibrate.target    tick_soft.wav
   /// Width and height of the Dragon Dice wizard's dialog, in logical pixels.
   static const double _kDiceWizardWidth = 960;
   static const double _kDiceWizardHeight = 620;
+
+  /// Padding around the key-size choice above the wizard.
+  static const double _kKeySizePad = 16;
 
   /// Bits the dice must carry beyond a point's: cutting the digest to 32
   /// bits loses some of what the rolls carry, and 32-bit outputs can be
@@ -3006,7 +4201,16 @@ press.calibrate.target    tick_soft.wav
     final List<int> chosen =
         placed.length > r ? placed.sublist(0, r) : placed;
     final Uint8List? oi = _stageOrbit(stage);
-    if (oi == null) return;
+    if (oi == null) {
+      // Stage 0's bundle, σ not back yet: its r₀ points now try to open it.
+      if (stage == 0 &&
+          _bundleHeader != null &&
+          _bundleKey == null &&
+          !_bundleOpening) {
+        unawaited(_openBundleWithPoints());
+      }
+      return;
+    }
     final OrbitProtocol orbit = OrbitProtocol(widget.core);
     // Interpolate Sh_i over the chosen slots at abscissa = slot index.
     final List<int> xs = <int>[for (final int s in chosen) s];
@@ -3092,6 +4296,8 @@ press.calibrate.target    tick_soft.wav
   /// old points no longer decode, and on dispose.
   void _clearOrbitPlacements() {
     _clearAdvanceCheckpoint(); // a re-rooted orbit invalidates a halted advance
+    _deckDirty = false;
+    _review.clear();
     for (int st = 0; st <= _maxStage; st++) {
       _shareEncodeGen[st]++; // discard any in-flight share-marker encode
       for (int s = 1; s <= _maxSlot; s++) {
@@ -3118,6 +4324,8 @@ press.calibrate.target    tick_soft.wav
     _boardDecoCache.clear();
     _mapsChanged((int _, int __) => true);
     _deck = null;
+    _customFacts.clear();
+    _studied.clear();
     _dropPaths();
     _boardCanonicalView = false;
   }
@@ -3134,17 +4342,16 @@ press.calibrate.target    tick_soft.wav
     // Cache key: stage 0 keys on the σ text (so no `orbitRoot` hash runs on a
     // pan/zoom rebuild); deep stages key on `stage#slot` alone, since their `o_i`
     // is stable until an advance / σ change — both of which reset [_boardKey].
-    final String key =
-        stage == 0 ? '0#$slot#${_sigmaCtrl.text.trim()}' : '$stage#$slot';
+    final String key = stage == 0
+        ? '0#$slot#${_sigmaCtrl.text.trim()}#${_bundleHeader != null}'
+        : '$stage#$slot';
     if (key != _boardKey) {
       _boardKey = key;
-      final Uint8List? oi = _stageOrbit(stage);
-      if (oi == null) {
+      final ({int o, int p, int q})? prm = _mapPrm(stage, slot);
+      if (prm == null) {
         _boardReservoirs = null;
         _boardParams = null;
       } else {
-        final ({int o, int p, int q}) prm =
-            OrbitProtocol(widget.core).orbitParams(oi, slot - 1);
         final StageReservoirs res =
             StageReservoirs(o: prm.o, p: prm.p, q: prm.q);
         final ({double o, double p, double q}) dk = res.displayKey;
@@ -3383,6 +4590,7 @@ press.calibrate.target    tick_soft.wav
             padding: const EdgeInsets.all(_kPanelPadding),
             child: CommandBoard(
               active: _context,
+              contexts: _contexts,
               commands: _board(),
               layout: _layout,
               colour: _kConsoleFg,
@@ -3573,6 +4781,7 @@ press.calibrate.target    tick_soft.wav
     final Widget? body = switch (_context) {
       CommandContext.main => null,
       CommandContext.setup => _setupPane(),
+      CommandContext.train => null,
       CommandContext.path => _routePanel(),
       CommandContext.view => _track(
           _Field.hue,
@@ -3603,8 +4812,6 @@ press.calibrate.target    tick_soft.wav
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: <Widget>[
-                  if (_paneField[CommandContext.main] == _Field.vault)
-                    _vaultPathField(),
                   if (_vaultBusy)
                     const Padding(
                       padding: EdgeInsets.only(top: 8),
@@ -3661,14 +4868,15 @@ press.calibrate.target    tick_soft.wav
   /// reproducible — see docs §"time is a perishable label on a durable
   /// parameter".)
   /// Open the spacious Argon2 calibration dialog (Setup board). It benchmarks on this
-  /// device, solves the iteration count N for a chosen target time, and — on
+  /// device, solves the iteration count D for a chosen target time, and — on
   /// Apply — returns N, which we write into the derivation-steps field. Exit is
   /// Esc + confirm (handled inside the dialog).
   Future<void> _openCalibrationDialog() async {
     if (_busy) return;
     final int profileIdx =
         _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
-    final int? n = await _dialog(_Cue.calibrate, () => showDialog<int>(
+    final ({int n, double secPerPass})? r =
+        await _dialog(_Cue.calibrate, () => showDialog<({int n, double secPerPass})>(
       context: context,
       barrierDismissible: false,
       builder: (BuildContext _) => _CalibrationDialog(
@@ -3679,10 +4887,11 @@ press.calibrate.target    tick_soft.wav
         initialStages: _pointStages,
       ),
     ));
-    if (!mounted || n == null) return;
+    if (!mounted || r == null) return;
     setState(() {
-      _iterations = n;
-      _iterationsField.text = n.toString();
+      _iterations = r.n;
+      _iterationsField.text = r.n.toString();
+      _passSeconds = r.secPerPass;
     });
     _sounds.play(UiSound.confirm);
   }
@@ -3739,7 +4948,7 @@ press.calibrate.target    tick_soft.wav
 
   /// The Argon2 memory profile, chosen on a three-stop slider rather than a
   /// dropdown so the memory cost reads as one escalating axis next to the
-  /// iteration-count (N) field.
+  /// iteration-count (D) field.
   Widget _argon2ProfileSlider() {
     final int idx = _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
     // Profile name lives in the console (focus _Field.profile); the slider thumb
@@ -3763,7 +4972,11 @@ press.calibrate.target    tick_soft.wav
                       final Argon2Profile next = _profiles[v.round()];
                       if (next == _profile) return;
                       _sounds.play(UiSound.tickSoft);
-                      setState(() => _profile = next);
+                      // A pass takes another time at another profile.
+                      setState(() {
+                        _profile = next;
+                        _passSeconds = null;
+                      });
                     },
             ),
           ),
@@ -3833,6 +5046,15 @@ press.calibrate.target    tick_soft.wav
     final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
     return OrbitVault(
       deck: _deckForSave(deepest),
+      passSeconds: _passSeconds,
+      gapSeconds: _gapSeconds,
+      epsilon:
+          _epsilon == GraduationParams.defaultEpsilon ? null : _epsilon,
+      facts: _customFacts.values.toList(),
+      studied: <List<int>>[
+        for (int i = 0; i <= deepest; i++)
+          (_studied[i] ?? const <int>{}).toList()..sort(),
+      ],
       sigma: _sigmaCtrl.text.trim().replaceAll(RegExp(r'\s'), ''),
       iterations: _iterations,
       profile: _profile,
@@ -3888,9 +5110,12 @@ press.calibrate.target    tick_soft.wav
         providedKey: providedKey,
         genLenBytes: genLenBytes,
       );
-      await tmp.writeAsBytes(sealed.fileBytes, flush: true);
-      await tmp.rename(path);
+      await _fileLocked(() async {
+        await tmp.writeAsBytes(sealed.fileBytes, flush: true);
+        await tmp.rename(path);
+      });
       _deck = vault.deck; // what the file now holds
+      _deckDirty = false;
       return (error: null, key: sealed.key);
     } catch (e) {
       // Best effort: never leave the partial temp behind. It is ciphertext, but
@@ -4010,6 +5235,21 @@ press.calibrate.target    tick_soft.wav
       _iterations = vault.iterations;
       _iterationsField.text = '${vault.iterations}';
       _profile = vault.profile;
+      _passSeconds = vault.passSeconds;
+      _gapSeconds = vault.gapSeconds;
+      _epsilon = vault.epsilon ?? GraduationParams.defaultEpsilon;
+      _customFacts
+        ..clear()
+        ..addAll(<String, CustomFact>{
+          for (final CustomFact f in vault.facts) f.id: f,
+        });
+      _studied
+        ..clear()
+        ..addAll(<int, Set<int>>{
+          for (int i = 0; i < vault.studied.length; i++)
+            if (vault.studied[i].isNotEmpty) i: vault.studied[i].toSet(),
+        });
+      if (_deck != null) _deck = _withAlwaysOnFacts(_deck!);
       for (int i = 1; i <= deepest; i++) {
         // o₀ is never stored: [_stageOrbit] re-derives it from σ on demand.
         _orbitO[i] = orbits[i];
@@ -4046,55 +5286,27 @@ press.calibrate.target    tick_soft.wav
       }
     });
     _setOrbitStage(deepest);
+    // A new setup: its deck as saved — with a card for every map, the derived
+    // ones included — and no training since.
+    setState(() => _deck = _deckForSave(deepest));
+    _deckDirty = false;
+    _review.clear();
+    if (_training) _logProgress();
     return null;
   }
 
-  /// Provisional-key save / load: an encrypted on-disk copy of the setup, kept
-  /// only across the memorisation window and destroyed at graduation.
-  Widget _vaultPathField() {
-    // Heading + explanation live in the console (focus _Field.vault). The
-    // provisional key is entered / shown / copied only inside the Write and
-    // Open dialogs — never in a panel field — so it is never an idle on-screen
-    // artifact.
-    return _track(
-      _Field.vault,
-      TextField(
-        controller: _vaultPath,
-        focusNode: _vaultPathFocus,
-        enabled: !_vaultBusy,
-        maxLines: 1,
-        autocorrect: false,
-        enableSuggestions: false,
-        decoration: const InputDecoration(
-          isDense: true,
-          border: OutlineInputBorder(),
-          labelText: 'File path',
-          hintText: '/path/to/setup.gwvault',
-        ),
-      ),
-    );
-  }
-
-  /// Bring up the setup file path field (Main board).
-  void _focusVaultPath() =>
-      _showField(_Field.vault, _vaultPathFocus, 'setup file path');
-
-  /// Write (save) the settled orbit setup to the file path as an
-  /// [OrbitVault], encrypted under a fresh app-generated 128-bit key, then
-  /// open the key dialog. The key can be overridden with the user's own
-  /// entropy from inside that dialog.
+  /// Write (save) the settled orbit setup as an [OrbitVault] to the path
+  /// asked for, encrypted under a fresh app-generated 128-bit key, then open
+  /// the key dialog. The key can be overridden with the user's own entropy
+  /// from inside that dialog.
   Future<void> _writeSetup() async {
     if (!_orbitSettled) {
       _sounds.play(UiSound.denyInput);
       _toast('Finish a setup first — there is nothing to write yet.');
       return;
     }
-    final String path = _vaultPath.text.trim();
-    if (path.isEmpty) {
-      _sounds.play(UiSound.denyInput);
-      _toast('Enter a file path.');
-      return;
-    }
+    final String? path = await _askPath();
+    if (!mounted || path == null) return;
     setState(() => _vaultBusy = true);
     final ({String? error, Uint8List? key}) result =
         await _saveOrbitVaultToFile(path);
@@ -4109,25 +5321,286 @@ press.calibrate.target    tick_soft.wav
     await _showKeyDialog(path, result.key!);
   }
 
-  /// Open (load) a saved setup from the file path (O): scan the QR (Q) or type
-  /// the 32- or 64-hex key (Alt+Q focuses the field, Enter loads), Esc to
-  /// cancel. The key is never displayed.
+  /// Open (load) a saved setup: its path and its key in one dialog — scan the
+  /// QR (Q) or type the 32- or 64-hex key (Alt+Q focuses the field, Enter
+  /// loads), Esc to cancel. The key is never displayed.
   Future<void> _openSetup() async {
-    final String path = _vaultPath.text.trim();
-    if (path.isEmpty) {
-      _sounds.play(UiSound.denyInput);
-      _toast('Enter a file path.');
+    final Uint8List? keyBytes = await _enterKey(
+        title: 'Open setup file', action: 'Load', askPath: true);
+    if (!mounted || keyBytes == null) return;
+    // No key: the path is stage 0's bundle ([_enterKey]).
+    if (keyBytes.isEmpty) {
+      await _openBundleFile(_vaultPath.text.trim());
       return;
     }
+    setState(_closeBundle);
+    await _loadWithBytes(_vaultPath.text.trim(), keyBytes);
+  }
+
+  /// Whether the file at [path] is stage 0's bundle (it opens without a key).
+  static bool _isBundleFile(String path) {
+    try {
+      final File f = File(path);
+      return f.existsSync() && Stage0Bundle.isBundle(f.readAsBytesSync());
+    } on FileSystemException {
+      return false;
+    }
+  }
+
+  /// Open stage 0's bundle at [path] in place of a setup file: the setup on
+  /// screen gives way, stage 0's maps render from the bundle's θ₀, and placing
+  /// r₀ of their points (Setup board) opens it.
+  Future<void> _openBundleFile(String path) async {
+    final Stage0Header header;
+    try {
+      header = Stage0Bundle.header(await File(path).readAsBytes());
+    } on Object {
+      _sounds.play(UiSound.denyInput);
+      _toast('That file is not stage 0\'s bundle.');
+      return;
+    }
+    if (!mounted) return;
+    if (_training) _switchMode(training: false);
+    _reset();
+    setState(() {
+      _closeBundle();
+      _bundlePath = path;
+      _bundleHeader = header;
+      _vaultPath.clear(); // a Save then asks its own path: never this file
+      _deck = null;
+      _studied.clear();
+      _boardKey = '';
+    });
+    _selectSlot(1);
+    _toast('Stage 0\'s bundle: its maps show from its clear part. Recall '
+        '${_requiredOf(0)} of them — place their points (Setup board › '
+        '${_layout.keys[_Cmd.placeByClick.slot]}, place by click) — and it '
+        'opens (${header.passes} Argon2 passes).');
+  }
+
+  /// Stage 0's placed points as the key: derive it (the bundle's `D` passes)
+  /// and open the bundle. Opened, σ and stage 0's cards are back and stage 0
+  /// derives from σ as in any setup; not opened, the points are cleared to
+  /// try others.
+  Future<void> _openBundleWithPoints() async {
+    final String? path = _bundlePath;
+    final Stage0Header? header = _bundleHeader;
+    final Uint8List? sh = _stageShBytes(0);
+    if (path == null || header == null || sh == null) return;
+    setState(() => _bundleOpening = true);
+    _toast('Opening stage 0\'s bundle: ${header.passes} Argon2 passes…');
+    Stage0Contents? contents;
+    SecretKey? key;
+    try {
+      key = await Stage0Bundle.deriveKey(header, sh, _harden);
+      contents =
+          await Stage0Bundle.openWithKey(await File(path).readAsBytes(), key);
+    } on Object {
+      contents = null;
+    } finally {
+      sh.fillRange(0, sh.length, 0);
+    }
+    if (!mounted) return;
+    setState(() => _bundleOpening = false);
+    final Stage0Contents? c = contents;
+    if (c == null || _bundlePath != path) {
+      _sounds.play(UiSound.denyMiss);
+      _toast('Those points do not open stage 0\'s bundle: they are cleared — '
+          'place others.');
+      setState(_clearOrbitPlacements);
+      return;
+    }
+    setState(() {
+      _bundleKey = key;
+      _sigmaCtrl.text = c.sigma;
+      _studied
+        ..clear()
+        ..addAll(<int, Set<int>>{
+          if (c.studied.isNotEmpty) 0: c.studied.toSet(),
+        });
+      _deck = _withAlwaysOnFacts(Deck(c.cards));
+      _deckDirty = false;
+      _boardKey = '';
+    });
+    _recomputeExtraShares(0); // σ is back: the other maps derive, K₀ too
+    _sounds.play(UiSound.exportOk);
+    _toast('Stage 0\'s bundle is open: σ and stage 0\'s cards are back. Train '
+        '(F3) reviews them; Train board › '
+        '${_layout.keys[_Cmd.saveProgress.slot]} (save progress) reseals it.');
+  }
+
+  /// The bundle's hardening: [GreatWallCore.hardenKey].
+  Future<Uint8List> _harden(Uint8List input, Argon2Profile p, int n) =>
+      widget.core.hardenKey(input, profile: p, passes: n);
+
+  /// Reseal stage 0's bundle with its open key: σ, stage 0's cards (its maps,
+  /// its selection, the salt's) and the maps studied.
+  Future<void> _resealBundle() async {
+    final String? path = _bundlePath;
+    final Stage0Header? header = _bundleHeader;
+    final SecretKey? key = _bundleKey;
+    if (path == null || header == null || key == null) return;
+    setState(() => _vaultBusy = true);
+    String? error;
+    try {
+      final Uint8List file = await Stage0Bundle.reseal(
+          header, _stage0Contents(_deckForSave(0)), key);
+      await _fileLocked(() async {
+        final File tmp = File('$path.tmp');
+        await tmp.writeAsBytes(file, flush: true);
+        await tmp.rename(path);
+      });
+    } on Object catch (e) {
+      error = '$e';
+    }
+    if (!mounted) return;
+    setState(() => _vaultBusy = false);
+    if (error != null) {
+      _sounds.play(UiSound.denyInput);
+      _toast('Could not reseal stage 0\'s bundle: $error');
+      return;
+    }
+    setState(() => _deckDirty = false);
+    _sounds.play(UiSound.exportOk);
+    _toast('Stage 0\'s bundle resealed.');
+  }
+
+  /// What stage 0's bundle holds, from [deck]: σ, stage 0's map cards, its
+  /// selection and the salt's card, and the maps of stage 0 studied.
+  Stage0Contents _stage0Contents(Deck deck) => Stage0Contents(
+        sigma: _sigmaCtrl.text.trim().replaceAll(RegExp(r'\s'), ''),
+        cards: <MemCard>[
+          for (final MemCard c in deck.cards)
+            if ((c.kind == CardKind.point && c.stageIndex == 0) ||
+                c.factId == selectionFact(0) ||
+                c.factId == kSaltFact)
+              c,
+        ],
+        studied: (_studied[0] ?? const <int>{}).toList()..sort(),
+      );
+
+  /// The setup file path for a save, asked with the current one filled in
+  /// (Enter takes it, Esc cancels); null if cancelled. The one taken becomes
+  /// the current path.
+  Future<String?> _askPath() async {
+    final TextEditingController input =
+        TextEditingController(text: _vaultPath.text.trim());
+    String? path;
+    final DialogRoute<void> route = DialogRoute<void>(
+      context: context,
+      builder: (BuildContext ctx) {
+        void take() {
+          final String p = input.text.trim();
+          if (p.isEmpty) {
+            _sounds.play(UiSound.denyInput);
+            _toast('Enter a file path.');
+            return;
+          }
+          path = p;
+          Navigator.of(ctx).pop();
+        }
+
+        return CallbackShortcuts(
+          bindings: <ShortcutActivator, VoidCallback>{
+            const SingleActivator(LogicalKeyboardKey.escape): () =>
+                Navigator.of(ctx).pop(),
+          },
+          child: AlertDialog(
+            title: const Text('Save setup file'),
+            content: SizedBox(
+              width: _kPathDialogWidth,
+              child: _pathField(input, autofocus: true, onSubmitted: take),
+            ),
+            actions: <Widget>[
+              TextButton(
+                onPressed: _press(_Cue.openCancel, () => Navigator.of(ctx).pop()),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: _press(_Cue.openLoad, take),
+                child: const Text('Save'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+    await _dialog(_Cue.openFile, () => Navigator.of(context).push(route));
+    unawaited(route.completed.whenComplete(input.dispose));
+    final String? taken = path;
+    if (taken != null) _vaultPath.text = taken;
+    return taken;
+  }
+
+  /// Width of the dialogs that ask for a file path.
+  static const double _kPathDialogWidth = 420;
+
+  /// A setup file path field.
+  Widget _pathField(
+    TextEditingController controller, {
+    FocusNode? focusNode,
+    bool autofocus = false,
+    required VoidCallback onSubmitted,
+  }) =>
+      TextField(
+        controller: controller,
+        focusNode: focusNode,
+        autofocus: autofocus,
+        autocorrect: false,
+        enableSuggestions: false,
+        maxLines: 1,
+        onSubmitted: (_) => onSubmitted(),
+        decoration: const InputDecoration(
+          isDense: true,
+          border: OutlineInputBorder(),
+          labelText: 'File path',
+          hintText: '/path/to/setup.gw',
+        ),
+      );
+
+  /// The provisional key, scanned from its QR (Q) or typed as 32 or 64 hex
+  /// (Alt+Q focuses the field, Enter takes it); null if cancelled (Esc). The
+  /// key is never displayed; the caller wipes it. With [askPath] the file's
+  /// path is asked too, above the key, the current one filled in; the one
+  /// taken becomes the current path.
+  Future<Uint8List?> _enterKey({
+    required String title,
+    required String action,
+    bool askPath = false,
+  }) async {
     final bool canScan = _scanSupported || _desktopScanSupported;
     final TextEditingController hexInput = TextEditingController();
     final FocusNode hexFocus = FocusNode(debugLabel: 'open-hex');
+    final TextEditingController pathInput =
+        TextEditingController(text: _vaultPath.text.trim());
+    final FocusNode pathFocus = FocusNode(debugLabel: 'open-path');
     Uint8List? keyBytes;
 
-    await _dialog(_Cue.openFile, () => showDialog<void>(
+    final DialogRoute<void> route = DialogRoute<void>(
       context: context,
       builder: (BuildContext ctx) {
+        // The path, when asked: it must be there before a key is taken.
+        bool pathTaken() {
+          if (!askPath) return true;
+          final String p = pathInput.text.trim();
+          if (p.isEmpty) {
+            _sounds.play(UiSound.denyInput);
+            _toast('Enter a file path.');
+            pathFocus.requestFocus();
+            return false;
+          }
+          _vaultPath.text = p;
+          return true;
+        }
+
         void loadHex() {
+          if (!pathTaken()) return;
+          // Stage 0's bundle opens without a key: its points are the key.
+          if (askPath && _isBundleFile(pathInput.text.trim())) {
+            keyBytes = Uint8List(0);
+            Navigator.of(ctx).pop();
+            return;
+          }
           try {
             keyBytes = SetupCrypto.hexToKey(hexInput.text);
           } on FormatException catch (e) {
@@ -4139,30 +5612,58 @@ press.calibrate.target    tick_soft.wav
         }
 
         Future<void> scan() async {
+          if (!pathTaken()) return;
           final Uint8List? k = await _scanKey();
           if (k == null) return;
           keyBytes = k;
           if (ctx.mounted) Navigator.of(ctx).pop();
         }
 
-        return CallbackShortcuts(
-          bindings: <ShortcutActivator, VoidCallback>{
-            if (canScan) const SingleActivator(LogicalKeyboardKey.keyQ): scan,
-            const SingleActivator(LogicalKeyboardKey.keyQ, alt: true): () =>
-                hexFocus.requestFocus(),
-            const SingleActivator(LogicalKeyboardKey.escape): () =>
-                Navigator.of(ctx).pop(),
+        return Focus(
+          // Q scans and Alt+Q types the key, unless a field is being typed in
+          // (a path holds letters): there the keys are the field's.
+          onKeyEvent: (FocusNode node, KeyEvent e) {
+            if (e is! KeyDownEvent) return KeyEventResult.ignored;
+            if (e.logicalKey == LogicalKeyboardKey.escape) {
+              Navigator.of(ctx).pop();
+              return KeyEventResult.handled;
+            }
+            if (e.logicalKey != LogicalKeyboardKey.keyQ) {
+              return KeyEventResult.ignored;
+            }
+            final bool alt = HardwareKeyboard.instance.isAltPressed;
+            if (!alt && (pathFocus.hasFocus || hexFocus.hasFocus)) {
+              return KeyEventResult.ignored;
+            }
+            if (alt) {
+              hexFocus.requestFocus();
+            } else if (canScan) {
+              unawaited(scan());
+            } else {
+              return KeyEventResult.ignored;
+            }
+            return KeyEventResult.handled;
           },
           child: Focus(
-            autofocus: true,
+            // With no path yet, typing starts there; else Q scans at once.
+            autofocus: !askPath || pathInput.text.isNotEmpty,
             child: AlertDialog(
-              title: const Text('Open setup file'),
+              title: Text(title),
               content: SizedBox(
-                width: 340,
+                width: askPath ? _kPathDialogWidth : 340,
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: <Widget>[
+                    if (askPath) ...<Widget>[
+                      _pathField(
+                        pathInput,
+                        focusNode: pathFocus,
+                        autofocus: pathInput.text.isEmpty,
+                        onSubmitted: () => hexFocus.requestFocus(),
+                      ),
+                      const SizedBox(height: 12),
+                    ],
                     Text(
                       canScan
                           ? 'Q — scan the QR with the camera.  Alt+Q — type the '
@@ -4203,18 +5704,24 @@ press.calibrate.target    tick_soft.wav
                 ),
                 FilledButton(
                   onPressed: _press(_Cue.openLoad, loadHex),
-                  child: const Text('Load'),
+                  child: Text(action),
                 ),
               ],
             ),
           ),
         );
       },
-    ));
-    hexInput.dispose();
-    hexFocus.dispose();
-    if (!mounted || keyBytes == null) return;
-    await _loadWithBytes(path, keyBytes!);
+    );
+    await _dialog(_Cue.openFile, () => Navigator.of(context).push(route));
+    // The field is still drawn while the dialog animates out: free it after.
+    hexInput.clear();
+    unawaited(route.completed.whenComplete(() {
+      hexInput.dispose();
+      hexFocus.dispose();
+      pathInput.dispose();
+      pathFocus.dispose();
+    }));
+    return keyBytes;
   }
 
   /// Scan the provisional-key QR, returning the 16 raw key bytes or null. Uses
@@ -4271,7 +5778,12 @@ press.calibrate.target    tick_soft.wav
       return;
     }
     _sounds.play(UiSound.confirm);
-    _toast('Setup loaded.');
+    final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
+    _toast(cp != null && _canResumeAdvance
+        ? 'Setup loaded. Its advance into Stage ${cp.stage} was halted after '
+            '${cp.pass}/$_iterations passes: selecting Stage ${cp.stage} or '
+            'Resume (${_hint(_Cmd.halt)}) continues from there.'
+        : 'Setup loaded.');
   }
 
   /// Decrypt the file at [path] with [keyBytes] and restore whichever setup it
@@ -4414,6 +5926,19 @@ press.calibrate.target    tick_soft.wav
             }
           }
 
+          // R — roll Dragon Dice for a new key and re-seal the file under it.
+          Future<void> rollOwnKey() async {
+            if (busy) return;
+            final Uint8List? rolled = await _rollKey(keyLen);
+            if (rolled == null || !ctx.mounted) {
+              if (rolled != null) _wipeBytes(rolled);
+              return;
+            }
+            if (await reseal(ownKey: rolled, newLen: rolled.length)) {
+              _toast('Re-saved with a ${keyLen * 8}-bit key from Dragon Dice.');
+            }
+          }
+
           // Q reveals the QR; pressing it again switches 128↔256 (a fresh key,
           // overwriting the file). Alt+Q copies; pressing it again switches too.
           void onShowQr() {
@@ -4448,6 +5973,8 @@ press.calibrate.target    tick_soft.wav
                 const SingleActivator(LogicalKeyboardKey.keyI): scanOwnKey,
               const SingleActivator(LogicalKeyboardKey.keyI, alt: true): () =>
                   hexFocus.requestFocus(),
+              // R — not a hex digit, so typing a key in the field is safe.
+              const SingleActivator(LogicalKeyboardKey.keyR): rollOwnKey,
               const SingleActivator(LogicalKeyboardKey.escape): () =>
                   Navigator.of(ctx).pop(),
             },
@@ -4470,13 +5997,16 @@ press.calibrate.target    tick_soft.wav
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          'Q — show the QR to hand-copy onto a printed blank '
-                          'template (Main board).  Alt+Q — copy the key for a password '
+                          'Q — show the QR, to copy its dots onto a printed '
+                          'template (see templates/ in the repository).  '
+                          'Alt+Q — copy the key for a password '
                           'manager (blind).  Press Q or Alt+Q again to switch to '
                           '${otherLen() * 8}-bit (a fresh key, overwriting the '
                           'file).  '
                           '${canScan ? 'I — scan an existing QR to reuse its key '
                               '(re-seals this setup under it).  ' : ''}'
+                          'R — roll Dragon Dice for a new key, 128 or 256 '
+                          'bits (re-seals this setup under it).  '
                           'Alt+I — type your own 32- or 64-hex key (Enter).  '
                           'Esc — close.',
                           style: const TextStyle(fontSize: 11),
@@ -4488,16 +6018,20 @@ press.calibrate.target    tick_soft.wav
                               color: Colors.white,
                               padding: const EdgeInsets.all(12),
                               child: CustomPaint(
-                                size: const Size(252, 252),
-                                painter: _QrPainter(matrix, _QrView.scan),
+                                size: const Size(_kQrSide, _kQrSide),
+                                painter: KeyQrPainter(matrix),
                               ),
                             ),
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            '${keyLen * 8}-bit · QR v$version. Do this alone, no '
-                            'cameras. At EC-L the code still scans with up to ~2 '
-                            'stray mis-coloured cells, so work carefully.',
+                            '${keyLen * 8}-bit · QR v$version. Copy each black '
+                            'dot onto the template cell of the same colour and '
+                            'place. Mistakes may touch at most '
+                            '${QrLayout(version).correctable} colour blocks '
+                            '(any number of wrong cells in one block counts '
+                            'once); the grey format cells are protected on '
+                            'their own. Do this alone, no cameras.',
                             style: const TextStyle(fontSize: 11),
                           ),
                         ],
@@ -4515,7 +6049,7 @@ press.calibrate.target    tick_soft.wav
                             border: OutlineInputBorder(),
                             labelText:
                                 'Your own key — 32 or 64 hex digits (optional)',
-                            hintText: 'from dice etc., then Enter to apply',
+                            hintText: 'from another source, then Enter to apply',
                           ),
                         ),
                       ],
@@ -4532,6 +6066,12 @@ press.calibrate.target    tick_soft.wav
                     onPressed: _press(_Cue.keyCopy, busy ? null : onCopy),
                     icon: const Icon(Icons.copy),
                     label: const Text('Copy key (Alt+Q)'),
+                  ),
+                  TextButton.icon(
+                    onPressed: _press(_Cue.keyDice, busy ? null : rollOwnKey),
+                    icon: D20Glyph(
+                        colour: Theme.of(ctx).colorScheme.primary),
+                    label: const Text('Roll dice (R)'),
                   ),
                   if (canScan)
                     TextButton.icon(
@@ -4556,6 +6096,79 @@ press.calibrate.target    tick_soft.wav
     _wipeBytes(key); // recorded or abandoned — drop our copy
   }
 
+  /// A provisional key from the Dragon Dice wizard: the first 16 or 32 bytes
+  /// of the rolls' digest; null if cancelled. The size starts at [lenBytes]
+  /// and can be switched in the wizard's dialog. The target is the key's
+  /// bits, with no margin: from 128 bits on, a digest cut to them cannot be
+  /// tabulated (dragon-dice/doc/FORMAT.md, "From the digest"). The caller
+  /// wipes the key.
+  Future<Uint8List?> _rollKey(int lenBytes) async {
+    int len = lenBytes;
+    int bits() => len == SetupCrypto.keyLenBytes
+        ? SetupCrypto.keyBits
+        : SetupCrypto.keyBits256;
+    DiceRolls? rolled;
+    await _dialog(
+      _Cue.dice,
+      () => showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (BuildContext ctx) => Dialog(
+          child: SizedBox(
+            width: _kDiceWizardWidth,
+            height: _kDiceWizardHeight,
+            child: StatefulBuilder(
+              builder: (BuildContext ctx,
+                      void Function(void Function()) setLocal) =>
+                  Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(
+                        _kKeySizePad, _kKeySizePad, _kKeySizePad, 0),
+                    child: SegmentedButton<int>(
+                      segments: const <ButtonSegment<int>>[
+                        ButtonSegment<int>(
+                            value: SetupCrypto.keyLenBytes,
+                            label: Text('${SetupCrypto.keyBits}-bit key')),
+                        ButtonSegment<int>(
+                            value: SetupCrypto.keyLenBytes256,
+                            label: Text('${SetupCrypto.keyBits256}-bit key')),
+                      ],
+                      selected: <int>{len},
+                      onSelectionChanged: (Set<int> s) =>
+                          setLocal(() => len = s.first),
+                    ),
+                  ),
+                  Expanded(
+                    child: DragonDiceWizard(
+                      targetBits: bits().toDouble(),
+                      purpose: 'The provisional key, ${bits()} bits',
+                      systemRandomByDefault: true,
+                      onCue: _cue,
+                      onDone: (DiceRolls r) {
+                        rolled = r;
+                        Navigator.of(ctx).pop();
+                      },
+                      onCancel: () => Navigator.of(ctx).pop(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    final DiceRolls? r = rolled;
+    if (r == null) return null;
+    final Uint8List digest = r.digest();
+    r.wipe();
+    final Uint8List key = Uint8List.fromList(digest.sublist(0, len));
+    _wipeBytes(digest);
+    return key;
+  }
+
   /// Byte-mode QR matrix for a provisional key: v1 (21×21) for the 16-byte
   /// key, v2 (25×25) for the 32-byte 256-bit key, both at EC level L.
   qr.QrImage _keyMatrix(Uint8List key) {
@@ -4570,60 +6183,6 @@ press.calibrate.target    tick_soft.wav
     for (int i = 0; i < b.length; i++) {
       b[i] = 0;
     }
-  }
-
-  /// Export both reusable **blank** hand-fill templates (the key-independent
-  /// skeleton: finders, timing, dark module, the v2 alignment pattern, over a
-  /// highlighted module grid) as PNGs in the vault path's folder — one per key
-  /// size, named `128-bit-…` / `256-bit-provisional-key-qr-template.png` so the
-  /// size leads the file name. They hold no secret; print and hand-colour.
-  Future<void> _exportBlankTemplate() async {
-    final String base = _vaultPath.text.trim();
-    if (base.isEmpty) {
-      _sounds.play(UiSound.denyInput);
-      _toast('Enter a file path first; the templates save in its folder.');
-      return;
-    }
-    final String dir = File(base).parent.path;
-    final String sep = Platform.pathSeparator;
-    try {
-      final List<String> saved = <String>[];
-      for (final int lenBytes in <int>[
-        SetupCrypto.keyLenBytes,
-        SetupCrypto.keyLenBytes256,
-      ]) {
-        final Uint8List png = await _renderBlankTemplatePng(lenBytes);
-        final String name =
-            '${lenBytes * 8}-bit-provisional-key-qr-template.png';
-        await File('$dir$sep$name').writeAsBytes(png, flush: true);
-        saved.add(name);
-      }
-      if (!mounted) return;
-      _sounds.play(UiSound.exportOk);
-      _toast('Blank templates saved in $dir: ${saved.join(', ')}');
-    } catch (e) {
-      if (mounted) _toast('Could not save the templates (${e.runtimeType}).');
-    }
-  }
-
-  /// Render the blank hand-fill skeleton PNG for a [lenBytes]-byte key (v1 for
-  /// 16, v2 for 32). A dummy all-zero key yields only the module geometry; only
-  /// the key-independent cells are drawn, so it leaks nothing.
-  Future<Uint8List> _renderBlankTemplatePng(int lenBytes) async {
-    final qr.QrImage matrix = _keyMatrix(Uint8List(lenBytes));
-    // 24 px per module, including the painter's 4-module quiet zone each side.
-    final int px = (matrix.moduleCount + 2 * _QrPainter.quiet) * 24;
-    final ui.PictureRecorder recorder = ui.PictureRecorder();
-    final Canvas canvas = Canvas(recorder);
-    _QrPainter(matrix, _QrView.blank)
-        .paint(canvas, Size(px.toDouble(), px.toDouble()));
-    final ui.Picture picture = recorder.endRecording();
-    final ui.Image image = await picture.toImage(px, px);
-    final ByteData? png = await image.toByteData(format: ui.ImageByteFormat.png);
-    image.dispose();
-    picture.dispose();
-    if (png == null) throw StateError('template render failed');
-    return png.buffer.asUint8List();
   }
 
   /// The inline hex editor for a point: a masked field labelled with
@@ -4917,12 +6476,6 @@ press.calibrate.target    tick_soft.wav
             'blind, never shown.';
       case _Field.hue:
         return 'Colour scheme: ${_hue.name}. ← → to cycle through the six hues.';
-      case _Field.vault:
-        return 'Provisional key: encrypt this setup to a file (AES-256-GCM) for '
-            'the memorisation window — a transient crutch, not a backup; delete '
-            'it at graduation. Protect it with your own password (managed/deleted '
-            'in a password manager) or an app-generated key shown as a small QR '
-            'to print and keep OFFLINE. The file is useless without its secret.';
     }
   }
 
@@ -4936,6 +6489,544 @@ press.calibrate.target    tick_soft.wav
 
   /// Reset behind an inline console confirmation, so the Reset key (or a stray
   /// keypress) cannot discard a setup by accident.
+  /// Side of the key's QR in the key dialog.
+  static const double _kQrSide = 300;
+
+  /// Width of the cards manager.
+  static const double _kCardsWidth = 520;
+
+  /// Width of the stage labels before the studied-maps checkboxes.
+  static const double _kStudiedLabelWidth = 64;
+
+  /// [deck] with stage [stage]'s selection card as [_studied] now has it: a
+  /// fresh card when the maps changed (its answer is new), none when no map
+  /// is set.
+  Deck _withSelectionCard(Deck deck, int stage) {
+    final String id = selectionFact(stage);
+    final Deck without =
+        Deck(<MemCard>[for (final MemCard c in deck.cards) if (c.factId != id) c]);
+    return (_studied[stage]?.isEmpty ?? true)
+        ? without
+        : without.withCard(MemCard.fact(id));
+  }
+
+  /// The cards manager (Main board X): the salt's card, the supply chain's
+  /// (on or off, with what it is), and your own (added and removed here).
+  Future<void> _showCardsManager() async {
+    final int deepest = _orbitDeepestStage;
+    setState(() {
+      _deck ??= _deckForSave(deepest);
+      // A stage with no maps set as studied starts from the maps you graded.
+      for (int i = 0; i <= deepest; i++) {
+        if (_studied[i]?.isNotEmpty ?? false) continue;
+        final Set<int> graded = <int>{
+          for (final MemCard c in _deck!.cards)
+            if (c.kind == CardKind.point && c.stageIndex == i && c.due != null)
+              c.slot,
+        };
+        if (graded.isEmpty) continue;
+        _studied[i] = graded;
+        _deck = _withSelectionCard(_deck!, i);
+        _deckDirty = true;
+      }
+    });
+    final TextEditingController prompt = TextEditingController();
+    final TextEditingController answer = TextEditingController();
+    final DialogRoute<void> route = DialogRoute<void>(
+      context: context,
+      builder: (BuildContext ctx) => StatefulBuilder(
+        builder: (BuildContext ctx, void Function(void Function()) setLocal) {
+          void change(void Function() f) {
+            setState(() {
+              f();
+              _deckDirty = true;
+            });
+            setLocal(() {});
+          }
+
+          void add() {
+            final String p = prompt.text.trim();
+            final String a = answer.text.trim();
+            if (p.isEmpty || a.isEmpty) {
+              _sounds.play(UiSound.denyInput);
+              _toast('A card needs a prompt and an answer.');
+              return;
+            }
+            if (_customFacts.length >= kMaxCustomFacts) {
+              _sounds.play(UiSound.denyBlocked);
+              _toast('At most $kMaxCustomFacts cards of your own.');
+              return;
+            }
+            int n = 1;
+            while (_customFacts.containsKey('$kCustomPrefix$n')) {
+              n++;
+            }
+            final String id = '$kCustomPrefix$n';
+            change(() {
+              _customFacts[id] = CustomFact(id: id, prompt: p, answer: a);
+              _deck = _deck!.withCard(MemCard.fact(id));
+            });
+            prompt.clear();
+            answer.clear();
+          }
+
+          void remove(String id) => change(() {
+                _customFacts.remove(id);
+                _deck = Deck(<MemCard>[
+                  for (final MemCard c in _deck!.cards)
+                    if (c.factId != id) c,
+                ]);
+              });
+
+          void study(int stage, int slot, bool on) => change(() {
+                final Set<int> maps = _studied.putIfAbsent(stage, () => <int>{});
+                on ? maps.add(slot) : maps.remove(slot);
+                _deck = _withSelectionCard(_deck!, stage);
+              });
+
+          void provenance(bool on) => change(() {
+                _deck = on
+                    ? _deck!.withCard(MemCard.fact(kProvenanceFact))
+                    : Deck(<MemCard>[
+                        for (final MemCard c in _deck!.cards)
+                          if (c.factId != kProvenanceFact) c,
+                      ]);
+              });
+
+          return CallbackShortcuts(
+            bindings: <ShortcutActivator, VoidCallback>{
+              const SingleActivator(LogicalKeyboardKey.escape): () =>
+                  Navigator.of(ctx).pop(),
+            },
+            child: AlertDialog(
+              title: const Text('Cards'),
+              content: SizedBox(
+                width: _kCardsWidth,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: <Widget>[
+                      const ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.water_drop_outlined),
+                        title: Text('Salt (Namtso)'),
+                        subtitle: Text('Always on: stage 0, slot 0 in Train.'),
+                      ),
+                      const ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.tune),
+                        title: Text('The setup\'s parameters: m, D and N'),
+                        subtitle: Text('Always on: the memory profile, the '
+                            'derivation steps per stage and the deep stages, '
+                            'as for a hard reset. Next due reaches them.'),
+                      ),
+                      SwitchListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        secondary: const Icon(Icons.verified_outlined),
+                        title: const Text('Supply chain'),
+                        subtitle: const Text(kProvenanceAbout),
+                        value: _provenanceOn,
+                        onChanged: provenance,
+                      ),
+                      const Divider(),
+                      const Text('The maps you study, per stage: the gate '
+                          'counts only these, and each stage has a card to '
+                          'recall which they are (prefilled with the maps '
+                          'you graded).'),
+                      for (int i = 0; i <= deepest; i++)
+                        Row(
+                          children: <Widget>[
+                            SizedBox(
+                              width: _kStudiedLabelWidth,
+                              child: Text('Stage $i'),
+                            ),
+                            Expanded(
+                              child: Wrap(
+                                children: <Widget>[
+                                  for (int j = 1; j <= kMapsPerStage; j++)
+                                    FilterChip(
+                                      visualDensity: VisualDensity.compact,
+                                      label: Text('$j'),
+                                      selected:
+                                          _studied[i]?.contains(j) ?? false,
+                                      onSelected: _isMap(i, j)
+                                          ? (bool on) => study(i, j, on)
+                                          : null,
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      const Divider(),
+                      Text('Your own cards (${_customFacts.length} of '
+                          '$kMaxCustomFacts)'),
+                      for (final CustomFact f in _customFacts.values)
+                        ListTile(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          title: Text(f.prompt),
+                          trailing: IconButton(
+                            tooltip: 'Remove',
+                            icon: const Icon(Icons.delete_outline),
+                            onPressed: () => remove(f.id),
+                          ),
+                        ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: prompt,
+                        maxLength: kMaxFactChars,
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          border: OutlineInputBorder(),
+                          labelText: 'Prompt',
+                          hintText: 'e.g. Export salt of the signing key',
+                        ),
+                      ),
+                      TextField(
+                        controller: answer,
+                        maxLength: kMaxFactChars,
+                        onSubmitted: (_) => add(),
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          border: OutlineInputBorder(),
+                          labelText: 'Answer',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: <Widget>[
+                TextButton(
+                  onPressed: _press(_Cue.cardsAdd, add),
+                  child: const Text('Add card'),
+                ),
+                FilledButton(
+                  onPressed: _press(
+                      _Cue.cardsClose, () => Navigator.of(ctx).pop()),
+                  child: const Text('Done'),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+    await _dialog(_Cue.cards, () => Navigator.of(context).push(route));
+    unawaited(route.completed.whenComplete(() {
+      prompt.dispose();
+      answer.dispose();
+    }));
+  }
+
+  /// Size of the card stats wizard.
+  static const double _kStatsWidth = 760;
+  static const double _kStatsHeight = 480;
+  static const double _kStatsPad = 16;
+
+  /// The card stats wizard (Train, Main board Z), the shown map's card
+  /// picked first.
+  Future<void> _showCardStats() async {
+    final List<MemCard> cards = <MemCard>[..._trainCards, ..._factCards];
+    final MemCard? shown = _trainCard;
+    final int initial =
+        shown == null ? 0 : cards.indexWhere((MemCard c) => c.id == shown.id);
+    await _dialog(
+      _Cue.stats,
+      () => showDialog<void>(
+        context: context,
+        builder: (BuildContext ctx) => CallbackShortcuts(
+          bindings: <ShortcutActivator, VoidCallback>{
+            const SingleActivator(LogicalKeyboardKey.escape): () =>
+                Navigator.of(ctx).pop(),
+          },
+          child: Dialog(
+            child: SizedBox(
+              width: _kStatsWidth,
+              height: _kStatsHeight,
+              child: Padding(
+                padding: const EdgeInsets.all(_kStatsPad),
+                child: CardStatsView(
+                  cards: cards,
+                  name: (MemCard c) => c.kind == CardKind.point
+                      ? cardName(c)
+                      : factName(c, _customFacts),
+                  schedule: _schedule,
+                  now: _schedule.clock.now(),
+                  initial: initial < 0 ? 0 : initial,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// A wipe is under way: an advance it halts reports nothing.
+  bool _wiping = false;
+
+  /// Presses the wipe takes: a deliberate act, never a slip.
+  static const int _kWipePresses = 7;
+
+  /// Width of the wipe wizard.
+  static const double _kWipeDialogWidth = 420;
+
+  /// The wipe wizard (Main board V): one button, pressed [_kWipePresses]
+  /// times, a counter showing the presses left; Esc or Cancel leaves nothing
+  /// done. Then [_wipe].
+  /// Space between the retirement dialog's parts.
+  static const double _kRetireGap = 12;
+
+  /// Retire the provisional key (Graduation's green light): seal stage 0's
+  /// bundle — σ and stage 0's card records under `Sh₀`, hardened by the
+  /// bundle's own `D` passes at `m` ([Stage0Bundle]) — next to the setup file,
+  /// then wipe the setup file. `m` defaults to Basic, so the bundle's clear
+  /// part shows nothing of the setup's profile; `D` to about two minutes.
+  /// Both are yours to set, and are stored in the clear.
+  Future<void> _retireKey() async {
+    final Uint8List? o0 = _stageOrbit(0);
+    final Uint8List? sh = _stageShBytes(0);
+    if (o0 == null || sh == null) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Stage 0 needs σ and its points to seal its bundle.');
+      return;
+    }
+    final String setupPath = _vaultPath.text.trim();
+    final TextEditingController pathInput = TextEditingController(
+        text: setupPath.isEmpty ? '' : '$setupPath$kStage0Suffix');
+    Argon2Profile profile = kStage0DefaultProfile;
+    // A pass's time is known only at the setup's profile; elsewhere it is timed.
+    final double? known = profile == _profile ? _passSeconds : null;
+    final TextEditingController passesInput = TextEditingController(
+        text: known == null ? '' : '${Stage0Bundle.defaultPasses(known)}');
+    final DialogRoute<bool> route = DialogRoute<bool>(
+      context: context,
+      builder: (BuildContext ctx) => StatefulBuilder(
+        builder: (BuildContext ctx, void Function(void Function()) setLocal) =>
+            AlertDialog(
+          title: const Text('Retire the provisional key'),
+          content: SizedBox(
+            width: _kGraduationWidth,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  const Text(
+                    'First stage 0\'s bundle is sealed: σ and stage 0\'s card '
+                    'records, under stage 0\'s points hardened by D Argon2 '
+                    'passes at profile m. Its maps ride in the clear, so stage '
+                    '0 trains from it without the key, and gives σ back if you '
+                    'forget it. Then the setup file is wiped.',
+                  ),
+                  const SizedBox(height: _kRetireGap),
+                  Wrap(
+                    spacing: _kRetireGap / 2,
+                    children: <Widget>[
+                      for (int i = 0; i < _profiles.length; i++)
+                        ChoiceChip(
+                          label: Text('m: ${_profileLabels[i]}'),
+                          selected: profile == _profiles[i],
+                          onSelected: (_) => setLocal(() {
+                            profile = _profiles[i];
+                            final double? s = _passSeconds;
+                            passesInput.text = profile == _profile && s != null
+                                ? '${Stage0Bundle.defaultPasses(s)}'
+                                : '';
+                          }),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: _kRetireGap),
+                  TextField(
+                    controller: passesInput,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: <TextInputFormatter>[
+                      FilteringTextInputFormatter.digitsOnly,
+                    ],
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                      labelText: 'D (passes)',
+                      hintText: 'empty: about 2 minutes, timed first',
+                    ),
+                  ),
+                  const SizedBox(height: _kRetireGap),
+                  TextField(
+                    controller: pathInput,
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                      labelText: 'Stage 0 bundle file',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Seal stage 0'),
+            ),
+          ],
+        ),
+      ),
+    );
+    final bool go = await _dialog(
+            _Cue.graduation, () => Navigator.of(context).push(route)) ??
+        false;
+    final String path = pathInput.text.trim();
+    int? passes = int.tryParse(passesInput.text.trim());
+    // The fields are still drawn while the dialog animates out.
+    unawaited(route.completed.whenComplete(() {
+      pathInput.dispose();
+      passesInput.dispose();
+    }));
+    if (!go || !mounted) {
+      sh.fillRange(0, sh.length, 0);
+      return;
+    }
+    if (path.isEmpty) {
+      sh.fillRange(0, sh.length, 0);
+      _toast('Stage 0\'s bundle needs a file path.');
+      return;
+    }
+    try {
+      if (passes == null || passes < 1) {
+        _toast('Timing one Argon2 pass at that profile…');
+        passes = Stage0Bundle.defaultPasses(
+            await widget.core.benchArgon2(profile: profile, passes: 1));
+      }
+      final int d = passes;
+      _toast('Sealing stage 0: $d passes…');
+      final Uint8List file = await Stage0Bundle.seal(
+        contents: _stage0Contents(_deckForSave(_orbitDeepestStage)),
+        shBytes: sh,
+        profile: profile,
+        passes: d,
+        theta: <Uint8List>[
+          for (int j = 0; j < kMapsPerStage; j++) widget.core.theta(o0, j),
+        ],
+        harden: _harden,
+      );
+      final File tmp = File('$path.tmp');
+      await tmp.writeAsBytes(file, flush: true);
+      await tmp.rename(path);
+      if (!mounted) return;
+      _toast('Stage 0\'s bundle sealed at $path (m '
+          '${_profileLabels[_profiles.indexOf(profile)]}, D $d).');
+    } on Object catch (e) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Could not seal stage 0\'s bundle: $e. Nothing was wiped.');
+      return;
+    } finally {
+      sh.fillRange(0, sh.length, 0);
+    }
+    await _wipeWizard();
+  }
+
+  Future<void> _wipeWizard() async {
+    // The setup file, or stage 0's bundle when it is what is open.
+    final String setup = _vaultPath.text.trim();
+    final bool bundle = setup.isEmpty && _bundlePath != null;
+    final String path = bundle ? _bundlePath! : setup;
+    final String what = bundle ? 'Stage 0\'s bundle' : 'The setup file';
+    int left = _kWipePresses;
+    await _dialog(
+      _Cue.wipe,
+      () => showDialog<void>(
+        context: context,
+        builder: (BuildContext ctx) => StatefulBuilder(
+          builder: (BuildContext ctx, void Function(void Function()) setLocal) {
+            final ColorScheme scheme = Theme.of(ctx).colorScheme;
+            return CallbackShortcuts(
+              bindings: <ShortcutActivator, VoidCallback>{
+                const SingleActivator(LogicalKeyboardKey.escape): () =>
+                    Navigator.of(ctx).pop(),
+              },
+              child: AlertDialog(
+                title: const Text('Wipe everything'),
+                content: SizedBox(
+                  width: _kWipeDialogWidth,
+                  child: Text(
+                    '${path.isEmpty ? 'No setup file is set: only the setup on '
+                        'screen is cleared' : '$what $path is '
+                        'overwritten and deleted, and the setup on screen '
+                        'cleared'}${_busy ? ', the running advance halted' : ''}. '
+                    'This cannot be undone. On flash storage the overwrite is '
+                    'best effort: the old bytes are ciphertext, useless once '
+                    'the key is gone too.',
+                  ),
+                ),
+                actions: <Widget>[
+                  TextButton(
+                    onPressed: _press(
+                        _Cue.wipeCancel, () => Navigator.of(ctx).pop()),
+                    child: const Text('Cancel'),
+                  ),
+                  FilledButton(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: scheme.error,
+                      foregroundColor: scheme.onError,
+                    ),
+                    onPressed: _press(_Cue.wipePress, () {
+                      setLocal(() => left--);
+                      if (left == 0) Navigator.of(ctx).pop();
+                    }),
+                    child: Text(left == _kWipePresses
+                        ? 'Wipe — press $left times'
+                        : 'Wipe — $left more'),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    );
+    if (left > 0 || !mounted) return;
+    await _wipe(path);
+  }
+
+  /// Wipe the setup file at [path] (if any) and clear the setup on screen,
+  /// halting a running advance first so nothing it derives outlives the wipe.
+  Future<void> _wipe(String path) async {
+    _wiping = true;
+    final OrbitAdvanceJob? job = _advanceJob;
+    if (job != null) {
+      job.cancel();
+      try {
+        await job.result;
+      } on Object {
+        // Halted, as asked.
+      }
+    }
+    _harvestSession?.cancel();
+    final String? failed =
+        path.isEmpty ? null : await _fileLocked(() => wipeFile(path));
+    if (!mounted) return;
+    _vaultPath.clear();
+    _reset();
+    _wiping = false;
+    _sounds.play(UiSound.warn);
+    _toast(failed ??
+        (path.isEmpty
+            ? 'Wiped: the setup on screen is cleared.'
+            : 'Wiped: the setup file was overwritten and deleted, and the '
+                'setup on screen cleared.'));
+  }
+
   Future<void> _confirmReset() async {
     final bool ok = await _consoleConfirm(
       message: 'Reset and discard the current setup? σ, every placed point and '
@@ -4965,6 +7056,7 @@ press.calibrate.target    tick_soft.wav
 
   void _reset() {
     _resolvePrompt(false); // drop any pending console confirmation
+    _closeBundle();
     _brightness.reset();
     _viewport.viewport = _initialViewport;
     _exportLabel.clear();
@@ -5013,21 +7105,21 @@ enum _Field {
   profile,
   exportLabel,
   hue,
-  vault,
 }
 
 /// The command board's commands, each at its context and position (an index
 /// into [kBoardKeys]: rows top to bottom, left to right).
 enum _Cmd {
-  layout(CommandContext.main, 0),
+  reset(CommandContext.main, 0),
   save(CommandContext.main, 1),
   open(CommandContext.main, 2),
-  templates(CommandContext.main, 3),
   volumeDown(CommandContext.main, 4),
   volumeUp(CommandContext.main, 5),
   secrets(CommandContext.main, 6),
-  filePath(CommandContext.main, 7),
-  reset(CommandContext.main, 8),
+  layout(CommandContext.main, 7),
+  stats(CommandContext.main, 8),
+  cards(CommandContext.main, 9),
+  wipe(CommandContext.main, 11),
   label(CommandContext.setup, 0),
   profile(CommandContext.setup, 1),
   steps(CommandContext.setup, 2),
@@ -5040,6 +7132,16 @@ enum _Cmd {
   halt(CommandContext.setup, 9),
   copyKey(CommandContext.setup, 10),
   copyDigest(CommandContext.setup, 11),
+  nextDue(CommandContext.train, 0),
+  recall(CommandContext.train, 1),
+  showAnswer(CommandContext.train, 2),
+  progress(CommandContext.train, 3),
+  gradeAgain(CommandContext.train, 4),
+  gradeHard(CommandContext.train, 5),
+  gradeGood(CommandContext.train, 6),
+  gradeEasy(CommandContext.train, 7),
+  saveProgress(CommandContext.train, 8),
+  graduation(CommandContext.train, 9),
   prevStop(CommandContext.path, 0),
   nextStop(CommandContext.path, 1),
   rhoZoom(CommandContext.path, 2),
@@ -5101,6 +7203,11 @@ abstract final class _Cue {
   static const String dice = 'dice';
   static const String key = 'key';
   static const String harvestDate = 'harvest.date';
+  static const String wipe = 'wipe';
+  static const String stats = 'stats';
+  static const String graduation = 'graduation';
+  static const String cards = 'cards';
+  static const String fact = 'fact';
   static const List<String> dialogs = <String>[
     calibrate,
     calibrateLeave,
@@ -5109,6 +7216,11 @@ abstract final class _Cue {
     key,
     dice,
     harvestDate,
+    wipe,
+    stats,
+    graduation,
+    cards,
+    fact,
   ];
 
   // Buttons outside the board, under `press.`.
@@ -5130,7 +7242,15 @@ abstract final class _Cue {
   static const String keyQr = 'key.qr';
   static const String keyCopy = 'key.copy';
   static const String keyOwn = 'key.own';
+  static const String keyDice = 'key.dice';
   static const String keyClose = 'key.close';
+  static const String wipePress = 'wipe.press';
+  static const String wipeCancel = 'wipe.cancel';
+  static const String graduationApply = 'graduation.apply';
+  static const String graduationCancel = 'graduation.cancel';
+  static const String graduationWipe = 'graduation.wipe';
+  static const String cardsAdd = 'cards.add';
+  static const String cardsClose = 'cards.close';
   static const String calibrateClose = 'calibrate.close';
   static const String calibrateBench = 'calibrate.bench';
   static const String calibrateScope = 'calibrate.scope';
@@ -5161,7 +7281,15 @@ abstract final class _Cue {
     keyQr,
     keyCopy,
     keyOwn,
+    keyDice,
     keyClose,
+    wipePress,
+    wipeCancel,
+    graduationApply,
+    graduationCancel,
+    graduationWipe,
+    cardsAdd,
+    cardsClose,
     calibrateClose,
     calibrateBench,
     calibrateScope,
@@ -5317,6 +7445,18 @@ class _HuePainter extends CustomPainter {
   bool shouldRepaint(_HuePainter old) =>
       old.selected != selected || old.focused != focused;
 }
+
+/// The device's clock, for the CPNF scheduler.
+class _SystemClock implements Clock {
+  const _SystemClock();
+
+  @override
+  DateTime now() => DateTime.now();
+}
+
+/// Where an attempt at a map stands in Train mode: recalling (its point
+/// hidden), found and awaiting the user's grade, or answered (shown).
+enum _TrainStep { recall, found, answered }
 
 /// A confirmation rendered inline in the console (instead of a modal dialog).
 /// The console's action buttons complete [completer] with the user's choice.
@@ -5624,79 +7764,6 @@ class _Badge extends StatelessWidget {
   }
 }
 
-/// Paints the provisional-key QR. In **scan** mode it draws the plain scannable
-/// code (solid black/white modules) — what the user reveals to hand-copy or to
-/// scan back. In **blank** mode it draws the reusable hand-fill skeleton: only
-/// the key-independent cells (the three finder patterns + separators, the timing
-/// patterns, and the dark module) are inked, every cell sits in a clearly drawn
-/// grid so the user can see exactly which squares to colour, and the data/EC
-/// cells are left empty to fill in by reading the scan code. (Byte-mode v1 has
-/// no alignment patterns.) Both views include the spec's 4-module quiet zone.
-class _QrPainter extends CustomPainter {
-  _QrPainter(this.image, this.view);
-
-  final qr.QrImage image;
-  final _QrView view;
-
-  /// QR spec mandates a clear margin of at least 4 modules around the symbol;
-  /// without it decoders often fail to lock onto the finder patterns.
-  static const int quiet = 4;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final int n = image.moduleCount; // 21 for version 1
-    final double cell = size.width / (n + 2 * quiet);
-    final double off = quiet * cell; // top-left offset of the symbol proper
-    final Paint inked = Paint()..color = Colors.black;
-    // A visible grid so the hand-filler can tell the module divisions apart.
-    final Paint grid = Paint()
-      ..color = const Color(0xFF9E9E9E)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1;
-    canvas.drawRect(Offset.zero & size, Paint()..color = Colors.white);
-    for (int r = 0; r < n; r++) {
-      for (int c = 0; c < n; c++) {
-        final Rect rect = Rect.fromLTWH(off + c * cell, off + r * cell, cell, cell);
-        final bool dark = image.isDark(r, c);
-        switch (view) {
-          case _QrView.scan:
-            if (dark) canvas.drawRect(rect, inked);
-          case _QrView.blank:
-            // Key-independent skeleton only — the user inks the rest by hand,
-            // reading the scan code, guided by the highlighted module grid.
-            if (dark && _isFixed(r, c, n)) canvas.drawRect(rect, inked);
-            canvas.drawRect(rect, grid);
-        }
-      }
-    }
-  }
-
-  /// Key-independent modules: the three 8×8 finder+separator corners, the timing
-  /// rows/cols, the dark module, and (at v2, n == 25) the single 5×5 alignment
-  /// pattern centred at (n-7, n-7). v1 has no alignment pattern.
-  bool _isFixed(int r, int c, int n) {
-    bool corner(int r0, int c0) =>
-        r >= r0 && r < r0 + 8 && c >= c0 && c < c0 + 8;
-    if (corner(0, 0) || corner(0, n - 8) || corner(n - 8, 0)) return true;
-    if (r == 6 || c == 6) return true; // timing patterns
-    if (r == n - 8 && c == 8) return true; // dark module
-    if (n >= 25) {
-      final int a = n - 7; // alignment-pattern centre (18 at v2)
-      if ((r - a).abs() <= 2 && (c - a).abs() <= 2) return true; // 5×5 ring
-    }
-    return false;
-  }
-
-  @override
-  bool shouldRepaint(_QrPainter oldDelegate) =>
-      oldDelegate.image != image || oldDelegate.view != view;
-}
-
-/// How [_QrPainter] renders: the plain scannable code, or the reusable blank
-/// skeleton (only the key-independent cells, over a highlighted module grid,
-/// printed for hand-colouring).
-enum _QrView { scan, blank }
-
 /// Calibration target presets: a human duration label paired with the
 /// wall-clock the derivation should take. Grounded in THREAT_MODEL.md — hours
 /// defeat robbery / flash-kidnap, ~a week defeats the flashiest wrench attacks.
@@ -5709,7 +7776,7 @@ const List<({String label, Duration target})> _kCalibTargets =
 ];
 /// Whether a calibration target time means one **inter-stage** derivation or
 /// the **whole setup** (all stages). All-stages divides the target by the stage
-/// count to get the per-stage time the iteration count N must hit.
+/// count to get the per-stage time the iteration count D must hit.
 enum _CalibScope { perStage, allStages }
 
 /// The spacious Argon2 calibration dialog (opened by Alt+D / the panel button).
@@ -6164,7 +8231,8 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
                         FilledButton(
                           onPressed: _press(_Cue.calibrateApply, (_benching || n == null)
                               ? null
-                              : () => Navigator.of(context).pop(n)),
+                              : () => Navigator.of(context)
+                                  .pop((n: n, secPerPass: _secPerPass!))),
                           child: const Text('Apply N'),
                         ),
                       ],

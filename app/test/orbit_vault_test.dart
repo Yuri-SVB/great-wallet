@@ -2,6 +2,7 @@ import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:great_wallet_app/src/ffi/core_bindings.dart'
     show Argon2Profile, kOrbitPointLen;
+import 'package:great_wallet_app/src/setup/fact_cards.dart';
 import 'package:great_wallet_app/src/setup/orbit_vault.dart';
 
 /// Pure-Dart serialization tests for [OrbitVault] — no FFI/engine needed.
@@ -102,6 +103,71 @@ void main() {
         throwsA(isA<FormatException>()
             .having((FormatException e) => e.message, 'message', 'bad vault')),
       );
+    });
+  });
+
+  group('graduation settings', () {
+    test('the pass time, the gap and ε round-trip; absent, they stay null',
+        () {
+      final OrbitVault v = sample()
+        ..passSeconds = 1.5
+        ..gapSeconds = 86400
+        ..epsilon = 0.0001;
+      final OrbitVault back = OrbitVault.fromJson(v.toJson());
+      expect(back.passSeconds, 1.5);
+      expect(back.gapSeconds, 86400);
+      expect(back.epsilon, 0.0001);
+      final OrbitVault plain = OrbitVault.fromJson(sample().toJson());
+      expect(plain.passSeconds, isNull);
+      expect(plain.gapSeconds, isNull);
+      expect(plain.epsilon, isNull);
+    });
+
+    test('your own cards round-trip', () {
+      final OrbitVault v = OrbitVault(
+        sigma: 'DEADBEEF',
+        iterations: 5,
+        profile: Argon2Profile.basic,
+        stages: sample().stages,
+        facts: const <CustomFact>[
+          CustomFact(id: 'misc:1', prompt: 'Export salt', answer: 'SIGN-1'),
+        ],
+      );
+      final OrbitVault back = OrbitVault.fromJson(v.toJson());
+      expect(back.facts.single.answer, 'SIGN-1');
+      expect(OrbitVault.fromJson(sample().toJson()).facts, isEmpty);
+    });
+
+    test('the maps studied per stage round-trip; bad ones are refused', () {
+      final OrbitVault v = OrbitVault(
+        sigma: 'DEADBEEF',
+        iterations: 5,
+        profile: Argon2Profile.basic,
+        stages: sample().stages,
+        studied: const <List<int>>[<int>[1, 2, 4], <int>[]],
+      );
+      final OrbitVault back = OrbitVault.fromJson(v.toJson());
+      expect(back.studied, <List<int>>[<int>[1, 2, 4], <int>[]]);
+      expect(sample().toJson().containsKey('studied'), isFalse);
+      for (final Object bad in <Object>[
+        <Object>[<int>[0]],
+        <Object>[<int>[kMapsPerStage + 1]],
+        <Object>[<int>[2, 2]],
+        <Object>[<int>[], <int>[], <int>[1]], // more lists than stages
+        'x',
+      ]) {
+        final Map<String, dynamic> json = sample().toJson()..['studied'] = bad;
+        expect(() => OrbitVault.fromJson(json), throwsFormatException,
+            reason: 'studied = $bad');
+      }
+    });
+
+    test('a non-positive or non-numeric setting is refused', () {
+      for (final Object bad in <Object>[0, -1, 'x']) {
+        final Map<String, dynamic> json = sample().toJson()..['epsilon'] = bad;
+        expect(() => OrbitVault.fromJson(json), throwsFormatException,
+            reason: 'epsilon = $bad');
+      }
     });
   });
 
