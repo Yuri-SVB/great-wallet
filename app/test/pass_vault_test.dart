@@ -152,7 +152,8 @@ void main() {
         },
         derive: counted);
     final MemSchedule schedule = MemSchedule(FakeClock(DateTime.utc(2026)));
-    final MemCard graded = schedule.grade(o.vault.header.cardOf(1)!, Grade.good);
+    final MemCard graded =
+        schedule.grade(o.vault.header.cardOf(1)!, Grade.good);
     o.vault.header = o.vault.header.withCards(<MemCard>[
       for (final MemCard c in o.vault.header.cards)
         c.factId == graded.factId ? graded : c,
@@ -167,7 +168,8 @@ void main() {
         await PassVault.rewrap(o.vault, slots: next, k: 4, derive: counted);
     final VaultHeader after = PassVault.header(rewrapped);
     expect(after.cardOf(1)!.repetitions, 1, reason: 'kept with its schedule');
-    expect(after.cardOf(7)!.repetitions, 0, reason: 'a new sentence, a new card');
+    expect(after.cardOf(7)!.repetitions, 0,
+        reason: 'a new sentence, a new card');
     expect(after.cardOf(6), isNull, reason: 'retired');
     expect(v.contents.sentences.containsKey(6), isFalse);
     final Opened back = await PassVault.open(
@@ -178,6 +180,61 @@ void main() {
         },
         derive: counted);
     expect(back.wrong, isEmpty);
+  });
+
+  test('the provisional key opens it alone, until retired under a new data key',
+      () async {
+    final Uint8List key =
+        Uint8List.fromList(List<int>.generate(16, (int i) => 0xA0 + i));
+    final Opened o = await PassVault.open(
+        await make(),
+        <int, List<int>>{
+          for (final int id in <int>[1, 2, 3, 4]) id: sentences[id]!
+        },
+        derive: counted);
+    derivations = 0;
+    final (Uint8List withKey, OpenVault v) =
+        await PassVault.addProvisional(o.vault, key, derive: counted);
+    expect(derivations, 1);
+    expect(PassVault.header(withKey).provisional, isNotNull);
+    expect(
+        (await PassVault.openWithKey(withKey, key, derive: counted))
+            .contents
+            .entries
+            .single
+            .label,
+        'Mail');
+    final Uint8List other = Uint8List.fromList(key)..[0] ^= 1;
+    await expectLater(PassVault.openWithKey(withKey, other, derive: counted),
+        throwsFormatException);
+
+    // A sentence retired: the same data key, so the key still opens it.
+    final (Uint8List rewrapped, OpenVault w) = await PassVault.rewrap(v,
+        slots: slots.where((VaultSlot s) => s.id != 6).toList(),
+        k: 4,
+        derive: counted);
+    expect((await PassVault.openWithKey(rewrapped, key, derive: counted)),
+        isA<OpenVault>());
+
+    // Retired: C(5, 4) wrappings under a new data key; the key opens nothing.
+    derivations = 0;
+    final (Uint8List retired, OpenVault _) =
+        await PassVault.retireProvisional(w, derive: counted);
+    expect(derivations, 5);
+    expect(PassVault.header(retired).provisional, isNull);
+    await expectLater(PassVault.openWithKey(retired, key, derive: counted),
+        throwsFormatException);
+    final Opened back = await PassVault.open(
+        retired,
+        <int, List<int>>{
+          for (final int id in <int>[2, 3, 4, 5]) id: sentences[id]!
+        },
+        derive: counted);
+    expect(back.vault.contents.entries.single.label, 'Mail');
+    expect(
+        () => PassVault.addProvisional(back.vault, Uint8List(20),
+            derive: counted),
+        throwsArgumentError);
   });
 
   test('the clear part cannot be altered unseen', () async {

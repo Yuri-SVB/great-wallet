@@ -1,4 +1,8 @@
+import 'dart:convert';
 import 'dart:io';
+
+import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
+    show MemCard;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -7,12 +11,15 @@ import 'package:formosa/io.dart';
 import 'package:great_wallet_app/src/formosa/formosa_screen.dart';
 import 'package:great_wallet_app/src/formosa/pass_vault.dart';
 
-/// F4: a vault created from six generated sentences, an entry added, locked,
-/// then opened again with four of them. Argon2id runs for real, light.
+/// F4: a vault created from six generated sentences and a provisional key,
+/// an entry added, locked, then opened again with four of them, and with the
+/// key; the key retired at the green light, and a new one added. Argon2id
+/// runs for real, light.
 void main() {
   final formosa.ThemeSet themes = loadThemes(Directory('../formosa/themes'));
   const KdfParams light =
       KdfParams(memoryKiB: 64, iterations: 1, parallelism: 1);
+  const String keyHex = 'a0a1a2a3a4a5a6a7a8a9aaabacadaeaf';
 
   testWidgets('create, add, lock, open with 4 of 6',
       (WidgetTester tester) async {
@@ -54,10 +61,32 @@ void main() {
     expect(sentences, hasLength(6));
     await tester.tap(find.text('Create'));
     await tester.pump();
-    for (int i = 0; i < 10 && find.text('Add entry').evaluate().isEmpty; i++) {
+    final Finder keyDialog = find.text('Provisional key — 128-bit');
+    for (int i = 0; i < 10 && keyDialog.evaluate().isEmpty; i++) {
       await settle();
     }
+    // The provisional key: a key of our own, typed, reseals the vault.
+    expect(keyDialog, findsOneWidget);
     expect(find.textContaining('Vault created'), findsOneWidget);
+    await tester.enterText(
+        find.widgetWithText(
+            TextField, 'Your own key — 32 or 64 hex digits (optional)'),
+        keyHex);
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pump();
+    await settle();
+    expect(find.textContaining('Re-saved with your own 128-bit key'),
+        findsOneWidget);
+    await tester.tap(find.text('Done'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('not yet.'), findsOneWidget,
+        reason: 'no sentence graded: the gate is shut');
+    expect(
+        tester
+            .widget<OutlinedButton>(find.widgetWithText(
+                OutlinedButton, 'Retire the provisional key…'))
+            .onPressed,
+        isNull);
     final VaultHeader h = PassVault.header(File(path).readAsBytesSync());
     expect(h.n, 6);
     expect(h.k, 4);
@@ -198,5 +227,55 @@ void main() {
         findsOneWidget);
     expect(now().cardOf(3)!.lapses, 1);
     expect(now().cardOf(1)!.repetitions, 1, reason: 'practice moves nothing');
+
+    // Opened with the provisional key alone: nothing graded.
+    final List<String> before = <String>[
+      for (final MemCard c in now().cards) jsonEncode(c.toJson()),
+    ];
+    await tester.tap(find.text('Lock'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Open'));
+    await tester.pump();
+    await settle();
+    await tester.tap(find.text('Open with the provisional key…'));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+        find.widgetWithText(TextField, 'Key — 32 or 64 hex digits'), keyHex);
+    await tester.tap(find.widgetWithText(FilledButton, 'Open').last);
+    await tester.pump();
+    for (int i = 0; i < 10 && find.text('Add entry').evaluate().isEmpty; i++) {
+      await settle();
+    }
+    expect(find.text('Mail'), findsOneWidget);
+    expect(find.textContaining('no sentence is graded'), findsOneWidget);
+    expect(<String>[
+      for (final MemCard c in now().cards) jsonEncode(c.toJson()),
+    ], before);
+
+    // At the green light (here ε = 1), the key is retired; then a new one.
+    await tester.pumpWidget(MaterialApp(
+      home:
+          Scaffold(body: FormosaScreen(themes: themes, kdf: light, epsilon: 1)),
+    ));
+    await tester.pump();
+    expect(find.textContaining('green light.'), findsOneWidget);
+    await tester.tap(find.text('Retire the provisional key…'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Retire it'));
+    await tester.pump();
+    for (int i = 0; i < 10 && now().provisional != null; i++) {
+      await settle();
+    }
+    expect(now().provisional, isNull);
+    expect(find.textContaining('Provisional key retired'), findsOneWidget);
+    await tester.tap(find.text('Add a provisional key…'));
+    await tester.pump();
+    for (int i = 0; i < 10 && keyDialog.evaluate().isEmpty; i++) {
+      await settle();
+    }
+    expect(keyDialog, findsOneWidget);
+    await tester.tap(find.text('Done'));
+    await tester.pumpAndSettle();
+    expect(now().provisional, isNotNull);
   });
 }

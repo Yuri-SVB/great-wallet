@@ -2,8 +2,6 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 
-import 'package:flutter/foundation.dart'
-    show defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:cryptography/cryptography.dart' show SecretKey;
 import 'package:flutter/material.dart';
 import 'package:dragon_dice_ui/dragon_dice_ui.dart'
@@ -29,8 +27,6 @@ import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
 import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:flutter/services.dart';
 import 'package:great_wall_ux/great_wall_ux.dart';
-import 'package:mobile_scanner/mobile_scanner.dart';
-import 'package:qr/qr.dart' as qr;
 
 import '../app/sound_cue_folder.dart';
 import '../command/command_board.dart';
@@ -48,13 +44,11 @@ import '../ffi/core_bindings.dart';
 import '../ffi/fixed.dart';
 import 'card_stats.dart';
 import 'cover_writes.dart';
-import 'desktop_qr_scanner.dart';
 import 'fact_cards.dart';
 import 'fact_review.dart';
 import 'file_wipe.dart';
 import 'orbit_vault.dart';
-import 'key_qr_painter.dart';
-import 'qr_layout.dart';
+import 'provisional_key.dart';
 import 'setup_crypto.dart';
 import 'stage0_bundle.dart';
 
@@ -838,22 +832,10 @@ press.calibrate.target    tick_soft.wav
 
   bool get _busy => _advancing;
 
-  /// Whether in-app webcam QR scanning is available — only on the platforms
-  /// `mobile_scanner` implements (Android / iOS / macOS). Linux/Windows hide the
-  /// Scan button and fall back to typing the key.
-  bool get _scanSupported =>
-      !kIsWeb &&
-      (defaultTargetPlatform == TargetPlatform.android ||
-          defaultTargetPlatform == TargetPlatform.iOS ||
-          defaultTargetPlatform == TargetPlatform.macOS);
-
-  /// Whether the desktop (flutter_webrtc + zxing2) scan path applies — Linux and
-  /// Windows, where `mobile_scanner` has no backend. Best-effort: the camera may
-  /// fail to open on some setups, in which case the user falls back to hex-load.
-  bool get _desktopScanSupported =>
-      !kIsWeb &&
-      (defaultTargetPlatform == TargetPlatform.linux ||
-          defaultTargetPlatform == TargetPlatform.windows);
+  /// Whether in-app webcam QR scanning is available ([mobileKeyScanSupported]),
+  /// and whether the desktop scanner applies ([desktopKeyScanSupported]).
+  bool get _scanSupported => mobileKeyScanSupported;
+  bool get _desktopScanSupported => desktopKeyScanSupported;
 
   /// Bring up input field [f] in the current context's pane and focus it by
   /// its [node]. If the field is not shown in the current mode, say so in the
@@ -3994,13 +3976,6 @@ press.calibrate.target    tick_soft.wav
     _pointImportFocus.requestFocus();
   }
 
-  /// Width and height of the Dragon Dice wizard's dialog, in logical pixels.
-  static const double _kDiceWizardWidth = 960;
-  static const double _kDiceWizardHeight = 620;
-
-  /// Padding around the key-size choice above the wizard.
-  static const double _kKeySizePad = 16;
-
   /// Bits the dice must carry beyond a point's: cutting the digest to 32
   /// bits loses some of what the rolls carry, and 32-bit outputs can be
   /// tabulated (dragon-dice/doc/FORMAT.md, "From the digest").
@@ -4030,8 +4005,8 @@ press.calibrate.target    tick_soft.wav
         barrierDismissible: false,
         builder: (BuildContext ctx) => Dialog(
           child: SizedBox(
-            width: _kDiceWizardWidth,
-            height: _kDiceWizardHeight,
+            width: kDiceWizardWidth,
+            height: kDiceWizardHeight,
             child: DragonDiceWizard(
               targetBits: _kDiceTargetBits.toDouble(),
               purpose: 'Slot $slot’s point',
@@ -5740,44 +5715,12 @@ press.calibrate.target    tick_soft.wav
     return keyBytes;
   }
 
-  /// Scan the provisional-key QR, returning the 16 raw key bytes or null. Uses
-  /// `mobile_scanner` where it has a backend, else the flutter_webrtc + zxing2
-  /// desktop scanner.
-  Future<Uint8List?> _scanKey() => _desktopScanSupported
-      ? DesktopKeyScanner.show(context)
-      : _scanWithMobileScanner();
+  /// How the key's shared dialogs voice themselves here.
+  KeyVoice get _keyVoice =>
+      KeyVoice(cue: _cue, sound: _sounds.play, toast: _toast);
 
-  /// The `mobile_scanner` dialog (Android / iOS / macOS): returns the 16 raw key
-  /// bytes from the QR's byte segment, or null if cancelled.
-  Future<Uint8List?> _scanWithMobileScanner() async {
-    Uint8List? keyBytes;
-    await _dialog(_Cue.scan, () => showDialog<void>(
-      context: context,
-      builder: (BuildContext ctx) => AlertDialog(
-        title: const Text('Scan provisional key'),
-        content: SizedBox(
-          width: 320,
-          height: 320,
-          child: MobileScanner(
-            onDetect: (BarcodeCapture capture) {
-              if (keyBytes != null || capture.barcodes.isEmpty) return;
-              final Uint8List? raw = capture.barcodes.first.rawBytes;
-              if (raw == null || !SetupCrypto.isValidKeyLen(raw.length)) return;
-              keyBytes = Uint8List.fromList(raw);
-              Navigator.of(ctx).pop();
-            },
-          ),
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: _press(_Cue.scanCancel, () => Navigator.of(ctx).pop()),
-            child: const Text('Cancel'),
-          ),
-        ],
-      ),
-    ));
-    return keyBytes;
-  }
+  /// Scan the provisional-key QR ([scanKey]): its raw key bytes, or null.
+  Future<Uint8List?> _scanKey() => scanKey(context, _keyVoice);
 
   /// Shared decrypt+restore from a file path and 16- or 32-byte key, wiping the
   /// key. The heavy part (the Argon2 key derivation, and an orbit restore's
@@ -5855,345 +5798,19 @@ press.calibrate.target    tick_soft.wav
   /// [orbit] says which writer the dialog's re-seals go back through, so the
   /// 128↔256 toggle and the own-key/scanned-key paths rewrite the same kind of
   /// vault the initial write produced.
-  Future<void> _showKeyDialog(String path, Uint8List keyBytes) async {
-    Uint8List key = keyBytes;
-    int keyLen = key.length; // 16 (128-bit) or 32 (256-bit)
-    qr.QrImage matrix = _keyMatrix(key);
-    final bool canScan = _scanSupported || _desktopScanSupported;
-    bool showQr = false;
-    bool copiedOnce = false;
-    bool busy = false;
-    final TextEditingController hexInput = TextEditingController();
-    final FocusNode hexFocus = FocusNode(debugLabel: 'write-hex');
-
-    await _dialog(_Cue.key, () => showDialog<void>(
-      context: context,
-      builder: (BuildContext ctx) => StatefulBuilder(
-        builder: (BuildContext ctx, void Function(void Function()) setLocal) {
-          void copyHex() {
-            Clipboard.setData(ClipboardData(text: SetupCrypto.keyToHex(key)));
-            _toast('${keyLen * 8}-bit key copied. The clipboard is not '
-                'air-gapped — clear it after pasting into your manager.');
-          }
-
-          // Re-seal the file with either the user's own key or a fresh
-          // [newLen]-byte generated key, overwriting the previous key + file,
-          // and redraw. Shared by the 128↔256 toggle and the own-key path.
-          Future<bool> reseal({Uint8List? ownKey, required int newLen}) async {
-            setLocal(() => busy = true);
-            final ({String? error, Uint8List? key}) r =
-                await _saveOrbitVaultToFile(path,
-                    providedKey: ownKey, genLenBytes: newLen);
-            if (ownKey != null) _wipeBytes(ownKey);
-            if (!ctx.mounted) return false;
-            if (r.error != null || r.key == null) {
-              setLocal(() => busy = false);
-              _sounds.play(UiSound.denyInput);
-              _toast(r.error ?? 'Could not save.');
-              return false;
-            }
-            _wipeBytes(key); // drop the superseded key
-            _sounds.play(UiSound.exportOk);
-            setLocal(() {
-              key = r.key!;
-              keyLen = key.length;
-              matrix = _keyMatrix(key);
-              busy = false;
-            });
-            return true;
-          }
-
-          int otherLen() => keyLen == SetupCrypto.keyLenBytes
-              ? SetupCrypto.keyLenBytes256
-              : SetupCrypto.keyLenBytes;
-
-          Future<void> applyOwnKey() async {
-            Uint8List ownKey;
-            try {
-              ownKey = SetupCrypto.hexToKey(hexInput.text);
-            } on FormatException catch (e) {
-              _sounds.play(UiSound.denyInput);
-              _toast(e.message);
-              return;
-            }
-            if (await reseal(ownKey: ownKey, newLen: ownKey.length)) {
-              setLocal(hexInput.clear);
-              _toast('Re-saved with your own ${keyLen * 8}-bit key.');
-            }
-          }
-
-          // Scan an existing provisional-key QR and re-seal the file under it,
-          // so saving the same setup again reuses the QR you already
-          // hand-coloured instead of producing a fresh code to copy. The scanned
-          // bytes are validated as a key length before use, and wiped by reseal.
-          Future<void> scanOwnKey() async {
-            if (busy) return;
-            final Uint8List? scanned = await _scanKey();
-            if (scanned == null) return;
-            if (!SetupCrypto.isValidKeyLen(scanned.length)) {
-              _wipeBytes(scanned);
-              _sounds.play(UiSound.denyInput);
-              _toast('That QR is not a valid provisional key.');
-              return;
-            }
-            if (await reseal(ownKey: scanned, newLen: scanned.length)) {
-              _toast('Re-saved with the scanned key — your existing QR still '
-                  'opens this file.');
-            }
-          }
-
-          // R — roll Dragon Dice for a new key and re-seal the file under it.
-          Future<void> rollOwnKey() async {
-            if (busy) return;
-            final Uint8List? rolled = await _rollKey(keyLen);
-            if (rolled == null || !ctx.mounted) {
-              if (rolled != null) _wipeBytes(rolled);
-              return;
-            }
-            if (await reseal(ownKey: rolled, newLen: rolled.length)) {
-              _toast('Re-saved with a ${keyLen * 8}-bit key from Dragon Dice.');
-            }
-          }
-
-          // Q reveals the QR; pressing it again switches 128↔256 (a fresh key,
-          // overwriting the file). Alt+Q copies; pressing it again switches too.
-          void onShowQr() {
-            if (busy) return;
-            if (!showQr) {
-              setLocal(() => showQr = true);
-            } else {
-              reseal(newLen: otherLen());
-            }
-          }
-
-          void onCopy() {
-            if (busy) return;
-            if (!copiedOnce) {
-              copyHex();
-              setLocal(() => copiedOnce = true);
-            } else {
-              reseal(newLen: otherLen()).then((bool ok) {
-                if (ok && ctx.mounted) copyHex();
-              });
-            }
-          }
-
-          final int version = keyLen > SetupCrypto.keyLenBytes ? 2 : 1;
-          return CallbackShortcuts(
-            bindings: <ShortcutActivator, VoidCallback>{
-              const SingleActivator(LogicalKeyboardKey.keyQ): onShowQr,
-              const SingleActivator(LogicalKeyboardKey.keyQ, alt: true): onCopy,
-              // I — scan an existing QR to reuse its key; Alt+I — type your own
-              // hex key. (I is a no-op where no camera backend exists.)
-              if (canScan)
-                const SingleActivator(LogicalKeyboardKey.keyI): scanOwnKey,
-              const SingleActivator(LogicalKeyboardKey.keyI, alt: true): () =>
-                  hexFocus.requestFocus(),
-              // R — not a hex digit, so typing a key in the field is safe.
-              const SingleActivator(LogicalKeyboardKey.keyR): rollOwnKey,
-              const SingleActivator(LogicalKeyboardKey.escape): () =>
-                  Navigator.of(ctx).pop(),
-            },
-            child: Focus(
-              autofocus: true,
-              child: AlertDialog(
-                title: Text('Provisional key — ${keyLen * 8}-bit'),
-                content: SizedBox(
-                  width: 340,
-                  child: SingleChildScrollView(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: <Widget>[
-                        const Text(
-                          'Saved. Keep the key OFFLINE and destroy it at '
-                          'graduation (shred / burn). Lose it and the file is '
-                          'unrecoverable — that is the point.',
-                          style: TextStyle(fontSize: 12),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          'Q — show the QR, to copy its dots onto a printed '
-                          'template (see templates/ in the repository).  '
-                          'Alt+Q — copy the key for a password '
-                          'manager (blind).  Press Q or Alt+Q again to switch to '
-                          '${otherLen() * 8}-bit (a fresh key, overwriting the '
-                          'file).  '
-                          '${canScan ? 'I — scan an existing QR to reuse its key '
-                              '(re-seals this setup under it).  ' : ''}'
-                          'R — roll Dragon Dice for a new key, 128 or 256 '
-                          'bits (re-seals this setup under it).  '
-                          'Alt+I — type your own 32- or 64-hex key (Enter).  '
-                          'Esc — close.',
-                          style: const TextStyle(fontSize: 11),
-                        ),
-                        if (showQr) ...<Widget>[
-                          const SizedBox(height: 12),
-                          Center(
-                            child: Container(
-                              color: Colors.white,
-                              padding: const EdgeInsets.all(12),
-                              child: CustomPaint(
-                                size: const Size(_kQrSide, _kQrSide),
-                                painter: KeyQrPainter(matrix),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            '${keyLen * 8}-bit · QR v$version. Copy each black '
-                            'dot onto the template cell of the same colour and '
-                            'place. Mistakes may touch at most '
-                            '${QrLayout(version).correctable} colour blocks '
-                            '(any number of wrong cells in one block counts '
-                            'once); the grey format cells are protected on '
-                            'their own. Do this alone, no cameras.',
-                            style: const TextStyle(fontSize: 11),
-                          ),
-                        ],
-                        const SizedBox(height: 12),
-                        TextField(
-                          controller: hexInput,
-                          focusNode: hexFocus,
-                          enabled: !busy,
-                          autocorrect: false,
-                          enableSuggestions: false,
-                          maxLines: 1,
-                          onSubmitted: (_) => applyOwnKey(),
-                          decoration: const InputDecoration(
-                            isDense: true,
-                            border: OutlineInputBorder(),
-                            labelText:
-                                'Your own key — 32 or 64 hex digits (optional)',
-                            hintText: 'from another source, then Enter to apply',
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                actions: <Widget>[
-                  TextButton.icon(
-                    onPressed: _press(_Cue.keyQr, busy ? null : onShowQr),
-                    icon: const Icon(Icons.qr_code_2),
-                    label: Text(showQr ? 'Switch bits (Q)' : 'Show QR (Q)'),
-                  ),
-                  TextButton.icon(
-                    onPressed: _press(_Cue.keyCopy, busy ? null : onCopy),
-                    icon: const Icon(Icons.copy),
-                    label: const Text('Copy key (Alt+Q)'),
-                  ),
-                  TextButton.icon(
-                    onPressed: _press(_Cue.keyDice, busy ? null : rollOwnKey),
-                    icon: D20Glyph(
-                        colour: Theme.of(ctx).colorScheme.primary),
-                    label: const Text('Roll dice (R)'),
-                  ),
-                  if (canScan)
-                    TextButton.icon(
-                      onPressed:
-                          _press(_Cue.keyOwn, busy ? null : scanOwnKey),
-                      icon: const Icon(Icons.qr_code_scanner),
-                      label: const Text('Scan to reuse (I)'),
-                    ),
-                  TextButton(
-                    onPressed: _press(_Cue.keyClose, () => Navigator.of(ctx).pop()),
-                    child: const Text('Done'),
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-      ),
-    ));
-    hexInput.dispose();
-    hexFocus.dispose();
-    _wipeBytes(key); // recorded or abandoned — drop our copy
-  }
-
-  /// A provisional key from the Dragon Dice wizard: the first 16 or 32 bytes
-  /// of the rolls' digest; null if cancelled. The size starts at [lenBytes]
-  /// and can be switched in the wizard's dialog. The target is the key's
-  /// bits, with no margin: from 128 bits on, a digest cut to them cannot be
-  /// tabulated (dragon-dice/doc/FORMAT.md, "From the digest"). The caller
-  /// wipes the key.
-  Future<Uint8List?> _rollKey(int lenBytes) async {
-    int len = lenBytes;
-    int bits() => len == SetupCrypto.keyLenBytes
-        ? SetupCrypto.keyBits
-        : SetupCrypto.keyBits256;
-    DiceRolls? rolled;
-    await _dialog(
-      _Cue.dice,
-      () => showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (BuildContext ctx) => Dialog(
-          child: SizedBox(
-            width: _kDiceWizardWidth,
-            height: _kDiceWizardHeight,
-            child: StatefulBuilder(
-              builder: (BuildContext ctx,
-                      void Function(void Function()) setLocal) =>
-                  Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: <Widget>[
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(
-                        _kKeySizePad, _kKeySizePad, _kKeySizePad, 0),
-                    child: SegmentedButton<int>(
-                      segments: const <ButtonSegment<int>>[
-                        ButtonSegment<int>(
-                            value: SetupCrypto.keyLenBytes,
-                            label: Text('${SetupCrypto.keyBits}-bit key')),
-                        ButtonSegment<int>(
-                            value: SetupCrypto.keyLenBytes256,
-                            label: Text('${SetupCrypto.keyBits256}-bit key')),
-                      ],
-                      selected: <int>{len},
-                      onSelectionChanged: (Set<int> s) =>
-                          setLocal(() => len = s.first),
-                    ),
-                  ),
-                  Expanded(
-                    child: DragonDiceWizard(
-                      targetBits: bits().toDouble(),
-                      purpose: 'The provisional key, ${bits()} bits',
-                      systemRandomByDefault: true,
-                      onCue: _cue,
-                      onDone: (DiceRolls r) {
-                        rolled = r;
-                        Navigator.of(ctx).pop();
-                      },
-                      onCancel: () => Navigator.of(ctx).pop(),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-    final DiceRolls? r = rolled;
-    if (r == null) return null;
-    final Uint8List digest = r.digest();
-    r.wipe();
-    final Uint8List key = Uint8List.fromList(digest.sublist(0, len));
-    _wipeBytes(digest);
-    return key;
-  }
-
-  /// Byte-mode QR matrix for a provisional key: v1 (21×21) for the 16-byte
-  /// key, v2 (25×25) for the 32-byte 256-bit key, both at EC level L.
-  qr.QrImage _keyMatrix(Uint8List key) {
-    final int version = key.length > SetupCrypto.keyLenBytes ? 2 : 1;
-    return qr.QrImage(
-      qr.QrCode(version, qr.QrErrorCorrectLevel.L)
-        ..addByteData(ByteData.sublistView(key)),
-    );
-  }
+  Future<void> _showKeyDialog(String path, Uint8List keyBytes) =>
+      showKeyDialog(
+        context,
+        key: keyBytes,
+        voice: _keyVoice,
+        sealed: 'this setup',
+        intro: 'Saved. Keep the key OFFLINE and destroy it at graduation '
+            '(shred / burn). Lose it and the file is unrecoverable — that is '
+            'the point.',
+        reseal: ({Uint8List? ownKey, required int newLen}) =>
+            _saveOrbitVaultToFile(path,
+                providedKey: ownKey, genLenBytes: newLen),
+      );
 
   static void _wipeBytes(Uint8List b) {
     for (int i = 0; i < b.length; i++) {
@@ -6505,8 +6122,6 @@ press.calibrate.target    tick_soft.wav
 
   /// Reset behind an inline console confirmation, so the Reset key (or a stray
   /// keypress) cannot discard a setup by accident.
-  /// Side of the key's QR in the key dialog.
-  static const double _kQrSide = 300;
 
   /// Width of the cards manager.
   static const double _kCardsWidth = 520;
@@ -7211,14 +6826,14 @@ abstract final class _Cue {
   static const String alertLog = 'alert.log';
 
   // Dialogs, under `dialog.open.` / `dialog.close.`.
-  static const String dialogOpen = 'dialog.open';
-  static const String dialogClose = 'dialog.close';
+  static const String dialogOpen = KeyCue.dialogOpen;
+  static const String dialogClose = KeyCue.dialogClose;
   static const String calibrate = 'calibrate';
   static const String calibrateLeave = 'calibrate.leave';
   static const String openFile = 'open';
-  static const String scan = 'scan';
-  static const String dice = 'dice';
-  static const String key = 'key';
+  static const String scan = KeyCue.scan;
+  static const String dice = KeyCue.dice;
+  static const String key = KeyCue.key;
   static const String harvestDate = 'harvest.date';
   static const String wipe = 'wipe';
   static const String stats = 'stats';
@@ -7255,12 +6870,12 @@ abstract final class _Cue {
   static const String openScan = 'open.scan';
   static const String openCancel = 'open.cancel';
   static const String openLoad = 'open.load';
-  static const String scanCancel = 'scan.cancel';
-  static const String keyQr = 'key.qr';
-  static const String keyCopy = 'key.copy';
-  static const String keyOwn = 'key.own';
-  static const String keyDice = 'key.dice';
-  static const String keyClose = 'key.close';
+  static const String scanCancel = KeyCue.scanCancel;
+  static const String keyQr = KeyCue.keyQr;
+  static const String keyCopy = KeyCue.keyCopy;
+  static const String keyOwn = KeyCue.keyOwn;
+  static const String keyDice = KeyCue.keyDice;
+  static const String keyClose = KeyCue.keyClose;
   static const String wipePress = 'wipe.press';
   static const String wipeCancel = 'wipe.cancel';
   static const String graduationApply = 'graduation.apply';

@@ -11,9 +11,16 @@
 /// No sentence has a check of its own (it would be a 33-bit oracle): a
 /// sentence is checked only by opening, then against the vault's copy.
 ///
+/// **The provisional key**, until the sentences graduate: one more wrapping
+/// of the data key, under Argon2id over a random 128- or 256-bit key kept
+/// outside the app (a QR, a password manager; the Great Wall's own can be
+/// reused). It opens the vault alone. Retiring it rewraps every `k`-subset
+/// under a new data key, so the retired key opens no later copy.
+///
 /// The file is JSON. In the clear, as the encryption's associated data: the
-/// version, the KDF settings, `k`, the slots (id and theme) and the
-/// wrappings, each labelled by its slots. Inside, under the data key, padded
+/// version, the KDF settings, `k`, the slots (id and theme), the sentences'
+/// cards, the wrappings, each labelled by its slots, and the provisional
+/// key's wrapping while there is one. Inside, under the data key, padded
 /// to a multiple of [PassVault.paddingStep]: the sentences and the entries.
 /// No wrench-attack resistance is aimed at (F4 holds less critical secrets),
 /// and nothing is time-locked.
@@ -27,6 +34,8 @@ import 'dart:typed_data';
 import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
     show MemCard;
 import 'package:cryptography/cryptography.dart';
+
+import '../setup/setup_crypto.dart' show SetupCrypto;
 
 /// Bits in a raw Formosa sentence (formosa's `kRawSentenceBits`).
 const int kSentenceBits = 33;
@@ -159,6 +168,9 @@ class VaultEntry {
   }
 }
 
+/// A wrapping of the data key: its salt, nonce and sealed key.
+typedef KeyWrap = ({List<int> salt, List<int> nonce, List<int> sealed});
+
 /// The clear part of a vault file.
 class VaultHeader {
   const VaultHeader({
@@ -167,6 +179,7 @@ class VaultHeader {
     required this.slots,
     required this.wraps,
     this.cards = const <MemCard>[],
+    this.provisional,
   });
 
   final KdfParams kdf;
@@ -178,9 +191,26 @@ class VaultHeader {
   /// wrench-attack goal.
   final List<MemCard> cards;
 
+  /// The provisional key's wrapping of the data key, until it is retired.
+  final KeyWrap? provisional;
+
   /// This header with [cards] in place of its own.
-  VaultHeader withCards(List<MemCard> cards) =>
-      VaultHeader(kdf: kdf, k: k, slots: slots, wraps: wraps, cards: cards);
+  VaultHeader withCards(List<MemCard> cards) => VaultHeader(
+      kdf: kdf,
+      k: k,
+      slots: slots,
+      wraps: wraps,
+      cards: cards,
+      provisional: provisional);
+
+  /// This header with [provisional] in place of its own.
+  VaultHeader withProvisional(KeyWrap? provisional) => VaultHeader(
+      kdf: kdf,
+      k: k,
+      slots: slots,
+      wraps: wraps,
+      cards: cards,
+      provisional: provisional);
 
   /// Slot [slot]'s card, if it has one.
   MemCard? cardOf(int slot) {
@@ -219,6 +249,12 @@ class VaultHeader {
               'key': base64Encode(w.sealed),
             },
         ],
+        if (provisional case final KeyWrap p)
+          'prov': <String, dynamic>{
+            'salt': _hex(p.salt),
+            'nonce': _hex(p.nonce),
+            'key': base64Encode(p.sealed),
+          },
       };
 
   List<int> get _aad => utf8.encode(jsonEncode(toJson()));
@@ -304,6 +340,9 @@ abstract final class PassVault {
   static const int _lengthLen = 4;
   static const int _sentenceBytes = 5; // 33 bits, zero-padded
   static final List<int> _tag = utf8.encode('greatwall-formosa-vault-v1');
+  static final List<int> _provisionalTag =
+      utf8.encode('greatwall-formosa-vault-v1 provisional');
+  static final List<int> _provisionalAad = utf8.encode('provisional');
   static final AesGcm _aes = AesGcm.with256bits();
 
   /// Every k-subset of [ids] (ascending), in lexicographic order.
@@ -366,7 +405,8 @@ abstract final class PassVault {
   }
 
   /// [v] rewrapped for [slots] and [k] (sentences added or retired): every
-  /// wrapping anew, the data key kept.
+  /// wrapping anew, the data key kept — and so the provisional key's
+  /// wrapping, if any.
   static Future<(Uint8List, OpenVault)> rewrap(
     OpenVault v, {
     required List<VaultSlot> slots,
@@ -387,11 +427,107 @@ abstract final class PassVault {
         previous: v.header.cards,
         onProgress: onProgress);
     // A retired sentence leaves the vault entirely.
-    v.contents.sentences.removeWhere(
-        (int id, _) => !slots.any((VaultSlot s) => s.id == id));
-    final OpenVault next = OpenVault(header, v.contents, v._dataKey);
+    v.contents.sentences
+        .removeWhere((int id, _) => !slots.any((VaultSlot s) => s.id == id));
+    final OpenVault next = OpenVault(
+        header.withProvisional(v.header.provisional), v.contents, v._dataKey);
     return (await save(next, random: rng), next);
   }
+
+  /// [v] with the provisional [key] (16 or 32 bytes): one more wrapping of
+  /// its data key, one derivation. Replaces the key it had, if any.
+  static Future<(Uint8List, OpenVault)> addProvisional(
+    OpenVault v,
+    Uint8List key, {
+    VaultKdf derive = argon2idKdf,
+    Random? random,
+  }) async {
+    if (!SetupCrypto.isValidKeyLen(key.length)) {
+      throw ArgumentError('a provisional key has 16 or 32 bytes');
+    }
+    final Random rng = random ?? Random.secure();
+    final Uint8List salt = _bytes(rng, _saltLen);
+    final Uint8List password = _provisionalPassword(key);
+    final Uint8List kek = await derive(password, salt, v.header.kdf);
+    password.fillRange(0, password.length, 0);
+    final SecretBox box = await _aes.encrypt(await v._dataKey.extractBytes(),
+        secretKey: SecretKey(kek),
+        nonce: _bytes(rng, _nonceLen),
+        aad: _provisionalAad);
+    kek.fillRange(0, kek.length, 0);
+    final OpenVault next = OpenVault(
+        v.header.withProvisional((
+          salt: salt,
+          nonce: box.nonce,
+          sealed: <int>[...box.cipherText, ...box.mac.bytes],
+        )),
+        v.contents,
+        v._dataKey);
+    return (await save(next, random: rng), next);
+  }
+
+  /// [v] without its provisional key: every `k`-subset rewrapped under a new
+  /// data key, C(n, k) derivations, so the retired key opens no later copy.
+  static Future<(Uint8List, OpenVault)> retireProvisional(
+    OpenVault v, {
+    VaultKdf derive = argon2idKdf,
+    Random? random,
+    void Function(int done, int total)? onProgress,
+  }) async {
+    final Random rng = random ?? Random.secure();
+    final SecretKey dataKey = SecretKey(_bytes(rng, keyLength));
+    final VaultHeader header = await _wrapAll(
+        slots: v.header.slots,
+        k: v.header.k,
+        kdf: v.header.kdf,
+        sentences: v.contents.sentences,
+        dataKey: dataKey,
+        derive: derive,
+        rng: rng,
+        previous: v.header.cards,
+        onProgress: onProgress);
+    final OpenVault next = OpenVault(header, v.contents, dataKey);
+    return (await save(next, random: rng), next);
+  }
+
+  /// Open [file] with its provisional [key]. Throws a [FormatException] when
+  /// it has none, or [key] is not it.
+  static Future<OpenVault> openWithKey(
+    Uint8List file,
+    Uint8List key, {
+    VaultKdf derive = argon2idKdf,
+  }) async {
+    const FormatException closed =
+        FormatException('This key does not open the vault.');
+    final (VaultHeader h, List<int> nonce, List<int> sealed) = _parse(file);
+    final KeyWrap? p = h.provisional;
+    if (p == null) throw closed;
+    final Uint8List password = _provisionalPassword(key);
+    final Uint8List kek =
+        await derive(password, Uint8List.fromList(p.salt), h.kdf);
+    password.fillRange(0, password.length, 0);
+    final List<int> plainKey;
+    try {
+      plainKey = await _aes.decrypt(
+          SecretBox(p.sealed.sublist(0, p.sealed.length - _tagLen),
+              nonce: p.nonce,
+              mac: Mac(p.sealed.sublist(p.sealed.length - _tagLen))),
+          secretKey: SecretKey(kek),
+          aad: _provisionalAad);
+    } on SecretBoxAuthenticationError {
+      throw closed;
+    } finally {
+      kek.fillRange(0, kek.length, 0);
+    }
+    final SecretKey dataKey = SecretKey(plainKey);
+    return OpenVault(
+        h, await _decryptContents(h, nonce, sealed, dataKey), dataKey);
+  }
+
+  static Uint8List _provisionalPassword(Uint8List key) => (BytesBuilder()
+        ..add(_provisionalTag)
+        ..add(key))
+      .toBytes();
 
   static Future<VaultHeader> _wrapAll({
     required List<VaultSlot> slots,
@@ -623,13 +759,25 @@ abstract final class PassVault {
           else
             throw bad,
       ];
+      final Object? prov = json['prov'];
+      final KeyWrap? p = switch (prov) {
+        null => null,
+        {
+          'salt': final String salt,
+          'nonce': final String nonce,
+          'key': final String key,
+        } =>
+          (salt: _unhex(salt), nonce: _unhex(nonce), sealed: base64Decode(key)),
+        _ => throw bad,
+      };
       return (
         VaultHeader(
             kdf: KdfParams.fromJson(json['kdf']),
             k: k,
             slots: s,
             wraps: w,
-            cards: _cardsOf(json['cards'])),
+            cards: _cardsOf(json['cards']),
+            provisional: p),
         _unhex(nonce),
         base64Decode(ct),
       );

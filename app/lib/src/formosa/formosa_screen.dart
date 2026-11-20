@@ -11,7 +11,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
-    show Clock, Grade, MemCard, MemSchedule;
+    show Clock, GraduationParams, Grade, MemCard, MemSchedule, failureChance;
 import 'package:dragon_dice_ui/dragon_dice_ui.dart'
     show DiceRolls, DragonDiceWizard, digestBits;
 import 'package:flutter/material.dart';
@@ -20,8 +20,10 @@ import 'package:formosa/formosa.dart' as formosa;
 import 'package:formosa_ui/formosa_ui.dart' show TableTab;
 
 import '../command/command_board.dart' show DeadGlyph, SweatGlyph;
-import '../setup/card_stats.dart' show dateText;
+import '../setup/card_stats.dart' show chanceText, dateText, durationText;
 import '../setup/fact_review.dart' show FactCheck, FactReviewFrame;
+import '../setup/provisional_key.dart';
+import '../setup/setup_crypto.dart' show SetupCrypto;
 import 'pass_vault.dart';
 
 /// The device's clock, for F4's cards.
@@ -34,6 +36,9 @@ class FormosaClock implements Clock {
 
 /// F4's schedule: SM-2 as the setup's cards, on the device's clock.
 const MemSchedule kFormosaSchedule = MemSchedule(FormosaClock());
+
+/// The graduation gate's target gap `T`, as the Great Wall's default.
+const Duration kFormosaGateGap = Duration(days: 7);
 
 /// Where the formosa package's themes are bundled.
 const String _kThemesAssets = 'packages/formosa/themes/';
@@ -66,6 +71,8 @@ class FormosaScreen extends StatefulWidget {
     this.derive = argon2idKdf,
     this.kdf = const KdfParams(),
     this.schedule = kFormosaSchedule,
+    this.gateGap = kFormosaGateGap,
+    this.epsilon = GraduationParams.defaultEpsilon,
   });
 
   /// The Formosa themes; loaded from the app's bundle when null.
@@ -81,6 +88,12 @@ class FormosaScreen extends StatefulWidget {
 
   /// The cards' schedule (the device's clock by default).
   final MemSchedule schedule;
+
+  /// The graduation gate: the provisional key may be retired once the chance
+  /// of recalling fewer than `k` sentences after [gateGap] is at most
+  /// [epsilon].
+  final Duration gateGap;
+  final double epsilon;
 
   @override
   State<FormosaScreen> createState() => _FormosaScreenState();
@@ -134,6 +147,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
   static const int _kDefaultStrength = 128;
 
   static const Duration _kClipboardClear = Duration(seconds: 30);
+  static const int _kByteValues = 256;
   static const double _kGap = 12;
   static const double _kWidth = 720;
   static const double _kDiceWidth = 860;
@@ -360,8 +374,18 @@ class _FormosaScreenState extends State<FormosaScreen> {
         _vault = v;
         _newSentences.clear();
         _view = _View.entries;
-        _status = 'Vault created: any $_k of its $_n sentences open it.';
+        _busy = 'Wrapping it for the provisional key…';
+        _progress = null;
       });
+      final Uint8List? key = await _newKey(SetupCrypto.keyLenBytes);
+      if (!mounted) return;
+      setState(() {
+        _busy = null;
+        _status = 'Vault created: any $_k of its $_n sentences open it'
+            '${key == null ? '.' : ', and the provisional key alone until '
+                'you retire it.'}';
+      });
+      if (key != null) await _showKey(key);
     } on Object catch (e) {
       _say('Could not create the vault: $e');
     } finally {
@@ -652,17 +676,191 @@ class _FormosaScreenState extends State<FormosaScreen> {
         '${next.due == null ? '' : ' Next review ${dateText(next.due!)}.'}');
   }
 
-  Future<void> _copy(VaultEntry e) async {
-    await Clipboard.setData(ClipboardData(text: e.secret));
+  Future<void> _copy(VaultEntry e) => _copyText(e.secret, e.label);
+
+  /// [text] to the clipboard, blind, cleared after [_kClipboardClear] unless
+  /// something else was copied since.
+  Future<void> _copyText(String text, String what) async {
+    await Clipboard.setData(ClipboardData(text: text));
     _clipTimer?.cancel();
     _clipTimer = Timer(_kClipboardClear, () async {
       final ClipboardData? now = await Clipboard.getData(Clipboard.kTextPlain);
-      if (now?.text == e.secret) {
+      if (now?.text == text) {
         await Clipboard.setData(const ClipboardData(text: ''));
       }
     });
-    _say('${e.label}: copied. The clipboard is not air-gapped; it is cleared '
-        'in ${_kClipboardClear.inSeconds} s.');
+    _say('$what: copied. The clipboard is not air-gapped; it is cleared in '
+        '${_kClipboardClear.inSeconds} s.');
+  }
+
+  // --- the provisional key ------------------------------------------------------
+
+  /// The open vault wrapped for a fresh random key of [lenBytes] bytes:
+  /// the key, or null (and why, in the status) if that failed.
+  Future<Uint8List?> _newKey(int lenBytes) async {
+    final ({String? error, Uint8List? key}) r =
+        await _resealKey(newLen: lenBytes);
+    if (r.error != null) _say(r.error!);
+    return r.key;
+  }
+
+  /// The open vault wrapped for [ownKey] (copied: the caller wipes its own),
+  /// or for a fresh random key of [newLen] bytes; written at once.
+  Future<({String? error, Uint8List? key})> _resealKey(
+      {Uint8List? ownKey, required int newLen}) async {
+    final OpenVault? v = _vault;
+    if (v == null) return (error: 'The vault is locked.', key: null);
+    final Random rng = Random.secure();
+    final Uint8List key = ownKey == null
+        ? Uint8List.fromList(
+            List<int>.generate(newLen, (_) => rng.nextInt(_kByteValues)))
+        : Uint8List.fromList(ownKey);
+    try {
+      final (Uint8List file, OpenVault next) =
+          await PassVault.addProvisional(v, key, derive: widget.derive);
+      await _write(file);
+      if (mounted) setState(() => _vault = next);
+      return (error: null, key: key);
+    } on Object catch (e) {
+      wipeKey(key);
+      return (error: 'Could not save: $e', key: null);
+    }
+  }
+
+  /// The key dialog (shared with the Great Wall) for [key], which already
+  /// opens the vault; it wipes [key] on close.
+  Future<void> _showKey(Uint8List key) => showKeyDialog(
+        context,
+        key: key,
+        reseal: _resealKey,
+        sealed: 'this vault',
+        intro: 'Saved. Keep the key OFFLINE: until you retire it at '
+            'graduation it opens this vault alone, without the sentences. '
+            'Then destroy it (shred / burn).',
+        voice: KeyVoice(toast: _say),
+        copy: (String hex, int bits) =>
+            unawaited(_copyText(hex, 'The $bits-bit provisional key')),
+      );
+
+  /// A provisional key for a vault that has none (it was retired).
+  Future<void> _addKey() async {
+    setState(() => _busy = 'Wrapping it for a provisional key…');
+    final Uint8List? key = await _newKey(SetupCrypto.keyLenBytes);
+    if (!mounted) return;
+    setState(() => _busy = null);
+    if (key == null) return;
+    _say('A provisional key: it opens the vault alone until you retire it.');
+    await _showKey(key);
+  }
+
+  /// The graduation gate for [h] at now + `T`: the chance of recalling fewer
+  /// than `k` of its sentences, each by its forgetting curve (one never
+  /// graded counts as forgotten), and whether it is at most `ε`.
+  ({double failure, bool passes}) _gate(VaultHeader h) {
+    final MemSchedule schedule = widget.schedule;
+    final DateTime at = schedule.clock.now().add(widget.gateGap);
+    final double failure = failureChance(<double>[
+      for (final VaultSlot s in h.slots)
+        if (h.cardOf(s.id) case final MemCard c when c.isGraded)
+          schedule.recall(c, at) ?? 0
+        else
+          0,
+    ], h.k);
+    return (failure: failure, passes: failure <= widget.epsilon);
+  }
+
+  /// Retire the provisional key, at the green light: a confirmation, then
+  /// every `k`-subset rewrapped under a new data key.
+  Future<void> _retireKey() async {
+    final OpenVault v = _vault!;
+    final VaultHeader h = v.header;
+    final int wraps =
+        PassVault.subsets(<int>[for (final VaultSlot s in h.slots) s.id], h.k)
+            .length;
+    final bool? go = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => AlertDialog(
+        title: const Text('Retire the provisional key'),
+        content: SizedBox(
+          width: _kWidth,
+          child: Text('Green light: after ${durationText(widget.gateGap)}, '
+              '${chanceText(_gate(h).failure)} chance of recalling fewer than '
+              '${h.k} of the ${h.n} sentences.\n\n'
+              'From now on only ${h.k} sentences open the vault. It is '
+              'rewrapped under a new data key ($wraps derivations), so the key '
+              'opens no later copy — but a backup of an earlier copy still '
+              'opens with it. Destroy every copy of the key (shred / burn), and '
+              'every earlier copy of the vault you do not need.'),
+        ),
+        actions: <Widget>[
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Retire it')),
+        ],
+      ),
+    );
+    if (go != true || !mounted) return;
+    setState(() {
+      _busy = 'Rewrapping for every ${h.k} of ${h.n} sentences under a new '
+          'data key…';
+      _progress = 0;
+    });
+    try {
+      final (Uint8List file, OpenVault next) =
+          await PassVault.retireProvisional(v, derive: widget.derive,
+              onProgress: (int d, int t) {
+        if (mounted) setState(() => _progress = d / t);
+      });
+      await _write(file);
+      if (!mounted) return;
+      setState(() {
+        _vault = next;
+        _status = 'Provisional key retired: only ${h.k} of the ${h.n} '
+            'sentences open the vault now. Destroy every copy of the key.';
+      });
+    } on Object catch (e) {
+      _say('Could not retire the key: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = null;
+          _progress = null;
+        });
+      }
+    }
+  }
+
+  /// Open the vault with its provisional key, scanned or typed: nothing is
+  /// graded.
+  Future<void> _unlockWithKey() async {
+    final Uint8List? key = await showDialog<Uint8List>(
+      context: context,
+      builder: (BuildContext _) => const _KeyEntryDialog(),
+    );
+    if (key == null || !mounted) return;
+    setState(() {
+      _busy = 'Opening with the provisional key…';
+      _progress = null;
+    });
+    try {
+      final OpenVault v =
+          await PassVault.openWithKey(_file!, key, derive: widget.derive);
+      if (!mounted) return;
+      setState(() {
+        _vault = v;
+        _clearInputs();
+        _view = _View.entries;
+        _status = 'Open with the provisional key: no sentence is graded.';
+      });
+    } on FormatException {
+      _say('This key does not open the vault.');
+    } finally {
+      wipeKey(key);
+      if (mounted) setState(() => _busy = null);
+    }
   }
 
   Future<void> _remove(VaultEntry e) async {
@@ -981,6 +1179,10 @@ class _FormosaScreenState extends State<FormosaScreen> {
             FilledButton(
                 onPressed: _busy == null ? _unlock : null,
                 child: const Text('Open')),
+            if (h.provisional != null)
+              OutlinedButton(
+                  onPressed: _busy == null ? _unlockWithKey : null,
+                  child: const Text('Open with the provisional key…')),
             TextButton(
                 onPressed: _busy == null ? _lock : null,
                 child: const Text('Cancel')),
@@ -1051,6 +1253,38 @@ class _FormosaScreenState extends State<FormosaScreen> {
         ),
         const Divider(height: _kGap * 3),
         _sentencesPanel(v),
+        const Divider(height: _kGap * 3),
+        _keyPanel(v),
+      ],
+    );
+  }
+
+  /// The provisional key and the graduation gate that retires it.
+  Widget _keyPanel(OpenVault v) {
+    final VaultHeader h = v.header;
+    final ({double failure, bool passes}) g = _gate(h);
+    final bool kept = h.provisional != null;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        Text('Graduation: after ${durationText(widget.gateGap)}, '
+            '${chanceText(g.failure)} chance of recalling fewer than ${h.k} of '
+            'the ${h.n} sentences (ε ${chanceText(widget.epsilon)}): '
+            '${g.passes ? 'green light' : 'not yet'}.'),
+        Text(kept
+            ? 'The provisional key opens the vault alone, until you retire it.'
+            : 'No provisional key: only ${h.k} sentences open the vault.'),
+        const SizedBox(height: _kGap / 2),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: kept
+              ? OutlinedButton(
+                  onPressed: _busy == null && g.passes ? _retireKey : null,
+                  child: const Text('Retire the provisional key…'))
+              : OutlinedButton(
+                  onPressed: _busy == null ? _addKey : null,
+                  child: const Text('Add a provisional key…')),
+        ),
       ],
     );
   }
@@ -1405,4 +1639,84 @@ class _GradeSentencesDialogState extends State<_GradeSentencesDialog> {
       ],
     );
   }
+}
+
+/// The provisional key, to open the vault: scanned from its QR (the Great
+/// Wall's serves too), or typed as 32 or 64 hex digits.
+class _KeyEntryDialog extends StatefulWidget {
+  const _KeyEntryDialog();
+
+  @override
+  State<_KeyEntryDialog> createState() => _KeyEntryDialogState();
+}
+
+class _KeyEntryDialogState extends State<_KeyEntryDialog> {
+  final TextEditingController _hex = TextEditingController();
+  String? _error;
+
+  @override
+  void dispose() {
+    _hex.dispose();
+    super.dispose();
+  }
+
+  Future<void> _scan() async {
+    final Uint8List? k = await scanKey(context);
+    if (k == null || !mounted) return;
+    if (!SetupCrypto.isValidKeyLen(k.length)) {
+      wipeKey(k);
+      setState(() => _error = 'That QR is not a valid provisional key.');
+      return;
+    }
+    Navigator.of(context).pop(k);
+  }
+
+  void _typed() {
+    try {
+      final Uint8List k = SetupCrypto.hexToKey(_hex.text);
+      _hex.clear();
+      Navigator.of(context).pop(k);
+    } on FormatException catch (e) {
+      setState(() => _error = e.message);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: const Text('Open with the provisional key'),
+        content: SizedBox(
+          width: _FormosaScreenState._kWidth,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              TextField(
+                controller: _hex,
+                obscureText: true,
+                autocorrect: false,
+                enableSuggestions: false,
+                onSubmitted: (_) => _typed(),
+                decoration: InputDecoration(
+                  isDense: true,
+                  border: const OutlineInputBorder(),
+                  labelText: 'Key — 32 or 64 hex digits',
+                  errorText: _error,
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: <Widget>[
+          if (keyScanSupported)
+            TextButton.icon(
+              onPressed: _scan,
+              icon: const Icon(Icons.qr_code_scanner),
+              label: const Text('Scan'),
+            ),
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel')),
+          FilledButton(onPressed: _typed, child: const Text('Open')),
+        ],
+      );
 }
