@@ -55,6 +55,7 @@ import 'orbit_vault.dart';
 import 'key_qr_painter.dart';
 import 'qr_layout.dart';
 import 'setup_crypto.dart';
+import 'stage0_bundle.dart';
 
 /// Setup mode screen: build an orbit setup — place points on each stage's
 /// maps, advance between stages, and memorise them.
@@ -3801,7 +3802,7 @@ press.calibrate.target    tick_soft.wav
                         wipe = true;
                         Navigator.of(ctx).pop();
                       }),
-                      child: const Text('Wipe the setup file…'),
+                      child: const Text('Retire the provisional key…'),
                     ),
                   TextButton(
                     onPressed: _press(
@@ -3827,7 +3828,7 @@ press.calibrate.target    tick_soft.wav
       gapInput.dispose();
       epsInput.dispose();
     }));
-    if (wipe && mounted) await _wipeWizard();
+    if (wipe && mounted) await _retireKey();
   }
 
   /// ε is entered and shown as a percentage.
@@ -6587,6 +6588,171 @@ press.calibrate.target    tick_soft.wav
   /// The wipe wizard (Main board V): one button, pressed [_kWipePresses]
   /// times, a counter showing the presses left; Esc or Cancel leaves nothing
   /// done. Then [_wipe].
+  /// Space between the retirement dialog's parts.
+  static const double _kRetireGap = 12;
+
+  /// Retire the provisional key (Graduation's green light): seal stage 0's
+  /// bundle — σ and stage 0's card records under `Sh₀`, hardened by the
+  /// bundle's own `D` passes at `m` ([Stage0Bundle]) — next to the setup file,
+  /// then wipe the setup file. `m` defaults to the setup's profile, `D` to
+  /// about two minutes; both are yours to set, and are stored in the clear.
+  Future<void> _retireKey() async {
+    final Uint8List? o0 = _stageOrbit(0);
+    final Uint8List? sh = _stageShBytes(0);
+    if (o0 == null || sh == null) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Stage 0 needs σ and its points to seal its bundle.');
+      return;
+    }
+    final String setupPath = _vaultPath.text.trim();
+    final TextEditingController pathInput = TextEditingController(
+        text: setupPath.isEmpty ? '' : '$setupPath$kStage0Suffix');
+    final TextEditingController passesInput = TextEditingController(
+        text: _passSeconds == null
+            ? ''
+            : '${Stage0Bundle.defaultPasses(_passSeconds!)}');
+    Argon2Profile profile = _profile;
+    final DialogRoute<bool> route = DialogRoute<bool>(
+      context: context,
+      builder: (BuildContext ctx) => StatefulBuilder(
+        builder: (BuildContext ctx, void Function(void Function()) setLocal) =>
+            AlertDialog(
+          title: const Text('Retire the provisional key'),
+          content: SizedBox(
+            width: _kGraduationWidth,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  const Text(
+                    'First stage 0\'s bundle is sealed: σ and stage 0\'s card '
+                    'records, under stage 0\'s points hardened by D Argon2 '
+                    'passes at profile m. Its maps ride in the clear, so stage '
+                    '0 trains from it without the key, and gives σ back if you '
+                    'forget it. Then the setup file is wiped.',
+                  ),
+                  const SizedBox(height: _kRetireGap),
+                  Wrap(
+                    spacing: _kRetireGap / 2,
+                    children: <Widget>[
+                      for (int i = 0; i < _profiles.length; i++)
+                        ChoiceChip(
+                          label: Text('m: ${_profileLabels[i]}'),
+                          selected: profile == _profiles[i],
+                          onSelected: (_) => setLocal(() {
+                            profile = _profiles[i];
+                            final double? s = _passSeconds;
+                            passesInput.text = profile == _profile && s != null
+                                ? '${Stage0Bundle.defaultPasses(s)}'
+                                : '';
+                          }),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: _kRetireGap),
+                  TextField(
+                    controller: passesInput,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: <TextInputFormatter>[
+                      FilteringTextInputFormatter.digitsOnly,
+                    ],
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                      labelText: 'D (passes)',
+                      hintText: 'empty: about 2 minutes, timed first',
+                    ),
+                  ),
+                  const SizedBox(height: _kRetireGap),
+                  TextField(
+                    controller: pathInput,
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                      labelText: 'Stage 0 bundle file',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Seal stage 0'),
+            ),
+          ],
+        ),
+      ),
+    );
+    final bool go = await _dialog(
+            _Cue.graduation, () => Navigator.of(context).push(route)) ??
+        false;
+    final String path = pathInput.text.trim();
+    int? passes = int.tryParse(passesInput.text.trim());
+    // The fields are still drawn while the dialog animates out.
+    unawaited(route.completed.whenComplete(() {
+      pathInput.dispose();
+      passesInput.dispose();
+    }));
+    if (!go || !mounted) {
+      sh.fillRange(0, sh.length, 0);
+      return;
+    }
+    if (path.isEmpty) {
+      sh.fillRange(0, sh.length, 0);
+      _toast('Stage 0\'s bundle needs a file path.');
+      return;
+    }
+    try {
+      if (passes == null || passes < 1) {
+        _toast('Timing one Argon2 pass at that profile…');
+        passes = Stage0Bundle.defaultPasses(
+            await widget.core.benchArgon2(profile: profile, passes: 1));
+      }
+      final int d = passes;
+      _toast('Sealing stage 0: $d passes…');
+      final Uint8List file = await Stage0Bundle.seal(
+        contents: Stage0Contents(
+          sigma: _sigmaCtrl.text.trim().replaceAll(RegExp(r'\s'), ''),
+          cards: <MemCard>[
+            for (final MemCard c in _trainCards)
+              if (c.stageIndex == 0) c,
+            for (final MemCard c in _deck?.cards ?? const <MemCard>[])
+              if (c.factId == selectionFact(0)) c,
+          ],
+          studied: (_studied[0] ?? const <int>{}).toList()..sort(),
+        ),
+        shBytes: sh,
+        profile: profile,
+        passes: d,
+        theta: <Uint8List>[
+          for (int j = 0; j < kMapsPerStage; j++) widget.core.theta(o0, j),
+        ],
+        harden: (Uint8List input, Argon2Profile p, int n) =>
+            widget.core.hardenKey(input, profile: p, passes: n),
+      );
+      final File tmp = File('$path.tmp');
+      await tmp.writeAsBytes(file, flush: true);
+      await tmp.rename(path);
+      if (!mounted) return;
+      _toast('Stage 0\'s bundle sealed at $path (m '
+          '${_profileLabels[_profiles.indexOf(profile)]}, D $d).');
+    } on Object catch (e) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Could not seal stage 0\'s bundle: $e. Nothing was wiped.');
+      return;
+    } finally {
+      sh.fillRange(0, sh.length, 0);
+    }
+    await _wipeWizard();
+  }
+
   Future<void> _wipeWizard() async {
     final String path = _vaultPath.text.trim();
     int left = _kWipePresses;

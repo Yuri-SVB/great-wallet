@@ -789,6 +789,41 @@ class GreatWallCore {
     return Argon2BenchJob(completer.future, cancel);
   }
 
+  /// A key hardened like the orbit's `H*`: [passes] Argon2d passes at
+  /// [profile] over [input], each pass fed the previous digest, in a worker
+  /// isolate. Returns the [kOrbitPointLen]-byte digest. [onProgress] is called
+  /// `(done, passes)` after each pass. Used by stage 0's bundle, whose key is
+  /// its polynomial hardened this way.
+  Future<Uint8List> hardenKey(
+    Uint8List input, {
+    required Argon2Profile profile,
+    required int passes,
+    void Function(int done, int total)? onProgress,
+  }) async {
+    final ReceivePort port = ReceivePort();
+    final Completer<Uint8List> completer = Completer<Uint8List>();
+    await Isolate.spawn<(SendPort, Uint8List, int, int)>(
+      _hardenKeyIsolateEntry,
+      (port.sendPort, input, profile.value, passes < 1 ? 1 : passes),
+      onError: port.sendPort,
+      errorsAreFatal: true,
+    );
+    port.listen((dynamic msg) {
+      if (msg is (int, int)) {
+        onProgress?.call(msg.$1, msg.$2);
+      } else if (msg is Uint8List) {
+        if (!completer.isCompleted) completer.complete(msg);
+        port.close();
+      } else {
+        if (!completer.isCompleted) {
+          completer.completeError(StateError('hardening failed'));
+        }
+        port.close();
+      }
+    });
+    return completer.future;
+  }
+
   /// Convenience wrapper: run a benchmark and await its result (not cancellable).
   Future<double> benchArgon2({
     Argon2Profile profile = Argon2Profile.basic,
@@ -798,6 +833,22 @@ class GreatWallCore {
         await startBenchArgon2(profile: profile, passes: passes);
     return job.result;
   }
+}
+
+/// Worker-isolate entry for [GreatWallCore.hardenKey]: [passes] Argon2d passes,
+/// each over the previous digest, reporting `(done, passes)` after each.
+void _hardenKeyIsolateEntry((SendPort, Uint8List, int, int) args) {
+  final (SendPort send, Uint8List input, int profileValue, int passes) = args;
+  final Argon2Profile profile = Argon2Profile.values[profileValue];
+  final GreatWallCoreBindings bindings = GreatWallCoreBindings.open();
+  Uint8List x = input;
+  for (int i = 0; i < passes; i++) {
+    final Uint8List next = bindings.orbitArgon2Single(x, profile);
+    if (!identical(x, input)) x.fillRange(0, x.length, 0);
+    x = next;
+    send.send((i + 1, passes));
+  }
+  send.send(x);
 }
 
 /// Worker-isolate entry: open the engine, run one untimed warm-up pass, then
