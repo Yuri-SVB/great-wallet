@@ -139,9 +139,13 @@ class _FormosaScreenState extends State<FormosaScreen> {
   final Map<int, TextEditingController> _inputs =
       <int, TextEditingController>{};
 
-  // The open vault.
+  // The open vault, the entries whose secret is shown, and the selection:
+  // the folder (null: all), the entry and the sentence.
   OpenVault? _vault;
   final Set<String> _shown = <String>{};
+  String? _folder;
+  String? _selected;
+  int? _selectedSlot;
 
   // Entries held to copy into another vault, and the file they are from: in
   // memory only, across a lock, until pasted or discarded.
@@ -171,6 +175,12 @@ class _FormosaScreenState extends State<FormosaScreen> {
   static const int _kByteValues = 256;
   static const int _kLogLines = 50;
   static const double _kPanelPadding = 8;
+  static const double _kFolderPaneWidth = 220;
+  static const double _kDetailPaneWidth = 360;
+  static const double _kFolderIndent = 12;
+  static const double _kFormWidth = 1000;
+  static const double _kSlotLabelWidth = 90;
+  static const double _kThemeWidth = 170;
   static const double _kPercentScale = 100;
   static const double _kGateFieldWidth = 160;
   static const double _kGap = 12;
@@ -283,6 +293,9 @@ class _FormosaScreenState extends State<FormosaScreen> {
       _clearInputs();
       _view = _View.start;
       _context = CommandContext.vault;
+      _folder = null;
+      _selected = null;
+      _selectedSlot = null;
       _status = 'Locked.';
     });
   }
@@ -1040,6 +1053,59 @@ class _FormosaScreenState extends State<FormosaScreen> {
   bool get _canPaste =>
       _view == _View.entries && _heldFrom != _path.text.trim();
 
+  // --- the selection ------------------------------------------------------------
+
+  /// The folder shown: the one picked while it still exists, else all.
+  String? get _shownFolder => _folders().contains(_folder) ? _folder : null;
+
+  /// The entries in the folder shown (and its subfolders), by folder, then
+  /// label.
+  List<VaultEntry> _listed() {
+    final String? f = _shownFolder;
+    return <VaultEntry>[
+      for (final VaultEntry e in _vault!.contents.entries)
+        if (f == null || e.folder == f || e.folder.startsWith('$f/')) e,
+    ]..sort((VaultEntry a, VaultEntry b) => a.folder == b.folder
+        ? a.label.compareTo(b.label)
+        : a.folder.compareTo(b.folder));
+  }
+
+  /// The entry selected: the one picked while it is listed, else the first.
+  VaultEntry? get _current {
+    final List<VaultEntry> listed = _listed();
+    for (final VaultEntry e in listed) {
+      if (e.id == _selected) return e;
+    }
+    return listed.firstOrNull;
+  }
+
+  /// The sentence selected: the one picked while it lives, else the first.
+  VaultSlot? get _currentSlot {
+    final List<VaultSlot> slots = _vault!.header.slots;
+    for (final VaultSlot s in slots) {
+      if (s.id == _selectedSlot) return s;
+    }
+    return slots.firstOrNull;
+  }
+
+  /// The selection moved by [delta] in the context's list (arrow keys).
+  void _move(int delta) {
+    if (_vault == null) return;
+    setState(() {
+      if (_context == CommandContext.entries) {
+        final List<VaultEntry> l = _listed();
+        final VaultEntry? c = _current;
+        if (c == null) return;
+        _selected = l[(l.indexOf(c) + delta).clamp(0, l.length - 1)].id;
+      } else if (_context == CommandContext.sentences) {
+        final List<VaultSlot> l = _vault!.header.slots;
+        final VaultSlot? c = _currentSlot;
+        if (c == null) return;
+        _selectedSlot = l[(l.indexOf(c) + delta).clamp(0, l.length - 1)].id;
+      }
+    });
+  }
+
   /// The entry dialog, for [entry] (edited) or a new one.
   Future<VaultEntry?> _entryDialog([VaultEntry? entry]) =>
       showDialog<VaultEntry>(
@@ -1070,7 +1136,10 @@ class _FormosaScreenState extends State<FormosaScreen> {
   Future<void> _addEntry() async {
     final VaultEntry? e = await _entryDialog();
     if (e == null || !mounted) return;
-    setState(() => _vault!.contents.entries.add(e));
+    setState(() {
+      _vault!.contents.entries.add(e);
+      _selected = e.id;
+    });
     await _save();
     _say('${e.label}: added.');
   }
@@ -1117,6 +1186,12 @@ class _FormosaScreenState extends State<FormosaScreen> {
     }
     if (key == LogicalKeyboardKey.escape) {
       _root.requestFocus(); // out of any field: the board's keys again
+      return KeyEventResult.handled;
+    }
+    if (!_typing &&
+        (key == LogicalKeyboardKey.arrowUp ||
+            key == LogicalKeyboardKey.arrowDown)) {
+      _move(key == LogicalKeyboardKey.arrowUp ? -1 : 1);
       return KeyEventResult.handled;
     }
     final KeyEventResult board = _boardKey(e);
@@ -1230,13 +1305,59 @@ class _FormosaScreenState extends State<FormosaScreen> {
             'A key that opens the vault alone, until you retire it.', _addKey,
             enabled: open && v.header.provisional == null);
       case CommandContext.entries:
+        final VaultEntry? e = v == null ? null : _current;
+        final bool on = open && e != null;
         put(0, 'Add entry', Icons.add,
             'A new entry: label, login, folder, secret and note.', _addEntry,
             enabled: open);
-        put(1, 'Paste held entries', Icons.move_to_inbox,
+        put(
+            1,
+            'Edit entry',
+            Icons.edit_outlined,
+            'Edits the entry selected; a new secret starts its card afresh.',
+            () => _editEntry(e!),
+            enabled: on);
+        put(2, 'Copy secret', Icons.copy,
+            'Copies its secret, blind; cleared in 30 s.', () => _copy(e!),
+            enabled: on);
+        put(
+            3,
+            'Copy login',
+            Icons.person_outline,
+            'Copies its login, blind; cleared in 30 s.',
+            () => _copyText(e!.login, '${e.label}\'s login'),
+            enabled: on && e.login.isNotEmpty);
+        b[4] = BoardCommand(
+            name: 'Show secret',
+            help: 'Shows or hides its secret on screen.',
+            icon: Icons.visibility_outlined,
+            active: e != null && _shown.contains(e.id),
+            enabled: on,
+            run: () => setState(() => _shown.contains(e!.id)
+                ? _shown.remove(e.id)
+                : _shown.add(e.id)));
+        b[5] = BoardCommand(
+            name: 'Memorise',
+            help: 'Gives it a CPNF card, reviewed through Next due; again, '
+                'drops it.',
+            icon: Icons.school_outlined,
+            active: e != null && _entryCard(e) != null,
+            enabled: on,
+            run: () => _toggleMemorise(e!));
+        b[6] = BoardCommand(
+            name: 'Hold to copy',
+            help: 'Holds it to paste into another vault; again, lets it go.',
+            icon: Icons.outbox_outlined,
+            active: e != null && _isHeld(e),
+            enabled: on,
+            run: () => _toggleHold(e!));
+        put(7, 'Remove entry', Icons.delete_outline,
+            'Removes the entry selected, and its card.', () => _remove(e!),
+            enabled: on);
+        put(8, 'Paste held entries', Icons.move_to_inbox,
             'Copies the held entries into this vault.', _paste,
             enabled: open && _held.isNotEmpty && _canPaste);
-        put(2, 'Discard held entries', Icons.clear_all,
+        put(9, 'Discard held entries', Icons.clear_all,
             'Lets the held entries go.', () => setState(_discardHeld),
             enabled: _held.isNotEmpty);
       case CommandContext.sentences:
@@ -1257,6 +1378,15 @@ class _FormosaScreenState extends State<FormosaScreen> {
         put(2, 'Keep the new sentence, and rewrap', Icons.save_outlined,
             'Adds the new sentence: every k of n is wrapped anew.', _keepAdded,
             enabled: open && _added != null);
+        final VaultSlot? s = v == null ? null : _currentSlot;
+        put(
+            3,
+            'Retire the sentence',
+            Icons.remove_circle_outline,
+            'Retires the sentence selected: every k of the rest is wrapped '
+                'anew.',
+            () => _retire(s!),
+            enabled: open && s != null && v.header.n > v.header.k);
       default: // the setup's contexts
     }
     return b;
@@ -1359,33 +1489,38 @@ class _FormosaScreenState extends State<FormosaScreen> {
                 _ => _entriesView(),
               },
           };
+    final Widget main =
+        _view == _View.entries && _context != CommandContext.vault
+            ? body
+            : Align(
+                alignment: Alignment.topCenter,
+                child: SizedBox(
+                  width: _kFormWidth,
+                  // A form scrolls only in a window too small for it.
+                  child: SingleChildScrollView(child: body),
+                ),
+              );
     return Focus(
       focusNode: _root,
       autofocus: true,
       onKeyEvent: _onKey,
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(_kGap * 2, _kGap, _kGap * 2, 0),
+            child: Text(
+                _held.isEmpty
+                    ? 'Formosa — passwords'
+                    : 'Formosa — passwords · ${_entriesText(_held.length)} '
+                        'held to copy into another vault, in memory only: '
+                        'lock, open the other vault, then paste (Entries).',
+                style: Theme.of(context).textTheme.titleMedium),
+          ),
           Expanded(
-            child: Align(
-              alignment: Alignment.topCenter,
-              child: SizedBox(
-                width: _kWidth,
-                child: ListView(
-                  padding: const EdgeInsets.all(_kGap * 2),
-                  children: <Widget>[
-                    Text('Formosa — passwords',
-                        style: Theme.of(context).textTheme.titleLarge),
-                    const SizedBox(height: _kGap),
-                    body,
-                    if (_held.isNotEmpty) ...<Widget>[
-                      const SizedBox(height: _kGap),
-                      Text('${_entriesText(_held.length)} held to copy into '
-                          'another vault, in memory only: lock, open the other '
-                          'vault, then paste (Entries).'),
-                    ],
-                  ],
-                ),
-              ),
+            child: Padding(
+              padding: const EdgeInsets.all(_kGap * 2),
+              child: main,
             ),
           ),
           _panel(),
@@ -1463,41 +1598,45 @@ class _FormosaScreenState extends State<FormosaScreen> {
         ],
       );
 
+  /// Sentence [id] of a new vault, on one line: its theme, a draw from
+  /// system randomness or Dragon Dice, and the sentence drawn.
   Widget _newSlotRow(int id) {
     final List<int>? bits = _newSentences[id];
     final formosa.Mnemonic m = _themes![_slotThemes[id]!];
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: _kGap / 2),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          Wrap(
-            spacing: _kGap,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: <Widget>[
-              Text('Sentence $id'),
-              DropdownButton<String>(
-                value: _slotThemes[id],
-                items: <DropdownMenuItem<String>>[
-                  for (final String t in _sentenceThemes)
-                    DropdownMenuItem<String>(value: t, child: Text(t)),
-                ],
-                onChanged: (String? t) => setState(() {
-                  _slotThemes[id] = t!;
-                  _newSentences.remove(id);
-                }),
-              ),
-              TextButton(
-                  onPressed: () => _generate(id, dice: false),
-                  child: const Text('System random')),
-              TextButton(
-                  onPressed: () => _generate(id, dice: true),
-                  child: const Text('Dragon Dice')),
+    return Row(
+      children: <Widget>[
+        SizedBox(width: _kSlotLabelWidth, child: Text('Sentence $id')),
+        SizedBox(
+          width: _kThemeWidth,
+          child: DropdownButton<String>(
+            isExpanded: true,
+            isDense: true,
+            value: _slotThemes[id],
+            items: <DropdownMenuItem<String>>[
+              for (final String t in _sentenceThemes)
+                DropdownMenuItem<String>(
+                    value: t, child: Text(t, overflow: TextOverflow.ellipsis)),
             ],
+            onChanged: (String? t) => setState(() {
+              _slotThemes[id] = t!;
+              _newSentences.remove(id);
+            }),
           ),
-          if (bits != null) SelectableText(m.toRawSentence(bits)),
-        ],
-      ),
+        ),
+        IconButton(
+            tooltip: 'System random',
+            onPressed: () => _generate(id, dice: false),
+            icon: const Icon(Icons.casino_outlined)),
+        IconButton(
+            tooltip: 'Dragon Dice',
+            onPressed: () => _generate(id, dice: true),
+            icon: const Icon(Icons.casino)),
+        Expanded(
+          child: bits == null
+              ? const SizedBox.shrink()
+              : SelectableText(m.toRawSentence(bits)),
+        ),
+      ],
     );
   }
 
@@ -1618,77 +1757,88 @@ class _FormosaScreenState extends State<FormosaScreen> {
         ),
       );
 
+  /// Three panes: the folders, the entries listed, the entry selected.
   Widget _entriesView() {
     final OpenVault v = _vault!;
-    return Column(
+    final String? folder = _shownFolder;
+    final VaultEntry? current = _current;
+    Widget folderTile(String? f) => ListTile(
+          dense: true,
+          selected: f == folder,
+          contentPadding: EdgeInsets.only(
+              left: f == null
+                  ? 0
+                  : _kFolderIndent * ('/'.allMatches(f).length + 1)),
+          leading: Icon(f == null ? Icons.folder_special : Icons.folder),
+          title: Text(f == null ? 'All entries' : f.split('/').last),
+          onTap: () => setState(() => _folder = f),
+        );
+    return Row(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        Text('${_entriesText(v.contents.entries.length)} · any '
-            '${v.header.k} of ${v.header.n} sentences open it.'),
-        for (final VaultEntry e in List<VaultEntry>.of(v.contents.entries)
-          ..sort((VaultEntry a, VaultEntry b) => a.folder == b.folder
-              ? a.label.compareTo(b.label)
-              : a.folder.compareTo(b.folder)))
-          ListTile(
-            contentPadding: EdgeInsets.zero,
-            title: Text(e.label),
-            subtitle: Text(<String>[
-              if (e.folder.isNotEmpty) 'in ${e.folder}',
-              if (e.login.isNotEmpty) e.login,
-              _shown.contains(e.id) ? e.secret : '••••••••',
-              if (e.note.isNotEmpty) e.note,
-            ].join('\n')),
-            trailing: Wrap(
-              children: <Widget>[
-                if (e.login.isNotEmpty)
-                  IconButton(
-                    tooltip: 'Copy login',
-                    onPressed: () => _copyText(e.login, '${e.label}\'s login'),
-                    icon: const Icon(Icons.person_outline),
-                  ),
-                IconButton(
-                  tooltip: 'Copy',
-                  onPressed: () => _copy(e),
-                  icon: const Icon(Icons.copy),
-                ),
-                IconButton(
-                  tooltip: 'Edit',
-                  onPressed: () => _editEntry(e),
-                  icon: const Icon(Icons.edit_outlined),
-                ),
-                IconButton(
-                  tooltip: _shown.contains(e.id) ? 'Hide' : 'Show',
-                  onPressed: () => setState(() => _shown.contains(e.id)
-                      ? _shown.remove(e.id)
-                      : _shown.add(e.id)),
-                  icon: Icon(_shown.contains(e.id)
-                      ? Icons.visibility_off
-                      : Icons.visibility),
-                ),
-                IconButton(
-                  tooltip: _entryCard(e) == null
-                      ? 'Memorise it (a CPNF card)'
-                      : 'Memorised: stop reviewing it',
-                  onPressed: () => _toggleMemorise(e),
-                  icon: Icon(_entryCard(e) == null
-                      ? Icons.school_outlined
-                      : Icons.school),
-                ),
-                IconButton(
-                  tooltip: _isHeld(e)
-                      ? 'Held: let it go'
-                      : 'Hold to copy into another vault',
-                  onPressed: () => _toggleHold(e),
-                  icon: Icon(_isHeld(e) ? Icons.outbox : Icons.outbox_outlined),
-                ),
-                IconButton(
-                  tooltip: 'Remove',
-                  onPressed: () => _remove(e),
-                  icon: const Icon(Icons.delete_outline),
-                ),
-              ],
-            ),
+        SizedBox(
+          width: _kFolderPaneWidth,
+          child: ListView(
+            children: <Widget>[
+              folderTile(null),
+              for (final String f in _folders()) folderTile(f),
+            ],
           ),
+        ),
+        const VerticalDivider(width: _kGap * 2),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Text('${_entriesText(v.contents.entries.length)} · any '
+                  '${v.header.k} of ${v.header.n} sentences open it.'),
+              Expanded(
+                child: ListView(
+                  children: <Widget>[
+                    for (final VaultEntry e in _listed())
+                      ListTile(
+                        dense: true,
+                        selected: e.id == current?.id,
+                        title: Text(e.label),
+                        subtitle: Text(<String>[
+                          if (folder == null && e.folder.isNotEmpty)
+                            'in ${e.folder}',
+                          if (e.login.isNotEmpty) e.login,
+                        ].join(' · ')),
+                        onTap: () => setState(() => _selected = e.id),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        const VerticalDivider(width: _kGap * 2),
+        SizedBox(
+          width: _kDetailPaneWidth,
+          child: current == null
+              ? const Text('No entry here: Add entry, on the Entries board.')
+              : _entryDetails(current),
+        ),
+      ],
+    );
+  }
+
+  /// Entry [e] in full: its secret hidden unless shown.
+  Widget _entryDetails(VaultEntry e) {
+    final MemCard? card = _entryCard(e);
+    return ListView(
+      children: <Widget>[
+        Text(e.label, style: Theme.of(context).textTheme.titleMedium),
+        if (e.folder.isNotEmpty) Text('Folder: ${e.folder}'),
+        if (e.login.isNotEmpty) Text('Login: ${e.login}'),
+        Text('Secret: ${_shown.contains(e.id) ? e.secret : '••••••••'}'),
+        if (e.note.isNotEmpty) Text('Note: ${e.note}'),
+        Text(card == null
+            ? 'Not memorised.'
+            : 'Memorised${card.due == null ? '' : ': next review '
+                '${dateText(card.due!)}'}.'),
+        if (_isHeld(e)) const Text('Held to copy into another vault.'),
       ],
     );
   }
@@ -1712,47 +1862,64 @@ class _FormosaScreenState extends State<FormosaScreen> {
     );
   }
 
-  /// The master secret's sentences: when each is next due, retiring one,
-  /// adding one — each change rewraps the vault.
+  /// The master secret's sentences, each with when it is next due; adding
+  /// one on the right — each change rewraps the vault.
   Widget _sentencesPanel(OpenVault v) {
     final VaultHeader h = v.header;
+    final VaultSlot? current = _currentSlot;
     final formosa.Mnemonic? m =
         _added == null ? null : _themes![_addTheme ?? _sentenceThemes.first];
-    return Column(
+    return Row(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        Text('Sentences: any ${h.k} of ${h.n} open the vault. Each is reviewed '
-            'when you enter it to open the vault, or through Next due.'),
-        for (final VaultSlot s in h.slots)
-          ListTile(
-            dense: true,
-            contentPadding: EdgeInsets.zero,
-            title: Text('Sentence ${s.id} (${s.theme})'),
-            subtitle: Text(_dueText(h, s.id)),
-            trailing: TextButton(
-              onPressed: _busy == null && h.n > h.k ? () => _retire(s) : null,
-              child: const Text('Retire'),
-            ),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Text('Sentences: any ${h.k} of ${h.n} open the vault. Each is '
+                  'reviewed when you enter it to open the vault, or through '
+                  'Next due.'),
+              Expanded(
+                child: ListView(
+                  children: <Widget>[
+                    for (final VaultSlot s in h.slots)
+                      ListTile(
+                        dense: true,
+                        selected: s.id == current?.id,
+                        title: Text('Sentence ${s.id} (${s.theme})'),
+                        subtitle: Text(_dueText(h, s.id)),
+                        onTap: () => setState(() => _selectedSlot = s.id),
+                      ),
+                  ],
+                ),
+              ),
+            ],
           ),
-        Wrap(
-          spacing: _kGap,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          children: <Widget>[
-            const Text('Add a sentence'),
-            DropdownButton<String>(
-              value: _addTheme ?? _sentenceThemes.first,
-              items: <DropdownMenuItem<String>>[
-                for (final String t in _sentenceThemes)
-                  DropdownMenuItem<String>(value: t, child: Text(t)),
-              ],
-              onChanged: (String? t) => setState(() {
-                _addTheme = t;
-                _added = null;
-              }),
-            ),
-          ],
         ),
-        if (m != null) SelectableText(m.toRawSentence(_added!)),
+        const VerticalDivider(width: _kGap * 2),
+        SizedBox(
+          width: _kDetailPaneWidth,
+          child: ListView(
+            children: <Widget>[
+              const Text('Add a sentence, in the theme:'),
+              DropdownButton<String>(
+                isExpanded: true,
+                value: _addTheme ?? _sentenceThemes.first,
+                items: <DropdownMenuItem<String>>[
+                  for (final String t in _sentenceThemes)
+                    DropdownMenuItem<String>(
+                        value: t,
+                        child: Text(t, overflow: TextOverflow.ellipsis)),
+                ],
+                onChanged: (String? t) => setState(() {
+                  _addTheme = t;
+                  _added = null;
+                }),
+              ),
+              if (m != null) SelectableText(m.toRawSentence(_added!)),
+            ],
+          ),
+        ),
       ],
     );
   }

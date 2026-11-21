@@ -16,8 +16,8 @@ import 'package:great_wallet_app/src/formosa/pass_vault.dart';
 /// F4: a vault created from six generated sentences and a provisional key,
 /// an entry added, locked, then opened again with four of them, and with the
 /// key; the key retired at the green light, and a new one added; the entry
-/// copied into a second vault — through the board, as F2 and F3's. Argon2id
-/// runs for real, light.
+/// copied into a second vault — through the board, as F2 and F3's, in a
+/// 1280 × 800 window with nothing scrolled to. Argon2id runs for real, light.
 void main() {
   final formosa.ThemeSet themes = loadThemes(Directory('../formosa/themes'));
   const KdfParams light =
@@ -26,7 +26,7 @@ void main() {
 
   testWidgets('create, add, lock, open with 4 of 6',
       (WidgetTester tester) async {
-    tester.view.physicalSize = const Size(1400, 2400);
+    tester.view.physicalSize = const Size(1280, 800);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
     final Directory dir = Directory.systemTemp.createTempSync('gw-formosa');
@@ -71,7 +71,7 @@ void main() {
 
     // Six sentences, one theme each, from the system's randomness.
     for (int i = 0; i < 6; i++) {
-      await tester.tap(find.text('System random').at(i));
+      await tester.tap(find.byTooltip('System random').at(i));
       await tester.pump();
     }
     final List<String> sentences = <String>[
@@ -139,17 +139,16 @@ void main() {
     await tester.tap(find.text('Add'));
     await tester.pump();
     await settle();
-    expect(find.text('Mail'), findsOneWidget);
-    expect(find.textContaining('alice'), findsOneWidget, reason: 'its login');
+    expect(find.text('Mail'), findsWidgets);
+    expect(find.textContaining('alice'), findsWidgets, reason: 'its login');
     expect(find.textContaining('hunter2'), findsNothing,
         reason: 'hidden until shown');
-    await tester.tap(find.byTooltip('Copy login'));
-    await tester.pump();
+    await run(CommandContext.entries, 'Copy login');
     await settle();
     expect(find.textContaining("Mail's login: copied"), findsOneWidget);
 
     // Edited: a new login, the same secret.
-    await tester.tap(find.byTooltip('Edit'));
+    await run(CommandContext.entries, 'Edit entry');
     await tester.pumpAndSettle();
     await tester.enterText(
         find.widgetWithText(TextField, 'Login (optional)'), 'bob');
@@ -159,7 +158,7 @@ void main() {
     await tester.tap(find.text('Save'));
     await tester.pump();
     await settle();
-    expect(find.textContaining('bob'), findsOneWidget);
+    expect(find.textContaining('bob'), findsWidgets);
     expect(find.textContaining('alice'), findsNothing);
     expect(find.textContaining('in Work/Mail'), findsOneWidget,
         reason: 'its folder, normalised');
@@ -201,7 +200,7 @@ void main() {
     await tester.tap(done);
     await tester.pump();
     await settle();
-    expect(find.text('Mail'), findsOneWidget);
+    expect(find.text('Mail'), findsWidgets);
     expect(
         find.textContaining('Sentences 2, 4, 6 graded good.'), findsOneWidget);
     expect(find.textContaining('Sentence 1 graded hard.'), findsOneWidget);
@@ -254,12 +253,7 @@ void main() {
       expect(now().cardOf(slot)!.repetitions, 1);
     }
     expect(reviewed..sort(), <int>[3, 5]);
-    await tester.tap(find.descendant(
-        of: find.byType(CommandBoard),
-        matching: find.byIcon(CommandContext.entries.icon)));
-    await tester.pump();
-    await tester.tap(find.byTooltip('Memorise it (a CPNF card)'));
-    await tester.pump();
+    await run(CommandContext.entries, 'Memorise');
     await settle();
     await run(CommandContext.vault, 'Next due');
     await tester.pumpAndSettle();
@@ -281,8 +275,9 @@ void main() {
     expect(added, findsOneWidget);
     expect(now().n, 7);
     expect(now().wraps, hasLength(35));
-    await tester.tap(find.text('Retire').last);
+    await tester.tap(find.textContaining('Sentence 7 ('));
     await tester.pump();
+    await run(CommandContext.sentences, 'Retire the sentence');
     for (int i = 0; i < 10 && now().n != 6; i++) {
       await settle();
     }
@@ -344,7 +339,7 @@ void main() {
     for (int i = 0; i < 10 && find.text('Mail').evaluate().isEmpty; i++) {
       await settle();
     }
-    expect(find.text('Mail'), findsOneWidget);
+    expect(find.text('Mail'), findsWidgets);
     expect(find.textContaining('no sentence is graded'), findsOneWidget);
     expect(<String>[
       for (final MemCard c in now().cards) jsonEncode(c.toJson()),
@@ -392,12 +387,7 @@ void main() {
     expect(now().provisional, isNotNull);
 
     // Mail held, the vault locked, a second vault made: Mail pasted into it.
-    await tester.tap(find.descendant(
-        of: find.byType(CommandBoard),
-        matching: find.byIcon(CommandContext.entries.icon)));
-    await tester.pump();
-    await tester.tap(find.byTooltip('Hold to copy into another vault'));
-    await tester.pump();
+    await run(CommandContext.entries, 'Hold to copy');
     expect(find.textContaining('1 entry held'), findsOneWidget);
     expect(enabled('Paste held entries'), isFalse, reason: 'its own vault');
     await run(CommandContext.vault, 'Lock');
@@ -409,7 +399,7 @@ void main() {
     await run(CommandContext.vault, 'New vault');
     await tester.pumpAndSettle();
     for (int i = 0; i < 6; i++) {
-      await tester.tap(find.text('System random').at(i));
+      await tester.tap(find.byTooltip('System random').at(i));
       await tester.pump();
     }
     await tester.tap(find.text('Create'));
@@ -422,7 +412,7 @@ void main() {
     expect(find.text('Mail'), findsNothing);
     await run(CommandContext.entries, 'Paste held entries');
     await settle();
-    expect(find.text('Mail'), findsOneWidget);
+    expect(find.text('Mail'), findsWidgets);
     expect(find.textContaining('1 entry copied from $path.'), findsOneWidget);
     expect(find.textContaining('in Work/Mail'), findsOneWidget,
         reason: 'the folder travels');
