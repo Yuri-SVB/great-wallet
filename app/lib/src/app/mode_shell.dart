@@ -1,15 +1,20 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../core/great_wall_core.dart';
+import '../formosa/formosa_screen.dart';
 import '../setup/setup_screen.dart';
 
-/// The great-wallet modes (ARCHITECTURE.md §"7. great-wallet"). **Setup** builds
-/// the orbit (protocol 0.5.0); **Train** recalls its maps (celestial-peace-nf-
-/// core), on the same screen and the same open setup; Accelerate / Inherit
-/// depend on libraries (jade-clock, phoenix-scroll) still in development.
+/// The great-wallet modes (ARCHITECTURE.md §"7. great-wallet"), on F2–F6.
+/// **Setup** builds the orbit (protocol 0.5.0); **Train** recalls its maps
+/// (celestial-peace-nf-core), on the same screen and the same open setup;
+/// **Formosa** is the password manager, apart from the setup; Accelerate /
+/// Inherit depend on libraries (jade-clock, phoenix-scroll) still in
+/// development.
 enum WalletMode {
   setup('Setup', Icons.auto_awesome_mosaic),
   train('Train', Icons.school),
+  formosa('Formosa', Icons.password),
   accelerate('Accelerate', Icons.bolt),
   inherit('Inherit', Icons.account_tree);
 
@@ -41,16 +46,38 @@ class ModeShell extends StatefulWidget {
 class _ModeShellState extends State<ModeShell> {
   WalletMode _mode = WalletMode.setup;
 
+  /// Each screen's focus scope: switching mode restores the keys to the one
+  /// shown, where they were last.
+  final FocusScopeNode _setupScope = FocusScopeNode(debugLabel: 'setup');
+  final FocusScopeNode _formosaScope = FocusScopeNode(debugLabel: 'formosa');
+
+  @override
+  void dispose() {
+    _setupScope.dispose();
+    _formosaScope.dispose();
+    super.dispose();
+  }
+
   /// Setup or Train, whichever the setup screen last showed: it stays
   /// mounted (and its setup open) while another mode is shown.
   bool _training = false;
 
-  void _select(WalletMode m) => setState(() {
-        _mode = m;
-        if (m == WalletMode.setup || m == WalletMode.train) {
-          _training = m == WalletMode.train;
-        }
-      });
+  void _select(WalletMode m) {
+    setState(() {
+      _mode = m;
+      if (m == WalletMode.setup || m == WalletMode.train) {
+        _training = m == WalletMode.train;
+      }
+    });
+    final FocusScopeNode? scope = switch (m) {
+      WalletMode.setup || WalletMode.train => _setupScope,
+      WalletMode.formosa => _formosaScope,
+      _ => null,
+    };
+    if (scope != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => scope.requestFocus());
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -80,23 +107,45 @@ class _ModeShellState extends State<ModeShell> {
   Widget _body() {
     final bool screen =
         _mode == WalletMode.setup || _mode == WalletMode.train;
+    final bool formosa = _mode == WalletMode.formosa;
     return Stack(
       children: <Widget>[
+        // Formosa stays mounted too, so its open vault survives a visit to
+        // Setup; shown, it takes the keys.
+        Offstage(
+          offstage: !formosa,
+          child: TickerMode(
+            enabled: formosa,
+            child: FocusScope(
+              node: _formosaScope,
+              child: FormosaScreen(
+                onFunctionKey: (LogicalKeyboardKey k) => _select(
+                    k == LogicalKeyboardKey.f3
+                        ? WalletMode.train
+                        : WalletMode.setup),
+              ),
+            ),
+          ),
+        ),
         Offstage(
           offstage: !screen,
           child: TickerMode(
             enabled: screen,
-            child: SetupScreen(
-              core: widget.core,
-              training: _training,
-              initialPath: widget.initialPath,
-              notice: widget.notice,
-              onTrainingChanged: (bool t) =>
-                  _select(t ? WalletMode.train : WalletMode.setup),
+            child: FocusScope(
+              node: _setupScope,
+              child: SetupScreen(
+                core: widget.core,
+                training: _training,
+                initialPath: widget.initialPath,
+                notice: widget.notice,
+                onTrainingChanged: (bool t) =>
+                    _select(t ? WalletMode.train : WalletMode.setup),
+                onFormosa: () => _select(WalletMode.formosa),
+              ),
             ),
           ),
         ),
-        if (!screen) _comingSoon(_mode),
+        if (!screen && !formosa) _comingSoon(_mode),
       ],
     );
   }

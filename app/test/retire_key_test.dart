@@ -130,6 +130,15 @@ void main() {
       }
     }
 
+    // Settles until [f] shows, at most [kMaxSettles] times: a busy machine
+    // can take longer than one settle to derive.
+    const int kMaxSettles = 15;
+    Future<void> settleUntil(Finder f) async {
+      for (int i = 0; i < kMaxSettles && f.evaluate().isEmpty; i++) {
+        await settle();
+      }
+    }
+
     // Open the file (Main board › E), then Train (F3).
     await tester.sendKeyEvent(LogicalKeyboardKey.keyE);
     await tester.pumpAndSettle();
@@ -138,7 +147,7 @@ void main() {
         find.widgetWithText(TextField, 'Key — 32 or 64 hex digits'), keyHex);
     await tester.tap(find.widgetWithText(FilledButton, 'Load'));
     await tester.pump();
-    await settle();
+    await settleUntil(find.textContaining('Setup loaded'));
     await tester.sendKeyEvent(LogicalKeyboardKey.f3);
     await tester.pump();
 
@@ -149,10 +158,6 @@ void main() {
     await tester.pump();
     await tester.sendKeyEvent(LogicalKeyboardKey.keyX);
     await tester.pumpAndSettle();
-    for (final Text t in tester.widgetList<Text>(find.descendant(
-        of: find.byType(AlertDialog), matching: find.byType(Text)))) {
-      debugPrint('DIALOG: ${t.data}');
-    }
     expect(
         find.descendant(
             of: find.byType(AlertDialog),
