@@ -156,8 +156,8 @@ void main() {
       expect(now().cardOf(id)!.due, isNull, reason: 'sentence $id');
     }
 
-    // Next due: first the sentences never graded (3 and 5), typed from
-    // memory in the open vault and graded; then the entry, memorised.
+    // Next due: first the sentences never graded (3 and 5) — 3 typed from
+    // memory and graded, 5 shown (so Again); then the entry, memorised.
     final Finder inDialog = find.byType(AlertDialog);
     final List<int> reviewed = <int>[];
     for (int i = 0; i < 2; i++) {
@@ -170,6 +170,20 @@ void main() {
           .data!;
       final int slot = int.parse(title.split(' ')[1]);
       reviewed.add(slot);
+      if (slot == 5) {
+        // Shown: the sentence on screen, and Again the only way out.
+        await tester.tap(find.text('Show'));
+        await tester.pumpAndSettle();
+        expect(find.textContaining('It is: ${sentences[4]}'), findsOneWidget);
+        expect(find.text('Good'), findsNothing);
+        await tester.tap(find.text('Again'));
+        await tester.pump();
+        await settle();
+        expect(
+            find.textContaining('Sentence 5: graded again.'), findsOneWidget);
+        expect(now().cardOf(5)!.lapses, 1);
+        continue;
+      }
       await tester.enterText(
           find.descendant(of: inDialog, matching: find.byType(TextField)),
           sentences[slot - 1]);

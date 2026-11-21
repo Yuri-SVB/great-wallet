@@ -707,6 +707,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
             'complete them, or Moon Cake. If in doubt, the lower grade: a '
             'sentence remembered only after a long effort is Hard, or Again.',
         body: _sentenceField(s, 'Sentence $slot'),
+        reveal: _themes![s.theme].toRawSentence(v.contents.sentences[slot]!),
         check: () async {
           final List<int>? bits = _bitsOf(s);
           final bool hit =
@@ -1556,6 +1557,7 @@ class _SecretReviewDialogState extends State<_SecretReviewDialog> {
   Widget build(BuildContext context) => FactReviewFrame(
         title: widget.entry.label,
         about: 'Type its secret from memory: only an exact match counts.',
+        reveal: widget.entry.secret,
         body: TextField(
           controller: _typed,
           autofocus: true,

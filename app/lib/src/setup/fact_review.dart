@@ -32,7 +32,8 @@ const double _kGap = 12;
 
 /// The frame every fact dialog shares: [about], the inputs ([body]), Check
 /// (running [check]), the result, and the grades. [practice], when set, is
-/// why the attempt is practice: nothing is graded.
+/// why the attempt is practice: nothing is graded. [reveal], when set, is the
+/// answer a Show button reveals: once shown, the attempt is a miss — Again.
 class FactReviewFrame extends StatefulWidget {
   const FactReviewFrame({
     super.key,
@@ -41,6 +42,7 @@ class FactReviewFrame extends StatefulWidget {
     required this.body,
     required this.check,
     this.practice,
+    this.reveal,
   });
 
   final String title;
@@ -48,6 +50,7 @@ class FactReviewFrame extends StatefulWidget {
   final Widget body;
   final Future<FactCheck> Function() check;
   final String? practice;
+  final String? reveal;
 
   @override
   State<FactReviewFrame> createState() => _FactReviewFrameState();
@@ -79,6 +82,10 @@ class _FactReviewFrameState extends State<FactReviewFrame> {
       });
     }
   }
+
+  /// Show the answer: the attempt becomes a miss.
+  void _show() => setState(() => _result =
+      FactCheck(hit: false, message: 'It is: ${widget.reveal}. Shown: Again.'));
 
   /// Leave: nothing graded before the check or in practice; after a miss, or
   /// a find that may not be scored, Again.
@@ -146,6 +153,11 @@ class _FactReviewFrameState extends State<FactReviewFrame> {
               onPressed: () => Navigator.of(context).pop(),
               child: const Text('Cancel'),
             ),
+            if (widget.reveal != null)
+              TextButton(
+                onPressed: _checking ? null : _show,
+                child: const Text('Show'),
+              ),
             FilledButton(
               onPressed: _checking ? null : () => unawaited(_check()),
               child: const Text('Check'),
@@ -331,9 +343,10 @@ class _ProfileDialogState extends State<ProfileDialog> {
 
   @override
   Widget build(BuildContext context) => FactReviewFrame(
-        title: factName(
-            MemCard.fact(kProfileFact), const <String, CustomFact>{}),
-        about: 'The Argon2 memory profile this setup derives with, as you would '
+        title:
+            factName(MemCard.fact(kProfileFact), const <String, CustomFact>{}),
+        about:
+            'The Argon2 memory profile this setup derives with, as you would '
             'set it for a hard reset on a new device.',
         practice: widget.practice,
         body: Wrap(
@@ -389,8 +402,8 @@ class _CountDialogState extends State<CountDialog> {
 
   @override
   Widget build(BuildContext context) => FactReviewFrame(
-        title: factName(
-            MemCard.fact(widget.factId), const <String, CustomFact>{}),
+        title:
+            factName(MemCard.fact(widget.factId), const <String, CustomFact>{}),
         about: widget.factId == kStagesFact
             ? 'How many deep stages this setup has, beyond stage 0.'
             : 'How many Argon2 iterations each stage\'s derivation runs (the '
@@ -413,9 +426,8 @@ class _CountDialogState extends State<CountDialog> {
           final bool hit = int.tryParse(_count.text) == widget.answer;
           return FactCheck(
             hit: hit,
-            message: hit
-                ? 'Right.'
-                : 'Missed — this setup\'s is ${widget.answer}.',
+            message:
+                hit ? 'Right.' : 'Missed — this setup\'s is ${widget.answer}.',
           );
         },
       );
@@ -461,8 +473,8 @@ class _SelectionDialogState extends State<SelectionDialog> {
               FilterChip(
                 label: Text('$j'),
                 selected: _ticked.contains(j),
-                onSelected: (bool on) => setState(
-                    () => on ? _ticked.add(j) : _ticked.remove(j)),
+                onSelected: (bool on) =>
+                    setState(() => on ? _ticked.add(j) : _ticked.remove(j)),
               ),
           ],
         ),
