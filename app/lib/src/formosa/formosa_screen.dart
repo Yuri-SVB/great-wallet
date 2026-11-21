@@ -14,6 +14,7 @@ import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
     show Clock, GraduationParams, Grade, MemCard, MemSchedule, failureChance;
 import 'package:dragon_dice_ui/dragon_dice_ui.dart'
     show DiceRolls, DragonDiceWizard, digestBits;
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:formosa/formosa.dart' as formosa;
@@ -659,12 +660,16 @@ class _FormosaScreenState extends State<FormosaScreen> {
         : '${e.label}: no longer memorised.');
   }
 
-  /// Review the entry cards due, longest-due first.
+  /// Review the next card due, longest-due first: the sentences' before the
+  /// entries'.
   Future<void> _nextDue() async {
     final OpenVault v = _vault!;
+    final List<MemCard> sentences = widget.schedule.queue(v.header.cards).due;
+    if (sentences.isNotEmpty) return _reviewSentence(v, sentences.first);
     final List<MemCard> due = widget.schedule.queue(v.contents.cards).due;
     if (due.isEmpty) {
-      _say('No entry is due.');
+      _say('Nothing is due. The sentences and the entries you memorise have '
+          'cards.');
       return;
     }
     final MemCard card = due.first;
@@ -681,6 +686,49 @@ class _FormosaScreenState extends State<FormosaScreen> {
     setState(() => v.contents.cards[at] = next);
     await _save();
     _say('${e.label}: graded ${g.name}.'
+        '${next.due == null ? '' : ' Next review ${dateText(next.due!)}.'}');
+  }
+
+  /// Review sentence [card] of the open vault: typed from memory, checked
+  /// against the vault's copy, then graded by you (a miss: Again).
+  Future<void> _reviewSentence(OpenVault v, MemCard card) async {
+    final int slot = _slotOfCard(card)!;
+    final VaultSlot s =
+        v.header.slots.firstWhere((VaultSlot x) => x.id == slot);
+    // The field's controller outlives the dialog's exit transition.
+    final TextEditingController typed = TextEditingController();
+    _inputs[slot] = typed;
+    final DialogRoute<Grade> route = DialogRoute<Grade>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext _) => FactReviewFrame(
+        title: 'Sentence $slot (${s.theme})',
+        about: 'Type it from memory: the first letters of each word, then '
+            'complete them, or Moon Cake. If in doubt, the lower grade: a '
+            'sentence remembered only after a long effort is Hard, or Again.',
+        body: _sentenceField(s, 'Sentence $slot'),
+        check: () async {
+          final List<int>? bits = _bitsOf(s);
+          final bool hit =
+              bits != null && listEquals(bits, v.contents.sentences[slot]);
+          return FactCheck(
+              hit: hit, message: hit ? 'Right.' : 'Missed — it is not that.');
+        },
+      ),
+    );
+    final Grade? g = await Navigator.of(context).push(route);
+    unawaited(route.completed.whenComplete(() {
+      if (identical(_inputs[slot], typed)) _inputs.remove(slot);
+      typed.dispose();
+    }));
+    if (g == null || !mounted) return;
+    final MemCard next = widget.schedule.grade(card, g);
+    setState(() => v.header = v.header.withCards(<MemCard>[
+          for (final MemCard c in v.header.cards)
+            c.factId == card.factId ? next : c,
+        ]));
+    await _save();
+    _say('Sentence $slot: graded ${g.name}.'
         '${next.due == null ? '' : ' Next review ${dateText(next.due!)}.'}');
   }
 
@@ -1256,37 +1304,8 @@ class _FormosaScreenState extends State<FormosaScreen> {
         for (final VaultSlot s in h.slots)
           Padding(
             padding: const EdgeInsets.symmetric(vertical: _kGap / 2),
-            child: Row(
-              children: <Widget>[
-                Expanded(
-                  child: TextField(
-                    controller: _inputs[s.id],
-                    obscureText: true,
-                    onChanged: (_) => setState(() {}),
-                    onSubmitted: (_) => _complete(s),
-                    decoration: InputDecoration(
-                      isDense: true,
-                      border: const OutlineInputBorder(),
-                      labelText: 'Sentence ${s.id} (${s.theme}) · '
-                          '${_dueText(h, s.id)}',
-                      suffixIcon: Icon(_bitsOf(s) != null
-                          ? Icons.check_circle_outline
-                          : Icons.radio_button_unchecked),
-                    ),
-                  ),
-                ),
-                IconButton(
-                  tooltip: 'Complete the words',
-                  onPressed: () => _complete(s),
-                  icon: const Icon(Icons.auto_fix_high),
-                ),
-                IconButton(
-                  tooltip: 'Table Selector (Moon Cake)',
-                  onPressed: () => _moonCake(s),
-                  icon: const Icon(Icons.grid_on),
-                ),
-              ],
-            ),
+            child: _sentenceField(
+                s, 'Sentence ${s.id} (${s.theme}) · ${_dueText(h, s.id)}'),
           ),
         const SizedBox(height: _kGap),
         Wrap(
@@ -1307,6 +1326,42 @@ class _FormosaScreenState extends State<FormosaScreen> {
       ],
     );
   }
+
+  /// Slot [s]'s sentence field, labelled [label]: hidden, with word
+  /// completion and Moon Cake; its mark shows a whole raw sentence.
+  Widget _sentenceField(VaultSlot s, String label) =>
+      ValueListenableBuilder<TextEditingValue>(
+        valueListenable: _inputs[s.id]!,
+        builder: (BuildContext _, TextEditingValue __, Widget? ___) => Row(
+          children: <Widget>[
+            Expanded(
+              child: TextField(
+                controller: _inputs[s.id],
+                obscureText: true,
+                onSubmitted: (_) => _complete(s),
+                decoration: InputDecoration(
+                  isDense: true,
+                  border: const OutlineInputBorder(),
+                  labelText: label,
+                  suffixIcon: Icon(_bitsOf(s) != null
+                      ? Icons.check_circle_outline
+                      : Icons.radio_button_unchecked),
+                ),
+              ),
+            ),
+            IconButton(
+              tooltip: 'Complete the words',
+              onPressed: () => _complete(s),
+              icon: const Icon(Icons.auto_fix_high),
+            ),
+            IconButton(
+              tooltip: 'Table Selector (Moon Cake)',
+              onPressed: () => _moonCake(s),
+              icon: const Icon(Icons.grid_on),
+            ),
+          ],
+        ),
+      );
 
   Widget _entriesView() {
     final OpenVault v = _vault!;
@@ -1427,7 +1482,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
         Text('Sentences: any ${h.k} of ${h.n} open the vault. Each is reviewed '
-            'when you enter it to open it.'),
+            'when you enter it to open the vault, or through Next due.'),
         for (final VaultSlot s in h.slots)
           ListTile(
             dense: true,

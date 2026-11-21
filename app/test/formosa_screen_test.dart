@@ -156,7 +156,33 @@ void main() {
       expect(now().cardOf(id)!.due, isNull, reason: 'sentence $id');
     }
 
-    // The entry memorised, then reviewed through Next due.
+    // Next due: first the sentences never graded (3 and 5), typed from
+    // memory in the open vault and graded; then the entry, memorised.
+    final Finder inDialog = find.byType(AlertDialog);
+    final List<int> reviewed = <int>[];
+    for (int i = 0; i < 2; i++) {
+      await tester.tap(find.text('Next due'));
+      await tester.pumpAndSettle();
+      final String title = tester
+          .widget<Text>(find.descendant(
+              of: inDialog,
+              matching: find.textContaining(RegExp(r'^Sentence \d \('))))
+          .data!;
+      final int slot = int.parse(title.split(' ')[1]);
+      reviewed.add(slot);
+      await tester.enterText(
+          find.descendant(of: inDialog, matching: find.byType(TextField)),
+          sentences[slot - 1]);
+      await tester.tap(find.text('Check'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Good'));
+      await tester.pump();
+      await settle();
+      expect(
+          find.textContaining('Sentence $slot: graded good.'), findsOneWidget);
+      expect(now().cardOf(slot)!.repetitions, 1);
+    }
+    expect(reviewed..sort(), <int>[3, 5]);
     await tester.tap(find.byTooltip('Memorise it (a CPNF card)'));
     await tester.pump();
     await settle();
@@ -175,12 +201,13 @@ void main() {
     await tester.pump();
     await tester.tap(find.text('Keep it, and rewrap'));
     await tester.pump();
-    for (int i = 0; i < 10 && now().n != 7; i++) {
+    final Finder added = find.textContaining('Sentence 7 added');
+    for (int i = 0; i < 10 && added.evaluate().isEmpty; i++) {
       await settle();
     }
+    expect(added, findsOneWidget);
     expect(now().n, 7);
     expect(now().wraps, hasLength(35));
-    expect(find.textContaining('Sentence 7 added'), findsOneWidget);
     await tester.tap(find.text('Retire').last);
     await tester.pump();
     for (int i = 0; i < 10 && now().n != 6; i++) {
@@ -251,6 +278,10 @@ void main() {
     expect(<String>[
       for (final MemCard c in now().cards) jsonEncode(c.toJson()),
     ], before);
+    await tester.tap(find.text('Next due'));
+    await tester.pump();
+    expect(find.textContaining('Nothing is due.'), findsOneWidget,
+        reason: 'every card reviewed today');
 
     // ε set to 100 % for this vault: the green light, and the key retired;
     // then a new one.
@@ -275,11 +306,12 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('Retire it'));
     await tester.pump();
-    for (int i = 0; i < 10 && now().provisional != null; i++) {
+    final Finder retired = find.textContaining('Provisional key retired');
+    for (int i = 0; i < 10 && retired.evaluate().isEmpty; i++) {
       await settle();
     }
+    expect(retired, findsOneWidget);
     expect(now().provisional, isNull);
-    expect(find.textContaining('Provisional key retired'), findsOneWidget);
     await tester.tap(find.text('Add a provisional key…'));
     await tester.pump();
     for (int i = 0; i < 10 && keyDialog.evaluate().isEmpty; i++) {
