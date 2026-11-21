@@ -20,7 +20,8 @@ import 'package:flutter/services.dart';
 import 'package:formosa/formosa.dart' as formosa;
 import 'package:formosa_ui/formosa_ui.dart' show TableTab;
 
-import '../command/command_board.dart' show DeadGlyph, SweatGlyph;
+import '../command/command_board.dart';
+import '../command/keyboard_layout.dart';
 import '../setup/card_stats.dart' show chanceText, dateText, durationText;
 import '../setup/fact_review.dart' show FactCheck, FactReviewFrame;
 import '../setup/provisional_key.dart';
@@ -104,7 +105,21 @@ class _FormosaScreenState extends State<FormosaScreen> {
   formosa.ThemeSet? _themes;
   _View _view = _View.start;
   final TextEditingController _path = TextEditingController();
-  String _status = '';
+  // The log, newest first; the status is its last line.
+  final List<String> _log = <String>[];
+  String get _status => _log.isEmpty ? '' : _log.first;
+  set _status(String s) {
+    _log.insert(0, s);
+    if (_log.length > _kLogLines) _log.removeLast();
+  }
+
+  // The board: its context, the panel folded away (F1), the explanation of
+  // the control under the pointer, and the keys' letters.
+  final FocusNode _root = FocusNode(debugLabel: 'formosa');
+  CommandContext _context = CommandContext.vault;
+  bool _panelHidden = false;
+  String? _explaining;
+  final KeyboardLayout _layout = KeyboardLayout.buildDefault;
 
   // Busy: a derivation (or several) in flight.
   String? _busy;
@@ -154,6 +169,8 @@ class _FormosaScreenState extends State<FormosaScreen> {
 
   static const Duration _kClipboardClear = Duration(seconds: 30);
   static const int _kByteValues = 256;
+  static const int _kLogLines = 50;
+  static const double _kPanelPadding = 8;
   static const double _kPercentScale = 100;
   static const double _kGateFieldWidth = 160;
   static const double _kGap = 12;
@@ -182,6 +199,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
   void dispose() {
     _clipTimer?.cancel();
     _discardHeld();
+    _root.dispose();
     _path.dispose();
     for (final TextEditingController c in _inputs.values) {
       c.dispose();
@@ -264,6 +282,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
       _header = null;
       _clearInputs();
       _view = _View.start;
+      _context = CommandContext.vault;
       _status = 'Locked.';
     });
   }
@@ -383,6 +402,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
         _vault = v;
         _newSentences.clear();
         _view = _View.entries;
+        _context = CommandContext.entries;
         _busy = 'Wrapping it for the provisional key…';
         _progress = null;
       });
@@ -479,6 +499,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
         _vault = o.vault;
         _clearInputs();
         _view = _View.entries;
+        _context = CommandContext.entries;
         _status = <String>[
           'Open.',
           if (o.wrong.isNotEmpty)
@@ -940,6 +961,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
         _vault = v;
         _clearInputs();
         _view = _View.entries;
+        _context = CommandContext.entries;
         _status = 'Open with the provisional key: no sentence is graded.';
       });
     } on FormatException {
@@ -1013,28 +1035,10 @@ class _FormosaScreenState extends State<FormosaScreen> {
     _say('${_entriesText(n)} copied from $from.');
   }
 
-  /// The held entries: pasted into the open vault (not their own), or
-  /// discarded.
-  Widget _heldBar() {
-    final int n = _held.length;
-    final bool canPaste =
-        _view == _View.entries && _heldFrom != _path.text.trim();
-    return Wrap(
-      spacing: _kGap,
-      crossAxisAlignment: WrapCrossAlignment.center,
-      children: <Widget>[
-        Text('${_entriesText(n)} held to copy into another vault, in memory '
-            'only: lock, open the other vault, then paste.'),
-        if (canPaste)
-          FilledButton(
-              onPressed: _busy == null ? _paste : null,
-              child: Text('Paste ${_entriesText(n)}')),
-        TextButton(
-            onPressed: () => setState(_discardHeld),
-            child: const Text('Discard')),
-      ],
-    );
-  }
+  /// Whether the held entries can be pasted here: into an open vault, not
+  /// their own.
+  bool get _canPaste =>
+      _view == _View.entries && _heldFrom != _path.text.trim();
 
   /// The entry dialog, for [entry] (edited) or a new one.
   Future<VaultEntry?> _entryDialog([VaultEntry? entry]) =>
@@ -1090,9 +1094,33 @@ class _FormosaScreenState extends State<FormosaScreen> {
 
   // --- the views --------------------------------------------------------------
 
+  /// Whether a text field has the keys: the board's letters type then.
+  bool get _typing {
+    final BuildContext? c = FocusManager.instance.primaryFocus?.context;
+    if (c == null) return false;
+    return c.widget is EditableText ||
+        c.findAncestorWidgetOfExactType<EditableText>() != null;
+  }
+
+  void _setContext(CommandContext c) => setState(() {
+        _context = c;
+        _panelHidden = false;
+        _explaining = null;
+      });
+
   KeyEventResult _onKey(FocusNode node, KeyEvent e) {
     if (e is! KeyDownEvent) return KeyEventResult.ignored;
     final LogicalKeyboardKey key = e.logicalKey;
+    if (key == LogicalKeyboardKey.f1) {
+      setState(() => _panelHidden = !_panelHidden);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.escape) {
+      _root.requestFocus(); // out of any field: the board's keys again
+      return KeyEventResult.handled;
+    }
+    final KeyEventResult board = _boardKey(e);
+    if (board == KeyEventResult.handled) return board;
     if (key == LogicalKeyboardKey.f2 || key == LogicalKeyboardKey.f3) {
       widget.onFunctionKey?.call(key);
       return KeyEventResult.handled;
@@ -1112,6 +1140,211 @@ class _FormosaScreenState extends State<FormosaScreen> {
     return KeyEventResult.handled;
   }
 
+  /// A board key, by position: Alt + a top-row key picks the context;
+  /// alone, it runs the context's command there.
+  KeyEventResult _boardKey(KeyEvent e) {
+    final HardwareKeyboard kb = HardwareKeyboard.instance;
+    if (_typing || kb.isControlPressed || kb.isMetaPressed) {
+      return KeyEventResult.ignored;
+    }
+    final int at = kBoardKeys.indexOf(e.physicalKey);
+    if (at < 0) return KeyEventResult.ignored;
+    if (kb.isAltPressed) {
+      for (final CommandContext c in kFormosaContexts) {
+        if (c.key == at) {
+          _setContext(c);
+          return KeyEventResult.handled;
+        }
+      }
+      return KeyEventResult.ignored;
+    }
+    final BoardCommand? c = _board()[at];
+    if (c != null && c.enabled) c.run();
+    return KeyEventResult.handled;
+  }
+
+  /// The context's commands, each at its board key; null where none is.
+  List<BoardCommand?> _board() {
+    final bool idle = _busy == null && _themes != null;
+    final OpenVault? v = _vault;
+    final bool open = v != null && idle;
+    final List<BoardCommand?> b =
+        List<BoardCommand?>.filled(kBoardKeys.length, null);
+    void put(int at, String name, IconData icon, String help, VoidCallback run,
+            {bool enabled = true}) =>
+        b[at] = BoardCommand(
+            name: name, help: help, icon: icon, run: run, enabled: enabled);
+    switch (_context) {
+      case CommandContext.vault:
+        put(
+            0,
+            'New vault',
+            Icons.add_box_outlined,
+            'Makes a vault at the file path: its sentences, then Create.',
+            _startCreate,
+            enabled: idle && _view == _View.start);
+        put(
+            1,
+            'Open',
+            Icons.folder_open,
+            'Opens the vault at the file path: its sentences, then Open.',
+            _openFile,
+            enabled: idle && _view == _View.start);
+        put(
+            2,
+            'Open with the provisional key',
+            Icons.key,
+            'Opens it with its provisional key, scanned or typed; nothing is '
+                'graded.',
+            _unlockWithKey,
+            enabled:
+                idle && _view == _View.unlock && _header?.provisional != null);
+        put(3, 'Lock', Icons.lock_outline,
+            'Closes the vault, or leaves making or opening one.', _lock,
+            enabled: idle && _view != _View.start);
+        put(
+            4,
+            'Next due',
+            Icons.school_outlined,
+            'Reviews the next card due: the sentences\', then the memorised '
+                'entries\'.',
+            _nextDue,
+            enabled: open);
+        put(
+            5,
+            'T and ε',
+            Icons.tune,
+            'Sets this vault\'s graduation gate: the gap T and the threshold '
+                'ε.',
+            _setGate,
+            enabled: open);
+        put(
+            6,
+            'Retire the provisional key',
+            Icons.key_off,
+            'At the green light: from then on only k sentences open the vault.',
+            _retireKey,
+            enabled:
+                open && v.header.provisional != null && _gate(v.header).passes);
+        put(7, 'Add a provisional key', Icons.vpn_key_outlined,
+            'A key that opens the vault alone, until you retire it.', _addKey,
+            enabled: open && v.header.provisional == null);
+      case CommandContext.entries:
+        put(0, 'Add entry', Icons.add,
+            'A new entry: label, login, folder, secret and note.', _addEntry,
+            enabled: open);
+        put(1, 'Paste held entries', Icons.move_to_inbox,
+            'Copies the held entries into this vault.', _paste,
+            enabled: open && _held.isNotEmpty && _canPaste);
+        put(2, 'Discard held entries', Icons.clear_all,
+            'Lets the held entries go.', () => setState(_discardHeld),
+            enabled: _held.isNotEmpty);
+      case CommandContext.sentences:
+        put(
+            0,
+            'New sentence (system random)',
+            Icons.casino_outlined,
+            'A sentence to add, in the theme chosen, from system randomness.',
+            () => _generateAdded(dice: false),
+            enabled: open);
+        put(
+            1,
+            'New sentence (Dragon Dice)',
+            Icons.casino,
+            'A sentence to add, in the theme chosen, from Dragon Dice.',
+            () => _generateAdded(dice: true),
+            enabled: open);
+        put(2, 'Keep the new sentence, and rewrap', Icons.save_outlined,
+            'Adds the new sentence: every k of n is wrapped anew.', _keepAdded,
+            enabled: open && _added != null);
+      default: // the setup's contexts
+    }
+    return b;
+  }
+
+  /// The bottom panel, as the setup's: the board and the log, or, folded
+  /// away (F1), one status line.
+  Widget _panel() {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    final Widget fold = IconButton(
+      tooltip: _panelHidden ? 'Restore (F1)' : 'Collapse (F1)',
+      icon: Icon(
+          _panelHidden ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down),
+      onPressed: () => setState(() => _panelHidden = !_panelHidden),
+    );
+    if (_panelHidden) {
+      return Material(
+        color: cs.surfaceContainerHighest,
+        child: Row(
+          children: <Widget>[
+            const SizedBox(width: _kGap),
+            Expanded(
+                child: Text(_busy ?? _status,
+                    maxLines: 1, overflow: TextOverflow.ellipsis)),
+            fold,
+          ],
+        ),
+      );
+    }
+    final String? explaining = _explaining;
+    return Material(
+      color: cs.surfaceContainerHighest,
+      child: SizedBox(
+        height: kBoardHeight + _kPanelPadding * 2,
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            Padding(
+              padding: const EdgeInsets.all(_kPanelPadding),
+              child: CommandBoard(
+                active: _context,
+                contexts: kFormosaContexts,
+                commands: _board(),
+                layout: _layout,
+                colour: cs.onSurface,
+                onContext: _setContext,
+                onExplain: (String? s) => setState(() => _explaining = s),
+                onCue: (String _) {},
+              ),
+            ),
+            const VerticalDivider(width: 1),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  Row(
+                    children: <Widget>[
+                      const SizedBox(width: _kGap),
+                      const Expanded(child: Text('Log')),
+                      fold,
+                    ],
+                  ),
+                  if (_busy != null) ...<Widget>[
+                    Text(_busy!),
+                    LinearProgressIndicator(value: _progress),
+                  ],
+                  Expanded(
+                    child: explaining != null
+                        ? Padding(
+                            padding: const EdgeInsets.all(_kGap),
+                            child: Text(explaining))
+                        : ListView(
+                            padding:
+                                const EdgeInsets.symmetric(horizontal: _kGap),
+                            children: <Widget>[
+                              for (final String line in _log) Text(line),
+                            ],
+                          ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final Widget body = _themes == null
@@ -1120,38 +1353,43 @@ class _FormosaScreenState extends State<FormosaScreen> {
             _View.start => _startView(),
             _View.create => _createView(),
             _View.unlock => _unlockView(),
-            _View.entries => _entriesView(),
+            _View.entries => switch (_context) {
+                CommandContext.vault => _keyPanel(_vault!),
+                CommandContext.sentences => _sentencesPanel(_vault!),
+                _ => _entriesView(),
+              },
           };
     return Focus(
+      focusNode: _root,
       autofocus: true,
       onKeyEvent: _onKey,
-      child: Align(
-        alignment: Alignment.topCenter,
-        child: SizedBox(
-          width: _kWidth,
-          child: ListView(
-            padding: const EdgeInsets.all(_kGap * 2),
-            children: <Widget>[
-              Text('Formosa — passwords',
-                  style: Theme.of(context).textTheme.titleLarge),
-              const SizedBox(height: _kGap),
-              body,
-              if (_held.isNotEmpty) ...<Widget>[
-                const SizedBox(height: _kGap),
-                _heldBar(),
-              ],
-              if (_busy != null) ...<Widget>[
-                const SizedBox(height: _kGap),
-                Text(_busy!),
-                LinearProgressIndicator(value: _progress),
-              ],
-              if (_status.isNotEmpty && _themes != null) ...<Widget>[
-                const SizedBox(height: _kGap),
-                Text(_status),
-              ],
-            ],
+      child: Column(
+        children: <Widget>[
+          Expanded(
+            child: Align(
+              alignment: Alignment.topCenter,
+              child: SizedBox(
+                width: _kWidth,
+                child: ListView(
+                  padding: const EdgeInsets.all(_kGap * 2),
+                  children: <Widget>[
+                    Text('Formosa — passwords',
+                        style: Theme.of(context).textTheme.titleLarge),
+                    const SizedBox(height: _kGap),
+                    body,
+                    if (_held.isNotEmpty) ...<Widget>[
+                      const SizedBox(height: _kGap),
+                      Text('${_entriesText(_held.length)} held to copy into '
+                          'another vault, in memory only: lock, open the other '
+                          'vault, then paste (Entries).'),
+                    ],
+                  ],
+                ),
+              ),
+            ),
           ),
-        ),
+          _panel(),
+        ],
       ),
     );
   }
@@ -1173,17 +1411,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
             ),
           ),
           const SizedBox(height: _kGap),
-          Wrap(
-            spacing: _kGap,
-            children: <Widget>[
-              FilledButton(
-                  onPressed: _busy == null ? _openFile : null,
-                  child: const Text('Open')),
-              OutlinedButton(
-                  onPressed: _busy == null ? _startCreate : null,
-                  child: const Text('New vault')),
-            ],
-          ),
+          const Text('Then New vault or Open, on the Vault board.'),
         ],
       );
 
@@ -1230,9 +1458,6 @@ class _FormosaScreenState extends State<FormosaScreen> {
               FilledButton(
                   onPressed: _busy == null ? _create : null,
                   child: const Text('Create')),
-              TextButton(
-                  onPressed: _busy == null ? _lock : null,
-                  child: const Text('Cancel')),
             ],
           ),
         ],
@@ -1347,20 +1572,11 @@ class _FormosaScreenState extends State<FormosaScreen> {
                 s, 'Sentence ${s.id} (${s.theme}) · ${_dueText(h, s.id)}'),
           ),
         const SizedBox(height: _kGap),
-        Wrap(
-          spacing: _kGap,
-          children: <Widget>[
-            FilledButton(
-                onPressed: _busy == null ? _unlock : null,
-                child: const Text('Open')),
-            if (h.provisional != null)
-              OutlinedButton(
-                  onPressed: _busy == null ? _unlockWithKey : null,
-                  child: const Text('Open with the provisional key…')),
-            TextButton(
-                onPressed: _busy == null ? _lock : null,
-                child: const Text('Cancel')),
-          ],
+        Align(
+          alignment: Alignment.centerLeft,
+          child: FilledButton(
+              onPressed: _busy == null ? _unlock : null,
+              child: const Text('Open')),
         ),
       ],
     );
@@ -1473,21 +1689,6 @@ class _FormosaScreenState extends State<FormosaScreen> {
               ],
             ),
           ),
-        const SizedBox(height: _kGap),
-        Wrap(
-          spacing: _kGap,
-          children: <Widget>[
-            FilledButton(onPressed: _addEntry, child: const Text('Add entry')),
-            OutlinedButton(
-                onPressed: _busy == null ? _nextDue : null,
-                child: const Text('Next due')),
-            OutlinedButton(onPressed: _lock, child: const Text('Lock')),
-          ],
-        ),
-        const Divider(height: _kGap * 3),
-        _sentencesPanel(v),
-        const Divider(height: _kGap * 3),
-        _keyPanel(v),
       ],
     );
   }
@@ -1507,23 +1708,6 @@ class _FormosaScreenState extends State<FormosaScreen> {
         Text(kept
             ? 'The provisional key opens the vault alone, until you retire it.'
             : 'No provisional key: only ${h.k} sentences open the vault.'),
-        const SizedBox(height: _kGap / 2),
-        Wrap(
-          spacing: _kGap,
-          children: <Widget>[
-            OutlinedButton(
-                onPressed: _busy == null ? _setGate : null,
-                child: const Text('T and ε…')),
-            if (kept)
-              OutlinedButton(
-                  onPressed: _busy == null && g.passes ? _retireKey : null,
-                  child: const Text('Retire the provisional key…'))
-            else
-              OutlinedButton(
-                  onPressed: _busy == null ? _addKey : null,
-                  child: const Text('Add a provisional key…')),
-          ],
-        ),
       ],
     );
   }
@@ -1566,24 +1750,9 @@ class _FormosaScreenState extends State<FormosaScreen> {
                 _added = null;
               }),
             ),
-            TextButton(
-                onPressed: () => _generateAdded(dice: false),
-                child: const Text('System random')),
-            TextButton(
-                onPressed: () => _generateAdded(dice: true),
-                child: const Text('Dragon Dice')),
           ],
         ),
-        if (m != null) ...<Widget>[
-          SelectableText(m.toRawSentence(_added!)),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: FilledButton(
-              onPressed: _busy == null ? _keepAdded : null,
-              child: const Text('Keep it, and rewrap'),
-            ),
-          ),
-        ],
+        if (m != null) SelectableText(m.toRawSentence(_added!)),
       ],
     );
   }

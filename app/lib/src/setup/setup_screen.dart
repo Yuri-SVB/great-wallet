@@ -4770,7 +4770,11 @@ press.calibrate.target    tick_soft.wav
   /// sits centred; nothing scrolls.
   Widget _contextPane() {
     final Widget? body = switch (_context) {
-      CommandContext.main => null,
+      CommandContext.main ||
+      CommandContext.vault ||
+      CommandContext.entries ||
+      CommandContext.sentences =>
+        null,
       CommandContext.setup => _setupPane(),
       CommandContext.train => null,
       CommandContext.path => _routePanel(),

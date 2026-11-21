@@ -5,16 +5,19 @@ import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
     show MemCard;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:formosa/formosa.dart' as formosa;
 import 'package:formosa/io.dart';
+import 'package:great_wallet_app/src/command/command_board.dart';
 import 'package:great_wallet_app/src/formosa/formosa_screen.dart';
 import 'package:great_wallet_app/src/formosa/pass_vault.dart';
 
 /// F4: a vault created from six generated sentences and a provisional key,
 /// an entry added, locked, then opened again with four of them, and with the
 /// key; the key retired at the green light, and a new one added; the entry
-/// copied into a second vault. Argon2id runs for real, light.
+/// copied into a second vault — through the board, as F2 and F3's. Argon2id
+/// runs for real, light.
 void main() {
   final formosa.ThemeSet themes = loadThemes(Directory('../formosa/themes'));
   const KdfParams light =
@@ -38,12 +41,30 @@ void main() {
       }
     }
 
+    // A board command, by its name; run in context [c] (its tab first).
+    Finder command(String name) => find.byWidgetPredicate(
+        (Widget w) => w is Semantics && w.properties.label == name);
+    bool enabled(String name) =>
+        tester
+            .widget<InkWell>(find.ancestor(
+                of: command(name), matching: find.byType(InkWell)))
+            .onTap !=
+        null;
+    Future<void> run(CommandContext c, String name) async {
+      await tester.tap(find.descendant(
+          of: find.byType(CommandBoard), matching: find.byIcon(c.icon)));
+      await tester.pump();
+      expect(enabled(name), isTrue, reason: name);
+      await tester.tap(command(name));
+      await tester.pump();
+    }
+
     await tester.pumpWidget(MaterialApp(
       home: Scaffold(body: FormosaScreen(themes: themes, kdf: light)),
     ));
     await tester.pump();
     await tester.enterText(find.widgetWithText(TextField, 'Vault file'), path);
-    await tester.tap(find.text('New vault'));
+    await run(CommandContext.vault, 'New vault');
     await tester.pumpAndSettle();
     expect(find.textContaining('Any 4 of 6 sentences open it: 132 bits'),
         findsOneWidget);
@@ -79,22 +100,35 @@ void main() {
         findsOneWidget);
     await tester.tap(find.text('Done'));
     await tester.pumpAndSettle();
+    await tester.tap(find.descendant(
+        of: find.byType(CommandBoard),
+        matching: find.byIcon(CommandContext.vault.icon)));
+    await tester.pump();
     expect(find.textContaining('not yet.'), findsOneWidget,
         reason: 'no sentence graded: the gate is shut');
-    expect(
-        tester
-            .widget<OutlinedButton>(find.widgetWithText(
-                OutlinedButton, 'Retire the provisional key…'))
-            .onPressed,
-        isNull);
+    expect(enabled('Retire the provisional key'), isFalse);
+
+    // F1 folds the panel away, and back.
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.sendKeyEvent(LogicalKeyboardKey.f1);
+    await tester.pump();
+    expect(find.byType(CommandBoard), findsNothing);
+    expect(find.byTooltip('Restore (F1)'), findsOneWidget);
+    await tester.sendKeyEvent(LogicalKeyboardKey.f1);
+    await tester.pump();
+    expect(find.byType(CommandBoard), findsOneWidget);
     final VaultHeader h = PassVault.header(File(path).readAsBytesSync());
     expect(h.n, 6);
     expect(h.k, 4);
     expect(h.slots.map((VaultSlot s) => s.theme).toSet(), hasLength(6),
         reason: 'one theme per sentence');
 
-    // An entry, typed in.
-    await tester.tap(find.text('Add entry'));
+    // An entry, typed in: Alt+W picks the Entries board, Q adds.
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyW);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyQ);
     await tester.pumpAndSettle();
     await tester.enterText(find.widgetWithText(TextField, 'Label'), 'Mail');
     await tester.enterText(
@@ -131,10 +165,9 @@ void main() {
         reason: 'its folder, normalised');
 
     // Locked, then opened with sentences 1, 2, 4 and 6.
-    await tester.tap(find.text('Lock'));
+    await run(CommandContext.vault, 'Lock');
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Open'));
-    await tester.pump();
+    await run(CommandContext.vault, 'Open');
     await settle();
     for (final int i in <int>[0, 1, 3, 5]) {
       await tester.enterText(
@@ -185,7 +218,7 @@ void main() {
     final Finder inDialog = find.byType(AlertDialog);
     final List<int> reviewed = <int>[];
     for (int i = 0; i < 2; i++) {
-      await tester.tap(find.text('Next due'));
+      await run(CommandContext.vault, 'Next due');
       await tester.pumpAndSettle();
       final String title = tester
           .widget<Text>(find.descendant(
@@ -221,10 +254,14 @@ void main() {
       expect(now().cardOf(slot)!.repetitions, 1);
     }
     expect(reviewed..sort(), <int>[3, 5]);
+    await tester.tap(find.descendant(
+        of: find.byType(CommandBoard),
+        matching: find.byIcon(CommandContext.entries.icon)));
+    await tester.pump();
     await tester.tap(find.byTooltip('Memorise it (a CPNF card)'));
     await tester.pump();
     await settle();
-    await tester.tap(find.text('Next due'));
+    await run(CommandContext.vault, 'Next due');
     await tester.pumpAndSettle();
     await tester.enterText(find.widgetWithText(TextField, 'Secret'), 'hunter2');
     await tester.tap(find.text('Check'));
@@ -235,10 +272,8 @@ void main() {
     expect(find.textContaining('Mail: graded good.'), findsOneWidget);
 
     // A sentence added (C(7, 4) wrappings), then retired again.
-    await tester.tap(find.text('System random'));
-    await tester.pump();
-    await tester.tap(find.text('Keep it, and rewrap'));
-    await tester.pump();
+    await run(CommandContext.sentences, 'New sentence (system random)');
+    await run(CommandContext.sentences, 'Keep the new sentence, and rewrap');
     final Finder added = find.textContaining('Sentence 7 added');
     for (int i = 0; i < 10 && added.evaluate().isEmpty; i++) {
       await settle();
@@ -256,10 +291,9 @@ void main() {
 
     // Opened again the same day, sentence 3 wrong: Again; the others, just
     // graded, are not due — practice.
-    await tester.tap(find.text('Lock'));
+    await run(CommandContext.vault, 'Lock');
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Open'));
-    await tester.pump();
+    await run(CommandContext.vault, 'Open');
     await settle();
     final String wrong3 = themes[now().slots[2].theme].generateRaw();
     final Map<int, String> typed = <int, String>{
@@ -297,18 +331,17 @@ void main() {
     final List<String> before = <String>[
       for (final MemCard c in now().cards) jsonEncode(c.toJson()),
     ];
-    await tester.tap(find.text('Lock'));
+    await run(CommandContext.vault, 'Lock');
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Open'));
-    await tester.pump();
+    await run(CommandContext.vault, 'Open');
     await settle();
-    await tester.tap(find.text('Open with the provisional key…'));
+    await run(CommandContext.vault, 'Open with the provisional key');
     await tester.pumpAndSettle();
     await tester.enterText(
         find.widgetWithText(TextField, 'Key — 32 or 64 hex digits'), keyHex);
     await tester.tap(find.widgetWithText(FilledButton, 'Open').last);
     await tester.pump();
-    for (int i = 0; i < 10 && find.text('Add entry').evaluate().isEmpty; i++) {
+    for (int i = 0; i < 10 && find.text('Mail').evaluate().isEmpty; i++) {
       await settle();
     }
     expect(find.text('Mail'), findsOneWidget);
@@ -316,14 +349,13 @@ void main() {
     expect(<String>[
       for (final MemCard c in now().cards) jsonEncode(c.toJson()),
     ], before);
-    await tester.tap(find.text('Next due'));
-    await tester.pump();
+    await run(CommandContext.vault, 'Next due');
     expect(find.textContaining('Nothing is due.'), findsOneWidget,
         reason: 'every card reviewed today');
 
     // ε set to 100 % for this vault: the green light, and the key retired;
     // then a new one.
-    await tester.tap(find.text('T and ε…'));
+    await run(CommandContext.vault, 'T and ε');
     await tester.pumpAndSettle();
     await tester.enterText(find.widgetWithText(TextField, 'T (days)'), '3');
     await tester.enterText(find.widgetWithText(TextField, 'ε (%)'), '100');
@@ -340,7 +372,7 @@ void main() {
     expect(now().gapSeconds, const Duration(days: 3).inSeconds);
     expect(now().epsilon, 1);
     expect(find.textContaining('green light.'), findsOneWidget);
-    await tester.tap(find.text('Retire the provisional key…'));
+    await run(CommandContext.vault, 'Retire the provisional key');
     await tester.pumpAndSettle();
     await tester.tap(find.text('Retire it'));
     await tester.pump();
@@ -350,8 +382,7 @@ void main() {
     }
     expect(retired, findsOneWidget);
     expect(now().provisional, isNull);
-    await tester.tap(find.text('Add a provisional key…'));
-    await tester.pump();
+    await run(CommandContext.vault, 'Add a provisional key');
     for (int i = 0; i < 10 && keyDialog.evaluate().isEmpty; i++) {
       await settle();
     }
@@ -361,17 +392,21 @@ void main() {
     expect(now().provisional, isNotNull);
 
     // Mail held, the vault locked, a second vault made: Mail pasted into it.
+    await tester.tap(find.descendant(
+        of: find.byType(CommandBoard),
+        matching: find.byIcon(CommandContext.entries.icon)));
+    await tester.pump();
     await tester.tap(find.byTooltip('Hold to copy into another vault'));
     await tester.pump();
     expect(find.textContaining('1 entry held'), findsOneWidget);
-    expect(find.text('Paste 1 entry'), findsNothing, reason: 'its own vault');
-    await tester.tap(find.text('Lock'));
+    expect(enabled('Paste held entries'), isFalse, reason: 'its own vault');
+    await run(CommandContext.vault, 'Lock');
     await tester.pumpAndSettle();
     expect(find.textContaining('1 entry held'), findsOneWidget,
         reason: 'held across the lock');
     final String path2 = '${dir.path}/other.vault';
     await tester.enterText(find.widgetWithText(TextField, 'Vault file'), path2);
-    await tester.tap(find.text('New vault'));
+    await run(CommandContext.vault, 'New vault');
     await tester.pumpAndSettle();
     for (int i = 0; i < 6; i++) {
       await tester.tap(find.text('System random').at(i));
@@ -385,8 +420,7 @@ void main() {
     await tester.tap(find.text('Done'));
     await tester.pumpAndSettle();
     expect(find.text('Mail'), findsNothing);
-    await tester.tap(find.text('Paste 1 entry'));
-    await tester.pump();
+    await run(CommandContext.entries, 'Paste held entries');
     await settle();
     expect(find.text('Mail'), findsOneWidget);
     expect(find.textContaining('1 entry copied from $path.'), findsOneWidget);

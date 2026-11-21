@@ -12,7 +12,12 @@ enum CommandContext {
   setup('Setup', Icons.tune, 1),
   train('Train', Icons.school, 1),
   path('Path', Icons.route, 2),
-  view('View', Icons.palette, 3);
+  view('View', Icons.palette, 3),
+
+  // Formosa's (F4).
+  vault('Vault', Icons.shield_outlined, 0),
+  entries('Entries', Icons.list_alt, 1),
+  sentences('Sentences', Icons.short_text, 2);
 
   const CommandContext(this.label, this.icon, this.key);
   final String label;
@@ -36,6 +41,13 @@ const List<CommandContext> kTrainContexts = <CommandContext>[
   CommandContext.train,
   CommandContext.path,
   CommandContext.view,
+];
+
+/// The contexts Formosa's board shows (F4).
+const List<CommandContext> kFormosaContexts = <CommandContext>[
+  CommandContext.vault,
+  CommandContext.entries,
+  CommandContext.sentences,
 ];
 
 /// One command on the board: what it shows and what it does. [enabled] is
@@ -103,6 +115,12 @@ String contextTabCue(CommandContext c) => 'tab.context.${c.name}';
 const double kBoardButtonWidth = 56;
 const double kBoardButtonHeight = 44;
 const double kBoardGap = 4;
+
+/// Height of a context tab, and of the whole board: its tabs and rows.
+const double kBoardTabHeight = 26;
+const double kBoardHeight = kBoardTabHeight +
+    kBoardGap +
+    kBoardRows * (kBoardButtonHeight + kBoardGap);
 
 /// The command board: the context tabs above a 3 × 4 grid of buttons, each
 /// with its icon and its key's letter in the current [layout]. Hovering or
@@ -236,7 +254,7 @@ class _Tab extends StatelessWidget {
           },
           child: SizedBox(
             width: kBoardButtonWidth,
-            height: 26,
+            height: kBoardTabHeight,
             child: Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: <Widget>[
