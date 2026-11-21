@@ -119,11 +119,16 @@ void main() {
     await tester.pumpAndSettle();
     await tester.enterText(
         find.widgetWithText(TextField, 'Login (optional)'), 'bob');
+    await tester.enterText(
+        find.widgetWithText(TextField, 'Folder (optional, e.g. Work/Mail)'),
+        ' Work / /Mail/ ');
     await tester.tap(find.text('Save'));
     await tester.pump();
     await settle();
     expect(find.textContaining('bob'), findsOneWidget);
     expect(find.textContaining('alice'), findsNothing);
+    expect(find.textContaining('in Work/Mail'), findsOneWidget,
+        reason: 'its folder, normalised');
 
     // Locked, then opened with sentences 1, 2, 4 and 6.
     await tester.tap(find.text('Lock'));
@@ -385,6 +390,8 @@ void main() {
     await settle();
     expect(find.text('Mail'), findsOneWidget);
     expect(find.textContaining('1 entry copied from $path.'), findsOneWidget);
+    expect(find.textContaining('in Work/Mail'), findsOneWidget,
+        reason: 'the folder travels');
     expect(find.textContaining('held'), findsNothing, reason: 'pasted once');
   });
 }

@@ -122,6 +122,14 @@ class VaultSlot {
   Map<String, dynamic> toJson() => <String, dynamic>{'id': id, 'theme': theme};
 }
 
+/// [raw] as a folder path: its parts trimmed, empty ones dropped, joined by
+/// `/` (`' Work / /Mail/ '` is `Work/Mail`); empty for the top level.
+String normalFolder(String raw) => raw
+    .split('/')
+    .map((String p) => p.trim())
+    .where((String p) => p.isNotEmpty)
+    .join('/');
+
 /// An entry of the manager.
 class VaultEntry {
   const VaultEntry({
@@ -129,6 +137,7 @@ class VaultEntry {
     required this.label,
     required this.secret,
     this.login = '',
+    this.folder = '',
     this.note = '',
     this.mnemonic = '',
   });
@@ -138,6 +147,10 @@ class VaultEntry {
 
   /// The account's name or address, if any: shown, and copied on its own.
   final String login;
+
+  /// Its folder ([normalFolder]): `Work/Mail`, or empty for the top level.
+  /// A folder exists while an entry is in it.
+  final String folder;
 
   /// What is copied: a password, a seed, anything.
   final String secret;
@@ -151,6 +164,7 @@ class VaultEntry {
         'label': label,
         'secret': secret,
         if (login.isNotEmpty) 'login': login,
+        if (folder.isNotEmpty) 'folder': folder,
         if (note.isNotEmpty) 'note': note,
         if (mnemonic.isNotEmpty) 'mnemonic': mnemonic,
       };
@@ -161,12 +175,14 @@ class VaultEntry {
         label = json['label'],
         secret = json['secret'];
     final Object? login = json['login'] ?? '',
+        folder = json['folder'] ?? '',
         note = json['note'] ?? '',
         mnemonic = json['mnemonic'] ?? '';
     if (id is! String ||
         label is! String ||
         secret is! String ||
         login is! String ||
+        folder is! String ||
         note is! String ||
         mnemonic is! String) {
       throw const FormatException('bad entry');
@@ -176,6 +192,7 @@ class VaultEntry {
         label: label,
         secret: secret,
         login: login,
+        folder: normalFolder(folder),
         note: note,
         mnemonic: mnemonic);
   }

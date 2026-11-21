@@ -66,6 +66,20 @@ void main() {
     expect(o.vault.contents.entries.single.login, 'alice');
   });
 
+  test('a folder is a normalised path, kept in the file', () {
+    expect(normalFolder(' Work / /Mail/ '), 'Work/Mail');
+    expect(normalFolder(' / '), isEmpty);
+    const VaultEntry e = VaultEntry(
+        id: 'e1', label: 'Mail', secret: 'hunter2', folder: 'Work/Mail');
+    expect(VaultEntry.fromJson(e.toJson()).folder, 'Work/Mail');
+    expect(
+        VaultEntry.fromJson(<String, dynamic>{
+          ...e.toJson(),
+          'folder': 'Work//Mail ',
+        }).folder,
+        'Work/Mail');
+  });
+
   test('an entry saved before logins reads with none', () {
     final VaultEntry e = VaultEntry.fromJson(
         <String, dynamic>{'id': 'e1', 'label': 'Mail', 'secret': 'hunter2'});

@@ -1003,6 +1003,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
             label: e.label,
             secret: e.secret,
             login: e.login,
+            folder: e.folder,
             note: e.note,
             mnemonic: e.mnemonic));
       }
@@ -1045,8 +1046,22 @@ class _FormosaScreenState extends State<FormosaScreen> {
           defaultStrength: _kDefaultStrength,
           rollBits: _rollBits,
           entry: entry,
+          folders: _folders(),
         ),
       );
+
+  /// The open vault's folders, each with its parents, sorted.
+  List<String> _folders() {
+    final Set<String> all = <String>{};
+    for (final VaultEntry e in _vault!.contents.entries) {
+      if (e.folder.isEmpty) continue;
+      final List<String> parts = e.folder.split('/');
+      for (int i = 1; i <= parts.length; i++) {
+        all.add(parts.take(i).join('/'));
+      }
+    }
+    return all.toList()..sort();
+  }
 
   Future<void> _addEntry() async {
     final VaultEntry? e = await _entryDialog();
@@ -1394,11 +1409,15 @@ class _FormosaScreenState extends State<FormosaScreen> {
       children: <Widget>[
         Text('${_entriesText(v.contents.entries.length)} · any '
             '${v.header.k} of ${v.header.n} sentences open it.'),
-        for (final VaultEntry e in v.contents.entries)
+        for (final VaultEntry e in List<VaultEntry>.of(v.contents.entries)
+          ..sort((VaultEntry a, VaultEntry b) => a.folder == b.folder
+              ? a.label.compareTo(b.label)
+              : a.folder.compareTo(b.folder)))
           ListTile(
             contentPadding: EdgeInsets.zero,
             title: Text(e.label),
             subtitle: Text(<String>[
+              if (e.folder.isNotEmpty) 'in ${e.folder}',
               if (e.login.isNotEmpty) e.login,
               _shown.contains(e.id) ? e.secret : '••••••••',
               if (e.note.isNotEmpty) e.note,
@@ -1621,10 +1640,14 @@ class _EntryDialog extends StatefulWidget {
     required this.defaultStrength,
     required this.rollBits,
     this.entry,
+    this.folders = const <String>[],
   });
 
   /// The entry edited; null for a new one.
   final VaultEntry? entry;
+
+  /// The vault's folders, suggested.
+  final List<String> folders;
   final formosa.ThemeSet themes;
   final List<int> strengths;
   final int defaultStrength;
@@ -1639,6 +1662,8 @@ class _EntryDialogState extends State<_EntryDialog> {
       TextEditingController(text: widget.entry?.label);
   late final TextEditingController _login =
       TextEditingController(text: widget.entry?.login);
+  late final TextEditingController _folder =
+      TextEditingController(text: widget.entry?.folder);
   late final TextEditingController _secret =
       TextEditingController(text: widget.entry?.secret);
   late final TextEditingController _note =
@@ -1655,6 +1680,7 @@ class _EntryDialogState extends State<_EntryDialog> {
   void dispose() {
     _label.dispose();
     _login.dispose();
+    _folder.dispose();
     _secret.dispose();
     _note.dispose();
     super.dispose();
@@ -1702,6 +1728,18 @@ class _EntryDialogState extends State<_EntryDialog> {
                 controller: _login,
                 decoration:
                     const InputDecoration(labelText: 'Login (optional)'),
+              ),
+              const SizedBox(height: _FormosaScreenState._kGap),
+              DropdownMenu<String>(
+                controller: _folder,
+                expandedInsets: EdgeInsets.zero,
+                enableFilter: true,
+                requestFocusOnTap: true,
+                label: const Text('Folder (optional, e.g. Work/Mail)'),
+                dropdownMenuEntries: <DropdownMenuEntry<String>>[
+                  for (final String f in widget.folders)
+                    DropdownMenuEntry<String>(value: f, label: f),
+                ],
               ),
               TextField(
                 controller: _secret,
@@ -1762,6 +1800,7 @@ class _EntryDialogState extends State<_EntryDialog> {
               label: _label.text.trim(),
               secret: _secret.text,
               login: _login.text.trim(),
+              folder: normalFolder(_folder.text),
               note: _note.text.trim(),
               mnemonic: _mnemonic,
             ));
