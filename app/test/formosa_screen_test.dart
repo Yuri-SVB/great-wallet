@@ -163,6 +163,29 @@ void main() {
     expect(find.textContaining('in Work/Mail'), findsOneWidget,
         reason: 'its folder, normalised');
 
+    // Right and Left step through the folders: all, Work, Work/Mail.
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    for (int i = 0; i < 2; i++) {
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump();
+    }
+    expect(
+        tester
+            .widget<ListTile>(find.ancestor(
+                of: find.byIcon(Icons.folder).last,
+                matching: find.byType(ListTile)))
+            .selected,
+        isTrue,
+        reason: 'the folder Work/Mail, last in its pane');
+    expect(find.textContaining('in Work/Mail'), findsNothing,
+        reason: 'listed in its own folder');
+    for (int i = 0; i < 2; i++) {
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+      await tester.pump();
+    }
+    expect(find.textContaining('in Work/Mail'), findsOneWidget,
+        reason: 'all entries again');
+
     // Locked, then opened with sentences 1, 2, 4 and 6.
     await run(CommandContext.vault, 'Lock');
     await tester.pumpAndSettle();

@@ -105,7 +105,8 @@ class _FormosaScreenState extends State<FormosaScreen> {
   formosa.ThemeSet? _themes;
   _View _view = _View.start;
   final TextEditingController _path = TextEditingController();
-  // The log, newest first; the status is its last line.
+  // The log, newest first (shown at the bottom); the status is its last
+  // line.
   final List<String> _log = <String>[];
   String get _status => _log.isEmpty ? '' : _log.first;
   set _status(String s) {
@@ -1106,6 +1107,15 @@ class _FormosaScreenState extends State<FormosaScreen> {
     });
   }
 
+  /// The folder shown moved by [delta] in the folders pane: all entries,
+  /// then each folder (Left and Right).
+  void _moveFolder(int delta) {
+    if (_vault == null || _context != CommandContext.entries) return;
+    final List<String?> l = <String?>[null, ..._folders()];
+    setState(() =>
+        _folder = l[(l.indexOf(_shownFolder) + delta).clamp(0, l.length - 1)]);
+  }
+
   /// The entry dialog, for [entry] (edited) or a new one.
   Future<VaultEntry?> _entryDialog([VaultEntry? entry]) =>
       showDialog<VaultEntry>(
@@ -1192,6 +1202,12 @@ class _FormosaScreenState extends State<FormosaScreen> {
         (key == LogicalKeyboardKey.arrowUp ||
             key == LogicalKeyboardKey.arrowDown)) {
       _move(key == LogicalKeyboardKey.arrowUp ? -1 : 1);
+      return KeyEventResult.handled;
+    }
+    if (!_typing &&
+        (key == LogicalKeyboardKey.arrowLeft ||
+            key == LogicalKeyboardKey.arrowRight)) {
+      _moveFolder(key == LogicalKeyboardKey.arrowLeft ? -1 : 1);
       return KeyEventResult.handled;
     }
     final KeyEventResult board = _boardKey(e);
@@ -1458,7 +1474,9 @@ class _FormosaScreenState extends State<FormosaScreen> {
                         ? Padding(
                             padding: const EdgeInsets.all(_kGap),
                             child: Text(explaining))
+                        // Newest at the bottom, where it stays anchored.
                         : ListView(
+                            reverse: true,
                             padding:
                                 const EdgeInsets.symmetric(horizontal: _kGap),
                             children: <Widget>[
