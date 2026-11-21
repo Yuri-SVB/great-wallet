@@ -98,13 +98,32 @@ void main() {
     await tester.pumpAndSettle();
     await tester.enterText(find.widgetWithText(TextField, 'Label'), 'Mail');
     await tester.enterText(
+        find.widgetWithText(TextField, 'Login (optional)'), 'alice');
+    await tester.enterText(
         find.widgetWithText(TextField, 'Secret (typed, or generated below)'),
         'hunter2');
     await tester.tap(find.text('Add'));
     await tester.pump();
     await settle();
     expect(find.text('Mail'), findsOneWidget);
-    expect(find.text('hunter2'), findsNothing, reason: 'hidden until shown');
+    expect(find.textContaining('alice'), findsOneWidget, reason: 'its login');
+    expect(find.textContaining('hunter2'), findsNothing,
+        reason: 'hidden until shown');
+    await tester.tap(find.byTooltip('Copy login'));
+    await tester.pump();
+    await settle();
+    expect(find.textContaining("Mail's login: copied"), findsOneWidget);
+
+    // Edited: a new login, the same secret.
+    await tester.tap(find.byTooltip('Edit'));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+        find.widgetWithText(TextField, 'Login (optional)'), 'bob');
+    await tester.tap(find.text('Save'));
+    await tester.pump();
+    await settle();
+    expect(find.textContaining('bob'), findsOneWidget);
+    expect(find.textContaining('alice'), findsNothing);
 
     // Locked, then opened with sentences 1, 2, 4 and 6.
     await tester.tap(find.text('Lock'));

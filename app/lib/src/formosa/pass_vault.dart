@@ -128,12 +128,16 @@ class VaultEntry {
     required this.id,
     required this.label,
     required this.secret,
+    this.login = '',
     this.note = '',
     this.mnemonic = '',
   });
 
   final String id;
   final String label;
+
+  /// The account's name or address, if any: shown, and copied on its own.
+  final String login;
 
   /// What is copied: a password, a seed, anything.
   final String secret;
@@ -146,6 +150,7 @@ class VaultEntry {
         'id': id,
         'label': label,
         'secret': secret,
+        if (login.isNotEmpty) 'login': login,
         if (note.isNotEmpty) 'note': note,
         if (mnemonic.isNotEmpty) 'mnemonic': mnemonic,
       };
@@ -155,16 +160,24 @@ class VaultEntry {
     final Object? id = json['id'],
         label = json['label'],
         secret = json['secret'];
-    final Object? note = json['note'] ?? '', mnemonic = json['mnemonic'] ?? '';
+    final Object? login = json['login'] ?? '',
+        note = json['note'] ?? '',
+        mnemonic = json['mnemonic'] ?? '';
     if (id is! String ||
         label is! String ||
         secret is! String ||
+        login is! String ||
         note is! String ||
         mnemonic is! String) {
       throw const FormatException('bad entry');
     }
     return VaultEntry(
-        id: id, label: label, secret: secret, note: note, mnemonic: mnemonic);
+        id: id,
+        label: label,
+        secret: secret,
+        login: login,
+        note: note,
+        mnemonic: mnemonic);
   }
 }
 

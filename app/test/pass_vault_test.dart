@@ -32,7 +32,8 @@ void main() {
         k: 4,
         kdf: light,
         contents: VaultContents(sentences: sentences, entries: <VaultEntry>[
-          const VaultEntry(id: 'e1', label: 'Mail', secret: 'hunter2'),
+          const VaultEntry(
+              id: 'e1', label: 'Mail', secret: 'hunter2', login: 'alice'),
         ]),
         derive: counted,
         random: Random(1),
@@ -62,6 +63,14 @@ void main() {
     expect(derivations, 1);
     expect(o.wrong, isEmpty);
     expect(o.vault.contents.entries.single.secret, 'hunter2');
+    expect(o.vault.contents.entries.single.login, 'alice');
+  });
+
+  test('an entry saved before logins reads with none', () {
+    final VaultEntry e = VaultEntry.fromJson(
+        <String, dynamic>{'id': 'e1', 'label': 'Mail', 'secret': 'hunter2'});
+    expect(e.login, isEmpty);
+    expect(e.toJson().containsKey('login'), isFalse);
   });
 
   test('3 do not; 5 with one wrong still open it, and name it', () async {

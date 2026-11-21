@@ -1002,6 +1002,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
             id: '$stamp-$i',
             label: e.label,
             secret: e.secret,
+            login: e.login,
             note: e.note,
             mnemonic: e.mnemonic));
       }
@@ -1034,20 +1035,42 @@ class _FormosaScreenState extends State<FormosaScreen> {
     );
   }
 
+  /// The entry dialog, for [entry] (edited) or a new one.
+  Future<VaultEntry?> _entryDialog([VaultEntry? entry]) =>
+      showDialog<VaultEntry>(
+        context: context,
+        builder: (BuildContext ctx) => _EntryDialog(
+          themes: _themes!,
+          strengths: _kStrengths,
+          defaultStrength: _kDefaultStrength,
+          rollBits: _rollBits,
+          entry: entry,
+        ),
+      );
+
   Future<void> _addEntry() async {
-    final VaultEntry? e = await showDialog<VaultEntry>(
-      context: context,
-      builder: (BuildContext ctx) => _EntryDialog(
-        themes: _themes!,
-        strengths: _kStrengths,
-        defaultStrength: _kDefaultStrength,
-        rollBits: _rollBits,
-      ),
-    );
+    final VaultEntry? e = await _entryDialog();
     if (e == null || !mounted) return;
     setState(() => _vault!.contents.entries.add(e));
     await _save();
     _say('${e.label}: added.');
+  }
+
+  /// Edit [e] in place. A new secret starts its card afresh, if memorised.
+  Future<void> _editEntry(VaultEntry e) async {
+    final VaultEntry? edited = await _entryDialog(e);
+    if (edited == null || !mounted) return;
+    final VaultContents c = _vault!.contents;
+    setState(() {
+      c.entries[c.entries.indexOf(e)] = edited;
+      if (edited.secret != e.secret && _entryCard(e) != null) {
+        c.cards
+          ..removeWhere((MemCard x) => x.factId == entryFact(e.id))
+          ..add(MemCard.fact(entryFact(e.id)));
+      }
+    });
+    await _save();
+    _say('${edited.label}: saved.');
   }
 
   // --- the views --------------------------------------------------------------
@@ -1375,15 +1398,28 @@ class _FormosaScreenState extends State<FormosaScreen> {
           ListTile(
             contentPadding: EdgeInsets.zero,
             title: Text(e.label),
-            subtitle: Text(_shown.contains(e.id)
-                ? '${e.secret}${e.note.isEmpty ? '' : '\n${e.note}'}'
-                : '••••••••${e.note.isEmpty ? '' : '\n${e.note}'}'),
+            subtitle: Text(<String>[
+              if (e.login.isNotEmpty) e.login,
+              _shown.contains(e.id) ? e.secret : '••••••••',
+              if (e.note.isNotEmpty) e.note,
+            ].join('\n')),
             trailing: Wrap(
               children: <Widget>[
+                if (e.login.isNotEmpty)
+                  IconButton(
+                    tooltip: 'Copy login',
+                    onPressed: () => _copyText(e.login, '${e.label}\'s login'),
+                    icon: const Icon(Icons.person_outline),
+                  ),
                 IconButton(
                   tooltip: 'Copy',
                   onPressed: () => _copy(e),
                   icon: const Icon(Icons.copy),
+                ),
+                IconButton(
+                  tooltip: 'Edit',
+                  onPressed: () => _editEntry(e),
+                  icon: const Icon(Icons.edit_outlined),
                 ),
                 IconButton(
                   tooltip: _shown.contains(e.id) ? 'Hide' : 'Show',
@@ -1584,8 +1620,11 @@ class _EntryDialog extends StatefulWidget {
     required this.strengths,
     required this.defaultStrength,
     required this.rollBits,
+    this.entry,
   });
 
+  /// The entry edited; null for a new one.
+  final VaultEntry? entry;
   final formosa.ThemeSet themes;
   final List<int> strengths;
   final int defaultStrength;
@@ -1596,20 +1635,26 @@ class _EntryDialog extends StatefulWidget {
 }
 
 class _EntryDialogState extends State<_EntryDialog> {
-  final TextEditingController _label = TextEditingController();
-  final TextEditingController _secret = TextEditingController();
-  final TextEditingController _note = TextEditingController();
+  late final TextEditingController _label =
+      TextEditingController(text: widget.entry?.label);
+  late final TextEditingController _login =
+      TextEditingController(text: widget.entry?.login);
+  late final TextEditingController _secret =
+      TextEditingController(text: widget.entry?.secret);
+  late final TextEditingController _note =
+      TextEditingController(text: widget.entry?.note);
   late String _theme = widget.themes.names.contains(formosa.kDefaultTheme)
       ? formosa.kDefaultTheme
       : widget.themes.names.first;
   late int _strength = widget.defaultStrength;
-  String _mnemonic = '';
+  late String _mnemonic = widget.entry?.mnemonic ?? '';
 
   static const int _kBitsPerByte = 8;
 
   @override
   void dispose() {
     _label.dispose();
+    _login.dispose();
     _secret.dispose();
     _note.dispose();
     super.dispose();
@@ -1640,7 +1685,7 @@ class _EntryDialogState extends State<_EntryDialog> {
   Widget build(BuildContext context) {
     final List<String> names = widget.themes.names.toList()..sort();
     return AlertDialog(
-      title: const Text('Add entry'),
+      title: Text(widget.entry == null ? 'Add entry' : 'Edit entry'),
       content: SizedBox(
         width: _FormosaScreenState._kWidth,
         child: SingleChildScrollView(
@@ -1652,6 +1697,11 @@ class _EntryDialogState extends State<_EntryDialog> {
                 controller: _label,
                 autofocus: true,
                 decoration: const InputDecoration(labelText: 'Label'),
+              ),
+              TextField(
+                controller: _login,
+                decoration:
+                    const InputDecoration(labelText: 'Login (optional)'),
               ),
               TextField(
                 controller: _secret,
@@ -1707,14 +1757,16 @@ class _EntryDialogState extends State<_EntryDialog> {
           onPressed: () {
             if (_label.text.trim().isEmpty || _secret.text.isEmpty) return;
             Navigator.of(context).pop(VaultEntry(
-              id: '${DateTime.now().microsecondsSinceEpoch}',
+              id: widget.entry?.id ??
+                  '${DateTime.now().microsecondsSinceEpoch}',
               label: _label.text.trim(),
               secret: _secret.text,
+              login: _login.text.trim(),
               note: _note.text.trim(),
               mnemonic: _mnemonic,
             ));
           },
-          child: const Text('Add'),
+          child: Text(widget.entry == null ? 'Add' : 'Save'),
         ),
       ],
     );
