@@ -15,7 +15,7 @@ import 'package:great_wallet_app/src/setup/setup_screen.dart';
 /// advance into stage 1 is halted after two of three passes and stopped there
 /// (D = 2, at once); the setup is written with the passes kept; D raised to 3
 /// runs one pass only, lowered to 1 lands at once; stage 1's first point
-/// confirms D and drops the passes.
+/// confirms D, and m with it, and drops the passes.
 void main() {
   GreatWallCore? core;
   String? openError;
@@ -248,6 +248,13 @@ void main() {
                 find.widgetWithText(TextField, 'Derivation steps / stage'))
             .enabled,
         isFalse);
+    // m locks with it.
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await alt(LogicalKeyboardKey.keyW); // Setup board
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyW); // Profile m
+    await tester.pump();
+    expect(log(), contains('m confirmed: stage 1 holds a point.'));
+    expect(tester.widget<Slider>(find.byType(Slider)).onChanged, isNull);
 
     await tester.pumpWidget(const SizedBox());
     await settle();

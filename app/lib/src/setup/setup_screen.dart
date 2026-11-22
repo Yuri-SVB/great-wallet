@@ -232,8 +232,8 @@ class _SetupScreenState extends State<SetupScreen>
     _trail.clear();
   }
 
-  /// Whether D is confirmed: stage 1 holds a point you placed. D is then the
-  /// same for every stage, and fixed.
+  /// Whether D and m are confirmed: stage 1 holds a point you placed. Both are
+  /// then the same for every stage, and fixed.
   bool get _dConfirmed {
     for (int s = 1; s <= _maxSlot; s++) {
       if (_placed(1, s)) return true;
@@ -5109,7 +5109,7 @@ press.calibrate.target    tick_soft.wav
     final int idx = _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
     // Profile name lives in the console (focus _Field.profile); the slider thumb
     // label still shows it on drag.
-    return _track(
+    final Widget slider = _track(
       _Field.profile,
       Row(
         children: <Widget>[
@@ -5122,7 +5122,8 @@ press.calibrate.target    tick_soft.wav
               max: (_profiles.length - 1).toDouble(),
               divisions: _profiles.length - 1,
               label: _profileLabels[idx],
-              onChanged: _busy
+              // m locks with D: every pass, at every stage, depends on it.
+              onChanged: _busy || _dConfirmed
                   ? null
                   : (double v) {
                       final Argon2Profile next = _profiles[v.round()];
@@ -5130,19 +5131,27 @@ press.calibrate.target    tick_soft.wav
                       _sounds.play(UiSound.tickSoft);
                       // A pass takes another time at another profile, and
                       // gives another digest: passes kept, a halted advance
-                      // and an unconfirmed stage 1 no longer apply.
+                      // and stage 1 (no point placed yet) no longer apply.
                       setState(() {
                         _profile = next;
                         _passSeconds = null;
+                        _restartCard(kProfileFact);
                         _clearTrail();
-                        _clearAdvanceCheckpoint();
-                        if (!_dConfirmed) _invalidateDeeperThan(0);
+                        _invalidateDeeperThan(0);
                       });
                     },
             ),
           ),
         ],
       ),
+    );
+    if (!_dConfirmed) return slider;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        slider,
+        const Text('m confirmed: stage 1 holds a point.'),
+      ],
     );
   }
 
@@ -6293,7 +6302,8 @@ press.calibrate.target    tick_soft.wav
         final int idx =
             _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
         return 'Argon2 profile: ${_profileLabels[idx]} — memory per pass. '
-            '← → or drag to change.';
+            '← → or drag to change. Stage 1\'s first point confirms it, with '
+            'D, for every stage.';
       case _Field.exportLabel:
         return 'Key (master-secret export): this stage’s orbit key '
             'Kᵢ = TH(tag, oᵢ ‖ Shᵢ), fixed once rᵢ fractals are placed and '
