@@ -216,6 +216,44 @@ class _SetupScreenState extends State<SetupScreen>
   /// change to `D` (the pass count it is relative to).
   ({int stage, int pass, Uint8List digest})? _advanceCheckpoint;
 
+  /// While D is open to change, the passes kept: the digest after each pass
+  /// of the advance into stage 1 (`_trail[p - 1]` after pass p), at
+  /// [_profile]. D can then go down to any pass kept (o₁ is that digest) or up
+  /// from the last one, nothing recomputed ([_setD]). Dropped when D is
+  /// confirmed — stage 1's first point placed — and with what it derives from
+  /// (σ, stage 0's points, the profile). Written with the setup, under the
+  /// provisional key.
+  final List<Uint8List> _trail = <Uint8List>[];
+
+  void _clearTrail() {
+    for (final Uint8List d in _trail) {
+      Entropy.wipe(d);
+    }
+    _trail.clear();
+  }
+
+  /// Whether D is confirmed: stage 1 holds a point you placed. D is then the
+  /// same for every stage, and fixed.
+  bool get _dConfirmed {
+    for (int s = 1; s <= _maxSlot; s++) {
+      if (_placed(1, s)) return true;
+    }
+    return false;
+  }
+
+  /// Keep pass [done]'s [digest] of an advance into [target]: stage 1's, while
+  /// D is open.
+  void _keepPass(int target, int done, Uint8List digest) {
+    if (target == 1 && done == _trail.length + 1 && !_dConfirmed) {
+      _trail.add(Uint8List.fromList(digest));
+    }
+  }
+
+  /// Whether the setup can be written as stage 0 and the passes kept: D is
+  /// open and stage 0 settled, though stage 1 is not.
+  bool get _savesTrail =>
+      _trail.isNotEmpty && !_dConfirmed && _orbitK[0] != null;
+
   /// Whether a halted advance can be resumed right now: its checkpoint is for
   /// the next stage to derive, its prefix is still settled, and `D` still agrees
   /// with the pass it stopped at.
@@ -2715,6 +2753,7 @@ press.calibrate.target    tick_soft.wav
     // convenience, so it skips the "advancing" scrim; D >= 1 shows it.
     final int steps = _iterations;
     final bool memoryHard = steps >= 1;
+    if (target == 1) _clearTrail(); // a fresh advance: fresh passes
     if (memoryHard) {
       setState(() {
         _advancing = true;
@@ -2756,6 +2795,7 @@ press.calibrate.target    tick_soft.wav
             pass: done,
             digest: Uint8List.fromList(digest),
           );
+          _keepPass(target, done, digest);
         },
       );
       _advanceJob = job;
@@ -2787,7 +2827,8 @@ press.calibrate.target    tick_soft.wav
       _toast(done > 0
           ? 'Advance into Stage $target halted after $done/$steps passes — '
               'kept. Resume (${_hint(_Cmd.halt)}) or selecting Stage $target '
-              'continues from there; Write '
+              'continues from there${target == 1 ? '; Stop here, under Steps D '
+                  '(${_hint(_Cmd.steps)}), sets D to $done' : ''}; Write '
               '(${_hint(_Cmd.save)}) keeps it across sessions (the file then '
               'holds the partial derivation — guard it). Changing D, or '
               're-placing a point in a shallower stage, discards it.'
@@ -2808,7 +2849,65 @@ press.calibrate.target    tick_soft.wav
     _clearAdvanceCheckpoint(); // the advance landed; the checkpoint is spent
     _setOrbitStage(target);
     _sounds.play(UiSound.stageReady);
-    _toast('Advanced to stage $target — place its points.');
+    _toastAdvanced(target);
+  }
+
+  /// The advance into [target] landed.
+  void _toastAdvanced(int target) => _toast(target == 1 && _trail.isNotEmpty
+      ? 'Advanced to stage 1 — place its points. Until its first point, D can '
+          'change at no cost: the ${_trail.length} passes are kept.'
+      : 'Advanced to stage $target — place its points.');
+
+  /// D set to [v]. Until D is confirmed, the passes kept make it cheap: at or
+  /// below them, o₁ lands at once; above, the advance resumes from the last
+  /// one (Resume, or selecting stage 1). Without passes kept, a stage 1
+  /// derived for the old D is dropped. Once D is confirmed, it stays.
+  void _setD(int v) {
+    if (v == _iterations || _dConfirmed) return;
+    final int kept = _trail.length;
+    setState(() {
+      _iterations = v;
+      _restartCard(kIterationsFact);
+      // Stage 1 (no point placed yet) was for the old D.
+      _invalidateDeeperThan(0);
+      if (kept > 0 && v >= 1 && v <= kept) {
+        _orbitO[1] = Uint8List.fromList(_trail[v - 1]);
+      } else if (kept > 0 && v > kept) {
+        _advanceCheckpoint =
+            (stage: 1, pass: kept, digest: Uint8List.fromList(_trail.last));
+      }
+    });
+    if (_orbitStage == 1) _setOrbitStage(_orbitO[1] == null ? 0 : 1);
+  }
+
+  /// D stepped by [delta] (− and +, or Up and Down in its field).
+  void _stepD(int delta) {
+    final int v = math.max(0, _iterations + delta);
+    _iterationsField.text = '$v';
+    _setD(v);
+  }
+
+  /// Stop here: D set to the passes kept of a halted advance into stage 1,
+  /// which lands at once.
+  void _stopHere() {
+    final int v = _trail.length;
+    if (_busy || v == 0 || v >= _iterations || _dConfirmed) return;
+    _iterationsField.text = '$v';
+    _setD(v);
+    _setOrbitStage(1);
+    _sounds.play(UiSound.stageReady);
+    _toast('D = $v: stage 1 from the passes kept — place its points; the '
+        'first confirms D.');
+  }
+
+  /// Fact card [factId], if in the deck, starts afresh: its answer changed.
+  void _restartCard(String factId) {
+    final Deck? deck = _deck;
+    if (deck == null || !deck.cards.any((MemCard c) => c.factId == factId)) {
+      return;
+    }
+    _deck = deck.withCard(MemCard.fact(factId));
+    _deckDirty = true;
   }
 
   /// Refine [_passSeconds] from a running advance: [passes] done in [timer]'s
@@ -2875,6 +2974,7 @@ press.calibrate.target    tick_soft.wav
             pass: done,
             digest: Uint8List.fromList(digest),
           );
+          _keepPass(target, done, digest);
         },
       );
       _advanceJob = job;
@@ -2916,7 +3016,7 @@ press.calibrate.target    tick_soft.wav
     _clearAdvanceCheckpoint();
     _setOrbitStage(target);
     _sounds.play(UiSound.stageReady);
-    _toast('Advanced to stage $target — place its points.');
+    _toastAdvanced(target);
   }
 
   /// Move the orbit cursor to [index] and reset the per-board transient state so
@@ -4103,6 +4203,17 @@ press.calibrate.target    tick_soft.wav
       _dropPaths();
       _boardCanonicalView = false;
     });
+    // Stage 0's points re-root stage 1, and stage 1's first point confirms D:
+    // either way the passes kept no longer serve.
+    if (stage <= 1 && _trail.isNotEmpty) {
+      final int kept = _trail.length;
+      setState(_clearTrail);
+      if (stage == 1) {
+        _toast('D = $_iterations confirmed: stage 1 holds a point, and D is the '
+            'same for every stage. The $kept passes kept to change it are '
+            'dropped.');
+      }
+    }
     // Pick the marker mode for the freshly placed point at the current zoom.
     _updateBoardMarkerMode();
   }
@@ -4287,6 +4398,7 @@ press.calibrate.target    tick_soft.wav
   /// old points no longer decode, and on dispose.
   void _clearOrbitPlacements() {
     _clearAdvanceCheckpoint(); // a re-rooted orbit invalidates a halted advance
+    _clearTrail();
     _deckDirty = false;
     _review.clear();
     for (int st = 0; st <= _maxStage; st++) {
@@ -4883,11 +4995,14 @@ press.calibrate.target    tick_soft.wav
       ),
     ));
     if (!mounted || r == null) return;
-    setState(() {
-      _iterations = r.n;
-      _iterationsField.text = r.n.toString();
-      _passSeconds = r.secPerPass;
-    });
+    setState(() => _passSeconds = r.secPerPass);
+    if (_dConfirmed) {
+      _toast('D stays $_iterations: stage 1 holds a point, and D is the same '
+          'for every stage.');
+      return;
+    }
+    _iterationsField.text = r.n.toString();
+    _setD(r.n);
     _sounds.play(UiSound.confirm);
   }
 
@@ -4896,12 +5011,14 @@ press.calibrate.target    tick_soft.wav
     final bool invalid = raw.isNotEmpty && !_iterationsValid;
     // Label/help live in the console (focus _Field.iterations); keep only the
     // field (with its validation error) in the panel.
-    return _track(
+    final bool open = !_busy && !_dConfirmed;
+    final int kept = _trail.length;
+    final Widget field = _track(
         _Field.iterations,
         TextField(
           controller: _iterationsField,
           focusNode: _iterationsFocus,
-          enabled: !_busy,
+          enabled: open,
           maxLines: 1,
           keyboardType: TextInputType.number,
           inputFormatters: <TextInputFormatter>[
@@ -4918,14 +5035,58 @@ press.calibrate.target    tick_soft.wav
           onChanged: (_) {
             _sounds.play(UiSound.tickSoft);
             final int? v = int.tryParse(_iterationsField.text.trim());
-            if (v != null && v >= 0 && v != _iterations) {
-              _iterations = v;
-              // The checkpoint's `pass` is relative to D; a new D orphans it.
-              _clearAdvanceCheckpoint();
-            }
+            if (v != null && v >= 0) _setD(v);
             setState(() {});
           },        ),
       );
+    final int more = _iterations - kept;
+    final double? pass = _passSeconds;
+    final String about = pass == null
+        ? ''
+        : ' (about ${durationText(Duration(seconds: (pass * more).round()))})';
+    final String hint = _dConfirmed
+        ? 'D confirmed: stage 1 holds a point.'
+        : kept == 0
+            ? ''
+            : more <= 0
+                ? '$kept passes kept: D = $_iterations lands at once.'
+                : '$kept passes kept: D = $_iterations runs $more more$about.';
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        Row(
+          children: <Widget>[
+            IconButton(
+              tooltip: 'D − 1',
+              onPressed: open && _iterations > 0 ? () => _stepD(-1) : null,
+              icon: const Icon(Icons.remove),
+            ),
+            Expanded(
+              child: CallbackShortcuts(
+                bindings: <ShortcutActivator, VoidCallback>{
+                  const SingleActivator(LogicalKeyboardKey.arrowUp): () =>
+                      _stepD(1),
+                  const SingleActivator(LogicalKeyboardKey.arrowDown): () =>
+                      _stepD(-1),
+                },
+                child: field,
+              ),
+            ),
+            IconButton(
+              tooltip: 'D + 1',
+              onPressed: open ? () => _stepD(1) : null,
+              icon: const Icon(Icons.add),
+            ),
+          ],
+        ),
+        if (hint.isNotEmpty) Text(hint, textAlign: TextAlign.center),
+        if (open && kept > 0 && kept < _iterations && _orbitO[1] == null)
+          TextButton(
+            onPressed: _stopHere,
+            child: Text('Stop here (D = $kept)'),
+          ),
+      ],
+    );
   }
 
   /// The three Argon2 memory profiles in ascending cost, paired with their
@@ -4967,10 +5128,15 @@ press.calibrate.target    tick_soft.wav
                       final Argon2Profile next = _profiles[v.round()];
                       if (next == _profile) return;
                       _sounds.play(UiSound.tickSoft);
-                      // A pass takes another time at another profile.
+                      // A pass takes another time at another profile, and
+                      // gives another digest: passes kept, a halted advance
+                      // and an unconfirmed stage 1 no longer apply.
                       setState(() {
                         _profile = next;
                         _passSeconds = null;
+                        _clearTrail();
+                        _clearAdvanceCheckpoint();
+                        if (!_dConfirmed) _invalidateDeeperThan(0);
                       });
                     },
             ),
@@ -5037,9 +5203,14 @@ press.calibrate.target    tick_soft.wav
   ///
   /// The result **is the secret** — the caller MUST [OrbitVault.wipe] it.
   OrbitVault _exportOrbitVault() {
-    final int deepest = _orbitDeepestStage;
+    // While D is open, stage 0 and the passes kept: stage 1 lands from them.
+    final bool trail = _savesTrail;
+    final int deepest = trail ? 0 : _orbitDeepestStage;
     final ({int stage, int pass, Uint8List digest})? cp = _advanceCheckpoint;
     return OrbitVault(
+      trail: trail
+          ? <List<int>>[for (final Uint8List d in _trail) List<int>.of(d)]
+          : const <List<int>>[],
       deck: _deckForSave(deepest),
       passSeconds: _passSeconds,
       gapSeconds: _gapSeconds,
@@ -5094,7 +5265,7 @@ press.calibrate.target    tick_soft.wav
     Uint8List? providedKey,
     int genLenBytes = SetupCrypto.keyLenBytes,
   }) async {
-    if (!_orbitSettled) {
+    if (!_orbitSettled && !_savesTrail) {
       return (error: 'This setup cannot be saved yet.', key: null);
     }
     final OrbitVault vault = _exportOrbitVault();
@@ -5151,6 +5322,8 @@ press.calibrate.target    tick_soft.wav
     if (sigma == null || sigma.isEmpty) return _vaultOpaqueError;
     final int deepest = vault.stages.length - 1;
     if (deepest < 0 || deepest > _maxStage) return _vaultOpaqueError;
+    // Passes kept ride only with stage 0 alone: D was still open.
+    if (vault.trail.isNotEmpty && deepest != 0) return _vaultOpaqueError;
 
     // Validate the whole file and resolve every stage's o_i and board
     // reservoirs first — the decode below is the expensive part, and a partial
@@ -5279,6 +5452,24 @@ press.calibrate.target    tick_soft.wav
           digest: Uint8List.fromList(r.digest),
         );
       }
+      // The passes kept while D is open: stage 1 lands from them at once, or
+      // the advance resumes from the last one.
+      if (vault.trail.isNotEmpty && _orbitK[0] != null) {
+        for (final List<int> d in vault.trail) {
+          _trail.add(Uint8List.fromList(d));
+        }
+        _clearAdvanceCheckpoint();
+        final int d = vault.iterations;
+        if (d >= 1 && d <= _trail.length) {
+          _orbitO[1] = Uint8List.fromList(_trail[d - 1]);
+        } else if (d > _trail.length) {
+          _advanceCheckpoint = (
+            stage: 1,
+            pass: _trail.length,
+            digest: Uint8List.fromList(_trail.last),
+          );
+        }
+      }
     });
     _setOrbitStage(deepest);
     // A new setup: its deck as saved — with a card for every map, the derived
@@ -5295,7 +5486,7 @@ press.calibrate.target    tick_soft.wav
   /// the key dialog. The key can be overridden with the user's own entropy
   /// from inside that dialog.
   Future<void> _writeSetup() async {
-    if (!_orbitSettled) {
+    if (!_orbitSettled && !_savesTrail) {
       _sounds.play(UiSound.denyInput);
       _toast('Finish a setup first — there is nothing to write yet.');
       return;
@@ -6094,7 +6285,10 @@ press.calibrate.target    tick_soft.wav
             'the memory-hard passes each stage runs — the orbit advance '
             'oᵢ₊₁ = H*(Kᵢ). Higher = longer, '
             'stronger (hours to weeks); 0 = instant pass-through (dev only, not '
-            'memory-hard).';
+            'memory-hard). Until stage 1 holds a point, every pass into it is '
+            'kept: D can go down to any of them at once, or up from the last, '
+            'nothing lost. Stage 1\'s first point confirms D, for every stage. '
+            '− / + or Up / Down step it.';
       case _Field.profile:
         final int idx =
             _profiles.indexOf(_profile).clamp(0, _profiles.length - 1);
@@ -7699,6 +7893,10 @@ class _CalibrationDialogState extends State<_CalibrationDialog> {
 
                     // 2 — target time.
                     Text('2 · Target time', style: theme.textTheme.labelLarge),
+                    const SizedBox(height: 6),
+                    const Text('A starting target: until stage 1 holds a '
+                        'point, you can stop earlier or go further, every pass '
+                        'kept.'),
                     const SizedBox(height: 6),
                     Wrap(
                       spacing: 10,
