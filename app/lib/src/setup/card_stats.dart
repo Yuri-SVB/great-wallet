@@ -28,7 +28,7 @@ String chanceText(double r) => r == 0 || r >= _kWholePercentFrom
 const double _kWholePercentFrom = 0.01;
 const int _kSmallDigits = 2;
 
-/// A duration in days and hours, hours and minutes, or minutes.
+/// A duration in days and hours, hours and minutes, minutes, or seconds.
 String durationText(Duration d) {
   if (d.inDays >= 1) {
     return '${d.inDays} d ${d.inHours % Duration.hoursPerDay} h';
@@ -36,7 +36,8 @@ String durationText(Duration d) {
   if (d.inHours >= 1) {
     return '${d.inHours} h ${d.inMinutes % Duration.minutesPerHour} min';
   }
-  return '${d.inMinutes} min';
+  if (d.inMinutes >= 1) return '${d.inMinutes} min';
+  return '${d.inSeconds} s';
 }
 
 /// A card's name in the wizard.

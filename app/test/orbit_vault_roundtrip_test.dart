@@ -100,6 +100,16 @@ void main() {
       expect(() => OrbitVault.fromJson(json), throwsFormatException);
     });
 
+    test('T covering a hard reset round-trips; off is left out', () {
+      final Map<String, dynamic> json = envelopeVault().toJson();
+      expect(json.containsKey('gapPlusReset'), isFalse);
+      json['gapPlusReset'] = true;
+      expect(OrbitVault.fromJson(json).gapPlusReset, isTrue);
+      expect(OrbitVault.fromJson(json).toJson()['gapPlusReset'], isTrue);
+      json['gapPlusReset'] = 'yes';
+      expect(() => OrbitVault.fromJson(json), throwsFormatException);
+    });
+
     test('a payload above the minimum is padded to the next power of two',
         () async {
       final String big = 'x' * (SetupCrypto.paddedMin + 1);

@@ -256,6 +256,58 @@ void main() {
     expect(log(), contains('m confirmed: stage 1 holds a point.'));
     expect(tester.widget<Slider>(find.byType(Slider)).onChanged, isNull);
 
+    // Stage 1 settled (3 points), the gate's T can also cover a hard reset:
+    // T grows by the derivation time, and the choice is kept.
+    for (final (LogicalKeyboardKey slot, String hex) in <(
+      LogicalKeyboardKey,
+      String
+    )>[
+      (LogicalKeyboardKey.digit2, '2468ACE0'),
+      (LogicalKeyboardKey.digit3, '0F1E2D3C'),
+    ]) {
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.sendKeyEvent(slot);
+      await alt(LogicalKeyboardKey.keyW);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyD); // Import hex
+      await tester.pump();
+      final Finder field = find.byWidgetPredicate((Widget w) =>
+          w is TextField &&
+          (w.decoration?.labelText ?? '').endsWith('8 hex digits'));
+      await tester.enterText(field, hex);
+      await tester.tap(find.widgetWithText(FilledButton, 'Apply'));
+      await tester.pump();
+      for (int i = 0; i < 1200 && field.evaluate().isNotEmpty; i++) {
+        await wait(100);
+      }
+    }
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.sendKeyEvent(LogicalKeyboardKey.f3); // Train
+    await tester.pump();
+    Future<void> graduation() async {
+      await alt(LogicalKeyboardKey.keyW); // Train board
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyX); // Graduation
+      await tester.pumpAndSettle();
+    }
+
+    String tNow() => tester
+        .widgetList<Text>(find.textContaining('T is now'))
+        .single
+        .data!;
+    await graduation();
+    final String before = tNow();
+    final Finder option = find.widgetWithText(
+        CheckboxListTile, 'T also covers a hard reset');
+    expect(tester.widget<CheckboxListTile>(option).value, isFalse);
+    await tester.tap(option);
+    await tester.pump();
+    expect(tNow(), isNot(before), reason: 'T grows by the derivation time');
+    await tester.tap(find.widgetWithText(FilledButton, 'Apply'));
+    await tester.pumpAndSettle();
+    await graduation();
+    expect(tester.widget<CheckboxListTile>(option).value, isTrue);
+    await tester.tap(find.text('Cancel').last);
+    await tester.pumpAndSettle();
+
     await tester.pumpWidget(const SizedBox());
     await settle();
   }, timeout: const Timeout(Duration(minutes: 10)));

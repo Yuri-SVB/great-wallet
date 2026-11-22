@@ -356,6 +356,11 @@ class _SetupScreenState extends State<SetupScreen>
   int? _gapSeconds;
   double _epsilon = GraduationParams.defaultEpsilon;
 
+  /// Whether `T` also covers a hard reset — a panic wipe at the last minute,
+  /// then the derivation run again from memory: `T` grows by the derivation
+  /// time. Off by default; saved with the setup.
+  bool _gapPlusReset = false;
+
   /// The gap until a derivation time is known.
   static const Duration _kGapFallback = Duration(days: 7);
 
@@ -371,10 +376,19 @@ class _SetupScreenState extends State<SetupScreen>
   }
 
   /// The gate's target gap `T`: the one set, else the derivation time, else
-  /// [_kGapFallback].
-  Duration get _gap => _gapSeconds != null
-      ? Duration(seconds: _gapSeconds!)
-      : _derivationTime ?? _kGapFallback;
+  /// [_kGapFallback] — plus the derivation time when it also covers a hard
+  /// reset ([_gapPlusReset]).
+  Duration get _gap => _withReset(
+      _gapSeconds != null
+          ? Duration(seconds: _gapSeconds!)
+          : _derivationTime ?? _kGapFallback,
+      _gapPlusReset);
+
+  /// [gap], plus the derivation time if [plusReset] and it is known.
+  Duration _withReset(Duration gap, bool plusReset) {
+    final Duration? derivation = _derivationTime;
+    return plusReset && derivation != null ? gap + derivation : gap;
+  }
 
   /// Every stage of the open setup at the graduation gate, [gap] from now,
   /// against [epsilon].
@@ -3786,6 +3800,7 @@ press.calibrate.target    tick_soft.wav
             : (_gapSeconds! / Duration.secondsPerDay).toString());
     final TextEditingController epsInput = TextEditingController(
         text: (_epsilon * _kPercentScale).toString());
+    bool plusReset = _gapPlusReset;
     bool wipe = false;
     final DialogRoute<void> route = DialogRoute<void>(
         context: context,
@@ -3793,9 +3808,10 @@ press.calibrate.target    tick_soft.wav
           builder: (BuildContext ctx, void Function(void Function()) setLocal) {
             final double? days = double.tryParse(gapInput.text.trim());
             final double? pct = double.tryParse(epsInput.text.trim());
-            final Duration gap = days != null && days > 0
+            final Duration base = days != null && days > 0
                 ? Duration(seconds: (days * Duration.secondsPerDay).round())
                 : derivation ?? _kGapFallback;
+            final Duration gap = _withReset(base, plusReset);
             final double eps =
                 pct != null && pct > 0 ? pct / _kPercentScale : _epsilon;
             final List<StageGate> gates = _gatesWith(gap, eps);
@@ -3837,7 +3853,8 @@ press.calibrate.target    tick_soft.wav
                 if (!go) return;
               }
               setState(() {
-                _gapSeconds = days != null && days > 0 ? gap.inSeconds : null;
+                _gapSeconds = days != null && days > 0 ? base.inSeconds : null;
+                _gapPlusReset = plusReset;
                 _epsilon = eps;
                 _deckDirty = true;
               });
@@ -3895,6 +3912,22 @@ press.calibrate.target    tick_soft.wav
                           field(epsInput, 'ε (%)',
                               chanceText(GraduationParams.defaultEpsilon)),
                         ],
+                      ),
+                      CheckboxListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        controlAffinity: ListTileControlAffinity.leading,
+                        value: plusReset,
+                        onChanged: derivation == null
+                            ? null
+                            : (bool? v) => setLocal(() => plusReset = v!),
+                        title: const Text('T also covers a hard reset'),
+                        subtitle: Text('For a panic wipe at the last minute, '
+                            'then the derivation run again from memory: T '
+                            'grows by the derivation time'
+                            '${derivation == null ? ' (unknown yet)' : ', '
+                                '${durationText(derivation)}'}. '
+                            'T is now ${durationText(gap)}.'),
                       ),
                       const SizedBox(height: 12),
                       for (final StageGate g in gates)
@@ -5223,6 +5256,7 @@ press.calibrate.target    tick_soft.wav
       deck: _deckForSave(deepest),
       passSeconds: _passSeconds,
       gapSeconds: _gapSeconds,
+      gapPlusReset: _gapPlusReset,
       epsilon:
           _epsilon == GraduationParams.defaultEpsilon ? null : _epsilon,
       facts: _customFacts.values.toList(),
@@ -5414,6 +5448,7 @@ press.calibrate.target    tick_soft.wav
       _profile = vault.profile;
       _passSeconds = vault.passSeconds;
       _gapSeconds = vault.gapSeconds;
+      _gapPlusReset = vault.gapPlusReset;
       _epsilon = vault.epsilon ?? GraduationParams.defaultEpsilon;
       _customFacts
         ..clear()

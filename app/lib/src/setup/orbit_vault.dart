@@ -44,6 +44,7 @@ class OrbitVault {
     this.passSeconds,
     this.gapSeconds,
     this.epsilon,
+    this.gapPlusReset = false,
     this.facts = const <CustomFact>[],
     this.studied = const <List<int>>[],
   });
@@ -120,6 +121,11 @@ class OrbitVault {
   int? gapSeconds;
   double? epsilon;
 
+  /// Whether `T` also covers a hard reset: a panic wipe at the last minute,
+  /// then the derivation run again from memory. `T` grows by the derivation
+  /// time. Off by default.
+  bool gapPlusReset;
+
   /// Your own fact cards: prompts and answers. Their schedules are in [deck].
   final List<CustomFact> facts;
 
@@ -143,6 +149,7 @@ class OrbitVault {
         if (passSeconds != null) 'passSeconds': passSeconds,
         if (gapSeconds != null) 'gapSeconds': gapSeconds,
         if (epsilon != null) 'epsilon': epsilon,
+        if (gapPlusReset) 'gapPlusReset': true,
         if (facts.isNotEmpty)
           'facts': <Map<String, dynamic>>[
             for (final CustomFact f in facts) f.toJson(),
@@ -194,6 +201,11 @@ class OrbitVault {
       passSeconds: _optionalPositive(json, 'passSeconds'),
       gapSeconds: _optionalPositive(json, 'gapSeconds')?.round(),
       epsilon: _optionalPositive(json, 'epsilon'),
+      gapPlusReset: switch (json['gapPlusReset']) {
+        null => false,
+        final bool b => b,
+        _ => throw const FormatException('bad vault'),
+      },
       facts: _facts(json['facts']),
       studied: _studied(json['studied'], rawStages.length),
     );
