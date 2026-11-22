@@ -84,6 +84,22 @@ void main() {
     // group does a handful — well past the 30 s default.
     const Timeout slow = Timeout(Duration(minutes: 10));
 
+    test('the trail round-trips, one orbit point per pass; a torn one fails',
+        () {
+      final Map<String, dynamic> json = envelopeVault().toJson();
+      final List<int> passes = <int>[
+        for (int p = 0; p < 3; p++)
+          for (int b = 0; b < kOrbitPointLen; b++) (p * 7 + b) & 0xFF,
+      ];
+      json['trail'] = base64Encode(passes);
+      final OrbitVault v = OrbitVault.fromJson(json);
+      expect(v.trail, hasLength(3));
+      expect(v.trail[1].first, 7);
+      expect(v.toJson()['trail'], json['trail']);
+      json['trail'] = base64Encode(passes.sublist(1));
+      expect(() => OrbitVault.fromJson(json), throwsFormatException);
+    });
+
     test('a payload above the minimum is padded to the next power of two',
         () async {
       final String big = 'x' * (SetupCrypto.paddedMin + 1);

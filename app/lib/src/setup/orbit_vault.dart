@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:celestial_peace_nf_core/celestial_peace_nf_core.dart'
     show Deck;
 
@@ -37,6 +39,7 @@ class OrbitVault {
     required this.profile,
     required this.stages,
     this.resume,
+    this.trail = const <List<int>>[],
     this.deck,
     this.passSeconds,
     this.gapSeconds,
@@ -91,6 +94,13 @@ class OrbitVault {
   /// instead of restarting it.
   OrbitVaultResume? resume;
 
+  /// While D is open to change (stage 1 holds no point you placed): the
+  /// digest after each pass of the advance into stage 1, `trail[p - 1]`
+  /// after pass p. So D can be lowered to any pass kept (o₁ is that digest)
+  /// or raised from the last one, nothing recomputed. Empty once D is
+  /// confirmed. Coercion-relevant, as [resume]: it leads to o₁.
+  final List<List<int>> trail;
+
   /// The CPNF deck (celestial-peace-nf-core): which maps are memorised, their
   /// landmark cues and their SM-2 state, saved with the setup under the
   /// provisional key. Null until the setup is first saved with one. It holds
@@ -127,6 +137,8 @@ class OrbitVault {
           for (final OrbitVaultStage s in stages) s.toJson()
         ],
         if (resume != null) 'resume': resume!.toJson(),
+        if (trail.isNotEmpty)
+          'trail': base64Encode(<int>[for (final List<int> d in trail) ...d]),
         if (deck != null) 'deck': deck!.toJson(),
         if (passSeconds != null) 'passSeconds': passSeconds,
         if (gapSeconds != null) 'gapSeconds': gapSeconds,
@@ -177,6 +189,7 @@ class OrbitVault {
           : OrbitVaultResume.fromJson(rawResume is Map<String, dynamic>
               ? rawResume
               : throw const FormatException('bad vault')),
+      trail: _trail(json['trail']),
       deck: rawDeck == null ? null : _deck(rawDeck),
       passSeconds: _optionalPositive(json, 'passSeconds'),
       gapSeconds: _optionalPositive(json, 'gapSeconds')?.round(),
@@ -184,6 +197,25 @@ class OrbitVault {
       facts: _facts(json['facts']),
       studied: _studied(json['studied'], rawStages.length),
     );
+  }
+
+  /// The trail section: absent, or base64 of whole orbit points, one per pass.
+  static List<List<int>> _trail(Object? raw) {
+    if (raw == null) return const <List<int>>[];
+    if (raw is! String) throw const FormatException('bad vault');
+    final List<int> bytes;
+    try {
+      bytes = base64Decode(raw);
+    } on FormatException {
+      throw const FormatException('bad vault');
+    }
+    if (bytes.isEmpty || bytes.length % kOrbitPointLen != 0) {
+      throw const FormatException('bad vault');
+    }
+    return <List<int>>[
+      for (int i = 0; i < bytes.length; i += kOrbitPointLen)
+        bytes.sublist(i, i + kOrbitPointLen),
+    ];
   }
 
   /// The studied-maps section: absent, or per stage a list of distinct slots
@@ -232,6 +264,9 @@ class OrbitVault {
       s.wipe();
     }
     resume?.wipe();
+    for (final List<int> d in trail) {
+      d.fillRange(0, d.length, 0);
+    }
   }
 
   @override
