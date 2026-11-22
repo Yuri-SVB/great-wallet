@@ -225,6 +225,12 @@ class _SetupScreenState extends State<SetupScreen>
   /// provisional key.
   final List<Uint8List> _trail = <Uint8List>[];
 
+  /// The first stage this setup keeps: 0, or past the earlier stages deleted
+  /// from the file (Graduation's *Delete earlier stages*). Those have no
+  /// points, keys or cards here, cannot be selected, and are left out of the
+  /// gate; only a hard reset checks them.
+  int _firstStage = 0;
+
   void _clearTrail() {
     for (final Uint8List d in _trail) {
       Entropy.wipe(d);
@@ -235,6 +241,7 @@ class _SetupScreenState extends State<SetupScreen>
   /// Whether D and m are confirmed: stage 1 holds a point you placed. Both are
   /// then the same for every stage, and fixed.
   bool get _dConfirmed {
+    if (_firstStage > 1) return true; // stage 1 was confirmed, then deleted
     for (int s = 1; s <= _maxSlot; s++) {
       if (_placed(1, s)) return true;
     }
@@ -392,19 +399,33 @@ class _SetupScreenState extends State<SetupScreen>
 
   /// Every stage of the open setup at the graduation gate, [gap] from now,
   /// against [epsilon].
-  List<StageGate> _gatesWith(Duration gap, double epsilon) => graduationGates(
-        Deck(<MemCard>[
-          for (final MemCard c in _trainCards)
-            if (_studied[c.stageIndex]?.contains(c.slot) ?? false) c,
-        ]),
-        <int>[for (int i = 0; i <= _orbitDeepestStage; i++) _requiredOf(i)],
-        _schedule.clock.now().add(gap),
-        _schedule,
-        params: GraduationParams(epsilon: epsilon),
-      );
+  /// A stage deleted from the file is left out: it comes back passing, with
+  /// no maps ([_gateText] says so).
+  List<StageGate> _gatesWith(Duration gap, double epsilon) => <StageGate>[
+        for (final StageGate g in graduationGates(
+          Deck(<MemCard>[
+            for (final MemCard c in _trainCards)
+              if (_studied[c.stageIndex]?.contains(c.slot) ?? false) c,
+          ]),
+          <int>[for (int i = 0; i <= _orbitDeepestStage; i++) _requiredOf(i)],
+          _schedule.clock.now().add(gap),
+          _schedule,
+          params: GraduationParams(epsilon: epsilon),
+        ))
+          g.stage < _firstStage
+              ? StageGate(
+                  stage: g.stage,
+                  required: g.required,
+                  maps: 0,
+                  failure: 0,
+                  passes: true)
+              : g,
+      ];
 
   /// A stage at the gate, in words.
-  String _gateText(StageGate g, Duration gap) => g.maps == 0 &&
+  String _gateText(StageGate g, Duration gap) => g.stage < _firstStage
+      ? 'deleted from this file, left out of the gate'
+      : g.maps == 0 &&
           (_studied[g.stage]?.isEmpty ?? true)
       ? 'no maps set as studied — tick them in Cards (${_hint(_Cmd.cards)})'
       : 'after ${durationText(gap)}, ${chanceText(g.failure)} chance of '
@@ -773,7 +794,9 @@ press.calibrate.target    tick_soft.wav
   String _stageExplanation(int i) {
     final String head = 'Stage $i (Alt+$i).';
     final String state;
-    if (_advanceTarget == i) {
+    if (i < _firstStage) {
+      state = 'Deleted from this setup file: only a hard reset checks it.';
+    } else if (_advanceTarget == i) {
       state = 'Advancing into it (memory-hard).';
     } else if (_orbitK[i] != null) {
       state = 'Complete: its ${_requiredOf(i)} points are placed.';
@@ -2658,8 +2681,8 @@ press.calibrate.target    tick_soft.wav
   /// stages whose `o_i` the forward advance has already produced. The next stage
   /// (`+1`) is the one a forward navigation would advance into.
   int get _orbitReachableCeiling {
-    int c = 0;
-    for (int i = 1; i <= _maxStage; i++) {
+    int c = _firstStage;
+    for (int i = math.max(1, _firstStage); i <= _maxStage; i++) {
       if (_orbitO[i] != null) {
         c = i;
       } else {
@@ -2676,6 +2699,12 @@ press.calibrate.target    tick_soft.wav
   void _selectOrbitStage(int index) {
     if (index < 0 || index > _maxStage) {
       _sounds.play(UiSound.denyBlocked);
+      return;
+    }
+    if (index < _firstStage) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Stage $index is deleted from this setup file: only a hard '
+          'reset checks it.');
       return;
     }
     if (index == _orbitStage) {
@@ -3763,6 +3792,11 @@ press.calibrate.target    tick_soft.wav
     final List<MemCard> cards = _trainCards;
     final List<StageGate> gates = _gatesWith(_gap, _epsilon);
     for (int i = 0; i <= deepest; i++) {
+      if (i < _firstStage) {
+        _toast('Stage $i: deleted from this file; only a hard reset checks '
+            'it.');
+        continue;
+      }
       final StageProgress p = progress.stages[i];
       final List<int> due = <int>[
         for (final MemCard c in cards)
@@ -3801,6 +3835,9 @@ press.calibrate.target    tick_soft.wav
         text: (_epsilon * _kPercentScale).toString());
     bool plusReset = _gapPlusReset;
     bool wipe = false;
+    bool delete = false;
+    final bool deletable =
+        _bundleKey == null && _orbitSettled && _orbitDeepestStage > _firstStage;
     final DialogRoute<void> route = DialogRoute<void>(
         context: context,
         builder: (BuildContext ctx) => StatefulBuilder(
@@ -3952,6 +3989,14 @@ press.calibrate.target    tick_soft.wav
                   ),
                 ),
                 actions: <Widget>[
+                  if (deletable)
+                    TextButton(
+                      onPressed: _press(_Cue.graduationDelete, () {
+                        delete = true;
+                        Navigator.of(ctx).pop();
+                      }),
+                      child: const Text('Delete earlier stages…'),
+                    ),
                   if (green)
                     TextButton(
                       onPressed: _press(_Cue.graduationWipe, () {
@@ -3985,6 +4030,219 @@ press.calibrate.target    tick_soft.wav
       epsInput.dispose();
     }));
     if (wipe && mounted) await _retireKey();
+    if (delete && mounted) await _deleteStages();
+  }
+
+  /// The word typed to confirm deleting stages.
+  static const String _kDeleteWord = 'delete';
+
+  /// Delete stages [_firstStage]..j from the setup file (Graduation's *Delete
+  /// earlier stages*): which, after a warning naming any not yet passing the
+  /// gate and a typed confirmation; then the key that opened the file,
+  /// checked; stage 0's bundle sealed first if stage 0 goes, so it keeps
+  /// training from it; then the stages dropped here and the file rewritten
+  /// under the same key. The deepest stage always stays.
+  Future<void> _deleteStages() async {
+    final String path = _vaultPath.text.trim();
+    final int deepest = _orbitDeepestStage;
+    if (_bundleKey != null || path.isEmpty) {
+      _sounds.play(UiSound.denyInput);
+      _toast('Open the setup file first (${_hint(_Cmd.open)}).');
+      return;
+    }
+    if (!_orbitSettled || deepest <= _firstStage) {
+      _sounds.play(UiSound.denyBlocked);
+      _toast('Nothing to delete: the deepest stage always stays, complete.');
+      return;
+    }
+    final int? last = await _askStagesToDelete(deepest);
+    if (last == null || !mounted) return;
+    final int from = _firstStage;
+    final Uint8List? key = await _enterKey(
+        title: 'Delete stages $from to $last', action: 'Delete');
+    if (!mounted || key == null) return;
+    try {
+      await SetupCrypto.openPayload(await File(path).readAsBytes(), key);
+    } on Object {
+      _wipeBytes(key);
+      _sounds.play(UiSound.denyInput);
+      _toast('That key does not open the setup file: nothing deleted.');
+      return;
+    }
+    if (from == 0 &&
+        !await _sealStage0(
+          title: 'Delete stage 0: its bundle first',
+          intro: 'Stage 0\'s bundle is sealed first: σ and stage 0\'s card '
+              'records, under stage 0\'s points hardened by D Argon2 passes '
+              'at profile m. Its maps ride in the clear, so stage 0 trains '
+              'from it without the key. Then stage 0 leaves the setup file.',
+        )) {
+      _wipeBytes(key);
+      return;
+    }
+    if (!mounted) {
+      _wipeBytes(key);
+      return;
+    }
+    setState(() {
+      _dropStagesUpTo(last);
+      _vaultBusy = true;
+    });
+    if (_orbitStage < _firstStage) _setOrbitStage(_firstStage);
+    final ({String? error, Uint8List? key}) r =
+        await _saveOrbitVaultToFile(path, providedKey: key);
+    if (r.key != null) _wipeBytes(r.key!);
+    _wipeBytes(key);
+    if (!mounted) return;
+    setState(() => _vaultBusy = false);
+    if (r.error != null) {
+      _sounds.play(UiSound.denyInput);
+      _toast('Stages $from to $last are dropped here, but the file could not '
+          'be written: ${r.error} Save progress (${_hint(_Cmd.saveProgress)}) '
+          'tries again.');
+      return;
+    }
+    _deckDirty = false;
+    _sounds.play(UiSound.exportOk);
+    _toast('Stages $from to $last deleted from the setup file: only a hard '
+        'reset checks them now.');
+  }
+
+  /// Which stages to delete — [_firstStage] to the one returned, below
+  /// [deepest] — after a warning and a typed confirmation; null if cancelled.
+  Future<int?> _askStagesToDelete(int deepest) async {
+    int last = _firstStage;
+    final List<StageGate> gates = _gatesWith(_gap, _epsilon);
+    final TextEditingController typed = TextEditingController();
+    final DialogRoute<int> route = DialogRoute<int>(
+      context: context,
+      builder: (BuildContext ctx) => StatefulBuilder(
+        builder: (BuildContext ctx, void Function(void Function()) setLocal) {
+          final ColorScheme scheme = Theme.of(ctx).colorScheme;
+          final List<int> weak = <int>[
+            for (int i = _firstStage; i <= last; i++)
+              if (!gates[i].passes) i,
+          ];
+          final bool confirmed =
+              typed.text.trim().toLowerCase() == _kDeleteWord;
+          return AlertDialog(
+            title: const Text('Delete earlier stages'),
+            content: SizedBox(
+              width: _kGraduationWidth,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: <Widget>[
+                    Text('Stages $_firstStage to $last leave this setup file: '
+                        'their points, their keys and their cards. Train no '
+                        'longer shows them and the gate leaves them out; only '
+                        'a hard reset checks them. The deeper stages stay, '
+                        'with stage ${last + 1}\'s orbit point, so the '
+                        'deepest key is still in the file.'
+                        '${_firstStage == 0 ? ' Stage 0\'s bundle is sealed '
+                            'first, so stage 0 keeps training from it.' : ''}'),
+                    const SizedBox(height: _kRetireGap),
+                    Wrap(
+                      spacing: _kRetireGap / 2,
+                      children: <Widget>[
+                        for (int j = _firstStage; j < deepest; j++)
+                          ChoiceChip(
+                            label: Text(j == _firstStage
+                                ? 'Stage $j'
+                                : 'Stages $_firstStage to $j'),
+                            selected: last == j,
+                            onSelected: (_) => setLocal(() => last = j),
+                          ),
+                      ],
+                    ),
+                    if (weak.isNotEmpty) ...<Widget>[
+                      const SizedBox(height: _kRetireGap),
+                      Text(
+                        'WARNING: not passing the graduation gate yet: stage'
+                        '${weak.length == 1 ? '' : 's'} ${weak.join(', ')}. '
+                        'Once deleted, nothing but a hard reset tells you '
+                        'whether you still recall ${weak.length == 1 ? 'it' : 'them'}.',
+                        style: TextStyle(
+                            color: scheme.error, fontWeight: FontWeight.bold),
+                      ),
+                    ],
+                    const SizedBox(height: _kRetireGap),
+                    TextField(
+                      controller: typed,
+                      onChanged: (_) => setLocal(() {}),
+                      decoration: const InputDecoration(
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                        labelText: 'Type "$_kDeleteWord" to confirm',
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            actions: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: scheme.error,
+                  foregroundColor: scheme.onError,
+                ),
+                onPressed: confirmed ? () => Navigator.of(ctx).pop(last) : null,
+                child: const Text('Delete'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    final int? r = await _dialog(
+        _Cue.graduation, () => Navigator.of(context).push(route));
+    // The field is still drawn while the dialog animates out.
+    unawaited(route.completed.whenComplete(typed.dispose));
+    return r;
+  }
+
+  /// Drop stages [_firstStage]..[last] (must run inside a [setState]): their
+  /// points, keys and orbit points wiped, their cards and studied maps gone;
+  /// the first stage kept becomes `last + 1`.
+  void _dropStagesUpTo(int last) {
+    for (int st = _firstStage; st <= last; st++) {
+      _shareEncodeGen[st]++; // discard any in-flight share-marker encode
+      for (int s = 1; s <= _maxSlot; s++) {
+        final List<int>? c = _boardChunks[st][s];
+        if (c != null) Entropy.wipe(c);
+        _boardChunks[st][s] = null;
+        _boardPoints[st][s] = null;
+        _boardDerived[st][s] = false;
+      }
+      final Uint8List? k = _orbitK[st];
+      if (k != null) {
+        Entropy.wipe(k);
+        _orbitK[st] = null;
+      }
+      final Uint8List? o = st == 0 ? null : _orbitO[st];
+      if (o != null) {
+        Entropy.wipe(o);
+        _orbitO[st] = null;
+      }
+      _studied.remove(st);
+    }
+    _mapsChanged((int st, int _) => st <= last, drop: true);
+    final Set<String> selections = <String>{
+      for (int st = 0; st <= last; st++) selectionFact(st),
+    };
+    final Deck? deck = _deck;
+    if (deck != null) {
+      _deck = Deck(<MemCard>[
+        for (final MemCard c in deck.cards)
+          if (!selections.contains(c.factId)) c,
+      ]);
+    }
+    _firstStage = last + 1;
   }
 
   /// ε is entered and shown as a percentage.
@@ -4431,6 +4689,7 @@ press.calibrate.target    tick_soft.wav
   void _clearOrbitPlacements() {
     _clearAdvanceCheckpoint(); // a re-rooted orbit invalidates a halted advance
     _clearTrail();
+    _firstStage = 0;
     _deckDirty = false;
     _review.clear();
     for (int st = 0; st <= _maxStage; st++) {
@@ -5276,8 +5535,9 @@ press.calibrate.target    tick_soft.wav
               digest: List<int>.of(cp.digest),
             )
           : null,
+      firstStage: _firstStage,
       stages: <OrbitVaultStage>[
-        for (int i = 0; i <= deepest; i++)
+        for (int i = _firstStage; i <= deepest; i++)
           OrbitVaultStage(
             required: _requiredOf(i),
             orbit: i == 0 ? null : List<int>.of(_orbitO[i]!),
@@ -5362,21 +5622,25 @@ press.calibrate.target    tick_soft.wav
   Future<String?> _restoreOrbitVault(OrbitVault vault) async {
     final Uint8List? sigma = _parseHex(vault.sigma);
     if (sigma == null || sigma.isEmpty) return _vaultOpaqueError;
-    final int deepest = vault.stages.length - 1;
-    if (deepest < 0 || deepest > _maxStage) return _vaultOpaqueError;
+    final int first = vault.firstStage;
+    final int deepest = first + vault.stages.length - 1;
+    if (deepest < first || deepest > _maxStage) return _vaultOpaqueError;
     // Passes kept ride only with stage 0 alone: D was still open.
     if (vault.trail.isNotEmpty && deepest != 0) return _vaultOpaqueError;
 
     // Validate the whole file and resolve every stage's o_i and board
     // reservoirs first — the decode below is the expensive part, and a partial
     // restore of a bad file must never reach the screen state.
-    final List<Uint8List> orbits = <Uint8List>[];
+    // Deleted stages have no orbit point here.
+    final List<Uint8List?> orbits = <Uint8List?>[
+      for (int i = 0; i < first; i++) null,
+    ];
     final List<List<int>> pointsRaw = <List<int>>[];
     final List<List<int>> reservoirs = <List<int>>[];
     final List<({int stage, int slot})> targets = <({int stage, int slot})>[];
     final OrbitProtocol protocol = OrbitProtocol(widget.core);
-    for (int i = 0; i <= deepest; i++) {
-      final OrbitVaultStage stage = vault.stages[i];
+    for (int i = first; i <= deepest; i++) {
+      final OrbitVaultStage stage = vault.stages[i - first];
       if (stage.required != _requiredOf(i)) return _vaultNonStandardError;
       final List<int>? oI = stage.orbit;
       if (i == 0) {
@@ -5401,7 +5665,7 @@ press.calibrate.target    tick_soft.wav
           return _vaultOpaqueError;
         }
         final ({int o, int p, int q}) prm =
-            protocol.orbitParams(orbits[i], point.slot - 1);
+            protocol.orbitParams(orbits[i]!, point.slot - 1);
         pointsRaw.add(<int>[point.reRaw, point.imRaw]);
         reservoirs.add(<int>[prm.o, prm.p, prm.q]);
         targets.add((stage: i, slot: point.slot));
@@ -5461,7 +5725,8 @@ press.calibrate.target    tick_soft.wav
             if (vault.studied[i].isNotEmpty) i: vault.studied[i].toSet(),
         });
       if (_deck != null) _deck = _withAlwaysOnFacts(_deck!);
-      for (int i = 1; i <= deepest; i++) {
+      _firstStage = first;
+      for (int i = math.max(1, first); i <= deepest; i++) {
         // o₀ is never stored: [_stageOrbit] re-derives it from σ on demand.
         _orbitO[i] = orbits[i];
       }
@@ -5474,7 +5739,7 @@ press.calibrate.target    tick_soft.wav
       }
       // Every o_i is in place above, so each stage can now re-interpolate its
       // own Sh_i, recompute K_i and kick off the derived slots' marker encode.
-      for (int i = 0; i <= deepest; i++) {
+      for (int i = first; i <= deepest; i++) {
         _recomputeExtraShares(i);
       }
       // A halted advance, if the file carried one. Accepted only when it still
@@ -6133,9 +6398,12 @@ press.calibrate.target    tick_soft.wav
   /// their placed points are wiped ([_invalidateDeeperThan]).
   Future<void> _truncateOrbit() async {
     final int k = _orbitStage;
-    if (k < 1) {
+    if (k <= _firstStage) {
       _sounds.play(UiSound.deny);
-      _toast('Stage 0 is the orbit root — it cannot be excluded.');
+      _toast(k == 0
+          ? 'Stage 0 is the orbit root — it cannot be excluded.'
+          : 'Stage $k is the first stage this file keeps — it cannot be '
+              'excluded.');
       return;
     }
     final bool ok = await _consoleConfirm(
@@ -6390,7 +6658,7 @@ press.calibrate.target    tick_soft.wav
     setState(() {
       _deck ??= _deckForSave(deepest);
       // A stage with no maps set as studied starts from the maps you graded.
-      for (int i = 0; i <= deepest; i++) {
+      for (int i = _firstStage; i <= deepest; i++) {
         if (_studied[i]?.isNotEmpty ?? false) continue;
         final Set<int> graded = <int>{
           for (final MemCard c in _deck!.cards)
@@ -6510,7 +6778,7 @@ press.calibrate.target    tick_soft.wav
                           'counts only these, and each stage has a card to '
                           'recall which they are (prefilled with the maps '
                           'you graded).'),
-                      for (int i = 0; i <= deepest; i++)
+                      for (int i = _firstStage; i <= deepest; i++)
                         Row(
                           children: <Widget>[
                             SizedBox(
@@ -6663,12 +6931,34 @@ press.calibrate.target    tick_soft.wav
   /// part shows nothing of the setup's profile; `D` to about two minutes.
   /// Both are yours to set, and are stored in the clear.
   Future<void> _retireKey() async {
+    // A stage 0 deleted earlier had its bundle sealed then.
+    if (_firstStage > 0 ||
+        await _sealStage0(
+          title: 'Retire the provisional key',
+          intro: 'First stage 0\'s bundle is sealed: σ and stage 0\'s card '
+              'records, under stage 0\'s points hardened by D Argon2 passes '
+              'at profile m. Its maps ride in the clear, so stage 0 trains '
+              'from it without the key, and gives σ back if you forget it. '
+              'Then the setup file is wiped.',
+        )) {
+      await _wipeWizard();
+    }
+  }
+
+  /// Seal stage 0's bundle — σ and stage 0's card records under its points,
+  /// hardened by `D` Argon2 passes at `m`, both asked with the file's path —
+  /// next to the setup file. A dialog titled [title] opens with [intro].
+  /// Whether it was sealed.
+  Future<bool> _sealStage0({
+    required String title,
+    required String intro,
+  }) async {
     final Uint8List? o0 = _stageOrbit(0);
     final Uint8List? sh = _stageShBytes(0);
     if (o0 == null || sh == null) {
       _sounds.play(UiSound.denyBlocked);
       _toast('Stage 0 needs σ and its points to seal its bundle.');
-      return;
+      return false;
     }
     final String setupPath = _vaultPath.text.trim();
     final TextEditingController pathInput = TextEditingController(
@@ -6683,7 +6973,7 @@ press.calibrate.target    tick_soft.wav
       builder: (BuildContext ctx) => StatefulBuilder(
         builder: (BuildContext ctx, void Function(void Function()) setLocal) =>
             AlertDialog(
-          title: const Text('Retire the provisional key'),
+          title: Text(title),
           content: SizedBox(
             width: _kGraduationWidth,
             child: SingleChildScrollView(
@@ -6691,13 +6981,7 @@ press.calibrate.target    tick_soft.wav
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: <Widget>[
-                  const Text(
-                    'First stage 0\'s bundle is sealed: σ and stage 0\'s card '
-                    'records, under stage 0\'s points hardened by D Argon2 '
-                    'passes at profile m. Its maps ride in the clear, so stage '
-                    '0 trains from it without the key, and gives σ back if you '
-                    'forget it. Then the setup file is wiped.',
-                  ),
+                  Text(intro),
                   const SizedBox(height: _kRetireGap),
                   Wrap(
                     spacing: _kRetireGap / 2,
@@ -6768,12 +7052,12 @@ press.calibrate.target    tick_soft.wav
     }));
     if (!go || !mounted) {
       sh.fillRange(0, sh.length, 0);
-      return;
+      return false;
     }
     if (path.isEmpty) {
       sh.fillRange(0, sh.length, 0);
       _toast('Stage 0\'s bundle needs a file path.');
-      return;
+      return false;
     }
     try {
       if (passes == null || passes < 1) {
@@ -6796,17 +7080,17 @@ press.calibrate.target    tick_soft.wav
       final File tmp = File('$path.tmp');
       await tmp.writeAsBytes(file, flush: true);
       await tmp.rename(path);
-      if (!mounted) return;
+      if (!mounted) return false;
       _toast('Stage 0\'s bundle sealed at $path (m '
           '${_profileLabels[_profiles.indexOf(profile)]}, D $d).');
     } on Object catch (e) {
       _sounds.play(UiSound.denyBlocked);
-      _toast('Could not seal stage 0\'s bundle: $e. Nothing was wiped.');
-      return;
+      _toast('Could not seal stage 0\'s bundle: $e. Nothing else was done.');
+      return false;
     } finally {
       sh.fillRange(0, sh.length, 0);
     }
-    await _wipeWizard();
+    return true;
   }
 
   Future<void> _wipeWizard() async {
@@ -7123,6 +7407,7 @@ abstract final class _Cue {
   static const String graduationApply = 'graduation.apply';
   static const String graduationCancel = 'graduation.cancel';
   static const String graduationWipe = 'graduation.wipe';
+  static const String graduationDelete = 'graduation.delete';
   static const String cardsAdd = 'cards.add';
   static const String cardsClose = 'cards.close';
   static const String calibrateClose = 'calibrate.close';
@@ -7162,6 +7447,7 @@ abstract final class _Cue {
     graduationApply,
     graduationCancel,
     graduationWipe,
+    graduationDelete,
     cardsAdd,
     cardsClose,
     calibrateClose,

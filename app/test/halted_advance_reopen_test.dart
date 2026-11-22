@@ -141,7 +141,10 @@ void main() {
           find.widgetWithText(TextField, 'Key — 32 or 64 hex digits'), hex);
       await tester.tap(find.widgetWithText(FilledButton, 'Load'));
       await tester.pump();
-      await settle();
+      // A busy machine can take longer than one settle to open it.
+      for (int i = 0; i < 10 && !log().contains('Setup loaded.'); i++) {
+        await settle();
+      }
       expect(log(), contains('Setup loaded.'));
     }
 

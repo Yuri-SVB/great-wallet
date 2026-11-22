@@ -100,6 +100,21 @@ void main() {
       expect(() => OrbitVault.fromJson(json), throwsFormatException);
     });
 
+    test('the first stage kept round-trips; 0 is left out, a bad one fails',
+        () {
+      final Map<String, dynamic> json = envelopeVault().toJson();
+      expect(json.containsKey('firstStage'), isFalse);
+      expect(OrbitVault.fromJson(json).firstStage, 0);
+      json['firstStage'] = 1;
+      expect(OrbitVault.fromJson(json).firstStage, 1);
+      expect(OrbitVault.fromJson(json).toJson()['firstStage'], 1);
+      for (final Object bad in <Object>[0, -1, 'one']) {
+        json['firstStage'] = bad;
+        expect(() => OrbitVault.fromJson(json), throwsFormatException,
+            reason: '$bad');
+      }
+    });
+
     test('T covering a hard reset round-trips; off is left out', () {
       final Map<String, dynamic> json = envelopeVault().toJson();
       expect(json.containsKey('gapPlusReset'), isFalse);

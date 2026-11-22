@@ -45,6 +45,7 @@ class OrbitVault {
     this.gapSeconds,
     this.epsilon,
     this.gapPlusReset = false,
+    this.firstStage = 0,
     this.facts = const <CustomFact>[],
     this.studied = const <List<int>>[],
   });
@@ -87,8 +88,15 @@ class OrbitVault {
   /// `P` — the Argon2 memory profile.
   final Argon2Profile profile;
 
-  /// One entry per orbit stage, in stage order (index `0..N`).
+  /// One entry per orbit stage kept, in stage order: stage [firstStage]
+  /// first.
   final List<OrbitVaultStage> stages;
+
+  /// The first stage the file keeps: 0, or past the earlier stages deleted
+  /// from it (their points and keys gone; only a hard reset checks them).
+  /// The first stage kept then carries its orbit point, so the deeper ones
+  /// still open.
+  final int firstStage;
 
   /// A **halted** memory-hard advance's checkpoint, or null for a fully settled
   /// setup. Lets a reopened file continue the advance from the pass it reached
@@ -150,6 +158,7 @@ class OrbitVault {
         if (gapSeconds != null) 'gapSeconds': gapSeconds,
         if (epsilon != null) 'epsilon': epsilon,
         if (gapPlusReset) 'gapPlusReset': true,
+        if (firstStage > 0) 'firstStage': firstStage,
         if (facts.isNotEmpty)
           'facts': <Map<String, dynamic>>[
             for (final CustomFact f in facts) f.toJson(),
@@ -181,6 +190,11 @@ class OrbitVault {
     }
     final Object? rawResume = json['resume'];
     final Object? rawDeck = json['deck'];
+    final int first = switch (json['firstStage']) {
+      null => 0,
+      final int f when f > 0 => f,
+      _ => throw const FormatException('bad vault'),
+    };
     return OrbitVault(
       sigma: sigma,
       iterations: _int(json, 'iterations'),
@@ -206,8 +220,9 @@ class OrbitVault {
         final bool b => b,
         _ => throw const FormatException('bad vault'),
       },
+      firstStage: first,
       facts: _facts(json['facts']),
-      studied: _studied(json['studied'], rawStages.length),
+      studied: _studied(json['studied'], first + rawStages.length),
     );
   }
 
