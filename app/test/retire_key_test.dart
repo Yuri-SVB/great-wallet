@@ -69,7 +69,7 @@ void main() {
     const int heldDays = 100000; // recall after a week ≈ 99.999%
     MemCard held(MemCard card) => card.copyWith(
           repetitions: 5,
-          intervalDays: heldDays,
+          intervalDays: heldDays.toDouble(),
           due: DateTime.now().add(const Duration(days: heldDays)),
         );
     final Deck deck = Deck(<MemCard>[

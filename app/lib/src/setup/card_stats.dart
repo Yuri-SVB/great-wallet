@@ -40,6 +40,12 @@ String durationText(Duration d) {
   return '${d.inSeconds} s';
 }
 
+/// [days] whole, or to a tenth: early successes' partial credit adds
+/// fractions.
+String _daysText(double days) => days == days.roundToDouble()
+    ? '${days.round()}'
+    : days.toStringAsFixed(1);
+
 /// A card's name in the wizard.
 String cardName(MemCard c) => c.kind == CardKind.point
     ? 'Stage ${c.stageIndex}, map ${c.slot}'
@@ -110,7 +116,7 @@ class _CardStatsViewState extends State<CardStatsView> {
                 ? 'new: not graded yet'
                 : 'graded'
       ),
-      ('Interval', '${c.intervalDays} days'),
+      ('Interval', '${_daysText(c.intervalDays)} days'),
       ('Ease', c.easeFactor.toStringAsFixed(2)),
       ('Successes in a row', '${c.repetitions}'),
       ('Lapses', '${c.lapses}'),

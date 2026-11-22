@@ -3453,16 +3453,15 @@ press.calibrate.target    tick_soft.wav
 
   /// Why an attempt at [card] now is practice, in words, or null if it is
   /// graded ([ReviewSession.practiceReasonFor]).
-  String? _practiceReason(MemCard card) => _practiceText(
-      _review.practiceReasonFor(card, aided: _attemptAided), card);
+  String? _practiceReason(MemCard card) =>
+      _practiceText(_review.practiceReasonFor(card, aided: _attemptAided));
 
-  /// [r], why an attempt at [card] is practice, in words.
-  static String? _practiceText(PracticeReason? r, MemCard card) => switch (r) {
+  /// [r], why an attempt is practice, in words.
+  static String? _practiceText(PracticeReason? r) => switch (r) {
         null => null,
         PracticeReason.stopsShown => 'stops count as targets',
         PracticeReason.routeChanged => 'the route changed during the attempt',
         PracticeReason.gradedThisSession => 'graded already this session',
-        PracticeReason.notDue => 'not due until ${dateText(card.due!)}',
       };
 
   /// The shown map's route, for its targets: its stops (the leaf last) and
@@ -3634,7 +3633,7 @@ press.calibrate.target    tick_soft.wav
   /// Review the fact [card] in its dialog, and grade it as answered there.
   Future<void> _reviewFact(MemCard card) async {
     final String? practice =
-        _practiceText(_review.practiceReasonFor(card), card);
+        _practiceText(_review.practiceReasonFor(card));
     final CustomFact? custom = _customFacts[card.factId];
     final Widget? dialog = switch (card.factId) {
       kSaltFact => SaltDialog(
