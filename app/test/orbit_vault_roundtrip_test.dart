@@ -84,6 +84,19 @@ void main() {
     // group does a handful — well past the 30 s default.
     const Timeout slow = Timeout(Duration(minutes: 10));
 
+    test('a payload above the minimum is padded to the next power of two',
+        () async {
+      final String big = 'x' * (SetupCrypto.paddedMin + 1);
+      final SealedVault sealed = await SetupCrypto.sealPayload(
+          <String, dynamic>{'big': big},
+          providedKey: testKey);
+      const int overhead = 16 + 12 + 16;
+      expect(sealed.fileBytes.length, SetupCrypto.paddedMin * 2 + overhead);
+      final Map<String, dynamic> back =
+          await SetupCrypto.openPayload(sealed.fileBytes, testKey);
+      expect(back['big'], big);
+    }, timeout: slow);
+
     test('round-trips through seal/open and leaks nothing in cleartext',
         () async {
       final OrbitVault vault = envelopeVault();
