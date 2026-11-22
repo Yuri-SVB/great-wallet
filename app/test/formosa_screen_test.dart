@@ -307,8 +307,8 @@ void main() {
     expect(now().n, 6);
     expect(now().cardOf(7), isNull);
 
-    // Opened again the same day, sentence 3 wrong: Again; the others, just
-    // graded, are not due — practice.
+    // Opened again the same day, sentence 3 wrong: Again; the others, not
+    // due yet, are graded too, for partial credit (next to none so soon).
     await run(CommandContext.vault, 'Lock');
     await tester.pumpAndSettle();
     await run(CommandContext.vault, 'Open');
@@ -333,17 +333,23 @@ void main() {
     await tester.pump();
     await grading();
     expect(find.textContaining('not the vault\'s: Again'), findsOneWidget);
-    expect(find.text('Good'), findsNothing,
-        reason: 'a wrong one is only Again');
+    expect(find.textContaining('(early: partial credit)'), findsNWidgets(4));
+    for (int row = 0; row < 4; row++) {
+      await tester.tap(find.text('Good').at(row));
+    }
+    await tester.pump();
     await tester.tap(done);
     await tester.pump();
     await settle();
     expect(find.textContaining('Sentence 3 not the vault\'s: graded again.'),
         findsOneWidget);
-    expect(find.textContaining('Sentences 1, 2, 4, 6 not due yet: practice.'),
+    expect(find.textContaining('Sentences 1, 2, 4, 6 graded good.'),
         findsOneWidget);
     expect(now().cardOf(3)!.lapses, 1);
-    expect(now().cardOf(1)!.repetitions, 1, reason: 'practice moves nothing');
+    expect(now().cardOf(1)!.repetitions, 1,
+        reason: 'an early success keeps its run');
+    expect(now().cardOf(1)!.intervalDays, closeTo(1, 0.01),
+        reason: 'minutes after a review, next to no credit');
 
     // Opened with the provisional key alone: nothing graded.
     final List<String> before = <String>[

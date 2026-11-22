@@ -28,7 +28,7 @@ String chanceText(double r) => r == 0 || r >= _kWholePercentFrom
 const double _kWholePercentFrom = 0.01;
 const int _kSmallDigits = 2;
 
-/// A duration in days and hours, hours and minutes, or minutes.
+/// A duration in days and hours, hours and minutes, minutes, or seconds.
 String durationText(Duration d) {
   if (d.inDays >= 1) {
     return '${d.inDays} d ${d.inHours % Duration.hoursPerDay} h';
@@ -36,8 +36,15 @@ String durationText(Duration d) {
   if (d.inHours >= 1) {
     return '${d.inHours} h ${d.inMinutes % Duration.minutesPerHour} min';
   }
-  return '${d.inMinutes} min';
+  if (d.inMinutes >= 1) return '${d.inMinutes} min';
+  return '${d.inSeconds} s';
 }
+
+/// [days] whole, or to a tenth: early successes' partial credit adds
+/// fractions.
+String _daysText(double days) => days == days.roundToDouble()
+    ? '${days.round()}'
+    : days.toStringAsFixed(1);
 
 /// A card's name in the wizard.
 String cardName(MemCard c) => c.kind == CardKind.point
@@ -109,7 +116,7 @@ class _CardStatsViewState extends State<CardStatsView> {
                 ? 'new: not graded yet'
                 : 'graded'
       ),
-      ('Interval', '${c.intervalDays} days'),
+      ('Interval', '${_daysText(c.intervalDays)} days'),
       ('Ease', c.easeFactor.toStringAsFixed(2)),
       ('Successes in a row', '${c.repetitions}'),
       ('Lapses', '${c.lapses}'),

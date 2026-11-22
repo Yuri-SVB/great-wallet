@@ -84,6 +84,60 @@ void main() {
     // group does a handful — well past the 30 s default.
     const Timeout slow = Timeout(Duration(minutes: 10));
 
+    test('the trail round-trips, one orbit point per pass; a torn one fails',
+        () {
+      final Map<String, dynamic> json = envelopeVault().toJson();
+      final List<int> passes = <int>[
+        for (int p = 0; p < 3; p++)
+          for (int b = 0; b < kOrbitPointLen; b++) (p * 7 + b) & 0xFF,
+      ];
+      json['trail'] = base64Encode(passes);
+      final OrbitVault v = OrbitVault.fromJson(json);
+      expect(v.trail, hasLength(3));
+      expect(v.trail[1].first, 7);
+      expect(v.toJson()['trail'], json['trail']);
+      json['trail'] = base64Encode(passes.sublist(1));
+      expect(() => OrbitVault.fromJson(json), throwsFormatException);
+    });
+
+    test('the first stage kept round-trips; 0 is left out, a bad one fails',
+        () {
+      final Map<String, dynamic> json = envelopeVault().toJson();
+      expect(json.containsKey('firstStage'), isFalse);
+      expect(OrbitVault.fromJson(json).firstStage, 0);
+      json['firstStage'] = 1;
+      expect(OrbitVault.fromJson(json).firstStage, 1);
+      expect(OrbitVault.fromJson(json).toJson()['firstStage'], 1);
+      for (final Object bad in <Object>[0, -1, 'one']) {
+        json['firstStage'] = bad;
+        expect(() => OrbitVault.fromJson(json), throwsFormatException,
+            reason: '$bad');
+      }
+    });
+
+    test('T covering a hard reset round-trips; off is left out', () {
+      final Map<String, dynamic> json = envelopeVault().toJson();
+      expect(json.containsKey('gapPlusReset'), isFalse);
+      json['gapPlusReset'] = true;
+      expect(OrbitVault.fromJson(json).gapPlusReset, isTrue);
+      expect(OrbitVault.fromJson(json).toJson()['gapPlusReset'], isTrue);
+      json['gapPlusReset'] = 'yes';
+      expect(() => OrbitVault.fromJson(json), throwsFormatException);
+    });
+
+    test('a payload above the minimum is padded to the next power of two',
+        () async {
+      final String big = 'x' * (SetupCrypto.paddedMin + 1);
+      final SealedVault sealed = await SetupCrypto.sealPayload(
+          <String, dynamic>{'big': big},
+          providedKey: testKey);
+      const int overhead = 16 + 12 + 16;
+      expect(sealed.fileBytes.length, SetupCrypto.paddedMin * 2 + overhead);
+      final Map<String, dynamic> back =
+          await SetupCrypto.openPayload(sealed.fileBytes, testKey);
+      expect(back['big'], big);
+    }, timeout: slow);
+
     test('round-trips through seal/open and leaks nothing in cleartext',
         () async {
       final OrbitVault vault = envelopeVault();

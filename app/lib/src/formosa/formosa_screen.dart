@@ -506,7 +506,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
           await PassVault.open(_file!, entered, derive: widget.derive);
       if (!mounted) return;
       setState(() => _busy = null);
-      final ({Map<int, Grade> graded, List<int> early})? g =
+      final Map<int, Grade>? g =
           await _gradeEntered(o.vault, entered.keys, o.wrong);
       if (g == null || !mounted) return;
       setState(() {
@@ -520,13 +520,11 @@ class _FormosaScreenState extends State<FormosaScreen> {
             '${_slotsText(o.wrong)} not the vault\'s: graded again.',
           for (final Grade grade in Grade.values)
             if (<int>[
-              for (final MapEntry<int, Grade> e in g.graded.entries)
+              for (final MapEntry<int, Grade> e in g.entries)
                 if (e.value == grade && !o.wrong.contains(e.key)) e.key,
             ]..sort()
                 case final List<int> slots when slots.isNotEmpty)
               '${_slotsText(slots)} graded ${grade.name}.',
-          if (g.early.isNotEmpty)
-            '${_slotsText(g.early)} not due yet: practice.',
         ].join(' ');
       });
       await _save();
@@ -538,36 +536,31 @@ class _FormosaScreenState extends State<FormosaScreen> {
   }
 
   /// Grade the sentences [entered] at an opening, as you grade them: each
-  /// right and due takes your grade; each wrong one only Again, whether due or
-  /// not — a forgotten sentence must come back soon; each right before due is
-  /// practice, its schedule untouched. Those not entered are not reviewed.
-  /// Returns the slots by what they got, or null if the screen went away.
-  Future<({Map<int, Grade> graded, List<int> early})?> _gradeEntered(
+  /// right one takes your grade — before due, partial credit, in proportion to
+  /// what had been forgotten (the core's rule); each wrong one only Again,
+  /// whether due or not — a forgotten sentence must come back soon. Those not
+  /// entered are not reviewed. Returns the grades, or null if the screen went
+  /// away.
+  Future<Map<int, Grade>?> _gradeEntered(
       OpenVault v, Iterable<int> entered, List<int> wrong) async {
     final MemSchedule schedule = widget.schedule;
     final DateTime now = schedule.clock.now();
-    final List<int> early = <int>[];
-    final List<int> due = <int>[];
-    for (final int slot in (List<int>.of(entered)..sort())) {
-      final MemCard? c = v.header.cardOf(slot);
-      if (c == null) continue;
-      if (wrong.contains(slot) || c.isDue(now)) {
-        due.add(slot);
-      } else {
-        early.add(slot);
-      }
-    }
-    Map<int, Grade> graded = <int, Grade>{};
-    if (due.isNotEmpty) {
-      final Map<int, Grade>? g = await showDialog<Map<int, Grade>>(
-        context: context,
-        barrierDismissible: false,
-        builder: (BuildContext _) =>
-            _GradeSentencesDialog(due: due, wrong: wrong, early: early),
-      );
-      if (g == null || !mounted) return null;
-      graded = g;
-    }
+    final List<int> slots = <int>[
+      for (final int slot in (List<int>.of(entered)..sort()))
+        if (v.header.cardOf(slot) != null) slot,
+    ];
+    if (slots.isEmpty) return <int, Grade>{};
+    final List<int> early = <int>[
+      for (final int slot in slots)
+        if (!wrong.contains(slot) && !v.header.cardOf(slot)!.isDue(now)) slot,
+    ];
+    final Map<int, Grade>? graded = await showDialog<Map<int, Grade>>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext _) =>
+          _GradeSentencesDialog(slots: slots, wrong: wrong, early: early),
+    );
+    if (graded == null || !mounted) return null;
     v.header = v.header.withCards(<MemCard>[
       for (final MemCard c in v.header.cards)
         if (_slotOfCard(c) case final int slot when graded.containsKey(slot))
@@ -575,7 +568,7 @@ class _FormosaScreenState extends State<FormosaScreen> {
         else
           c,
     ]);
-    return (graded: graded, early: early);
+    return graded;
   }
 
   static int? _slotOfCard(MemCard c) {
@@ -2171,14 +2164,14 @@ class _EntryDialogState extends State<_EntryDialog> {
 /// one only Again. Every one is graded before going on.
 class _GradeSentencesDialog extends StatefulWidget {
   const _GradeSentencesDialog({
-    required this.due,
+    required this.slots,
     required this.wrong,
     required this.early,
   });
 
-  /// The slots to grade (right and due, or wrong), those wrong, and those
-  /// right before due (practice, shown only).
-  final List<int> due;
+  /// The slots to grade, those wrong (only Again), and those right before
+  /// due (partial credit).
+  final List<int> slots;
   final List<int> wrong;
   final List<int> early;
 
@@ -2188,7 +2181,7 @@ class _GradeSentencesDialog extends StatefulWidget {
 
 class _GradeSentencesDialogState extends State<_GradeSentencesDialog> {
   late final Map<int, Grade> _grades = <int, Grade>{
-    for (final int s in widget.due)
+    for (final int s in widget.slots)
       if (widget.wrong.contains(s)) s: Grade.again,
   };
 
@@ -2213,7 +2206,7 @@ class _GradeSentencesDialogState extends State<_GradeSentencesDialog> {
               const Text('How hard did each come back? If in doubt, the lower '
                   'grade: a sentence remembered only after a long effort is '
                   'Hard, or Again.'),
-              for (final int s in widget.due)
+              for (final int s in widget.slots)
                 Padding(
                   padding: const EdgeInsets.symmetric(
                       vertical: _FormosaScreenState._kGap / 2),
@@ -2221,7 +2214,9 @@ class _GradeSentencesDialogState extends State<_GradeSentencesDialog> {
                     spacing: _FormosaScreenState._kGap,
                     crossAxisAlignment: WrapCrossAlignment.center,
                     children: <Widget>[
-                      Text('Sentence $s'),
+                      Text('Sentence $s'
+                          '${widget.early.contains(s) ? ' (early: partial '
+                              'credit)' : ''}'),
                       if (widget.wrong.contains(s))
                         const Text('not the vault\'s: Again')
                       else
@@ -2251,17 +2246,13 @@ class _GradeSentencesDialogState extends State<_GradeSentencesDialog> {
                     ],
                   ),
                 ),
-              if (widget.early.isNotEmpty)
-                Text('Not due yet, so practice: sentence'
-                    '${widget.early.length == 1 ? '' : 's'} '
-                    '${widget.early.join(', ')}.'),
             ],
           ),
         ),
       ),
       actions: <Widget>[
         FilledButton(
-          onPressed: _grades.length == widget.due.length
+          onPressed: _grades.length == widget.slots.length
               ? () => Navigator.of(context).pop(_grades)
               : null,
           child: const Text('Done'),

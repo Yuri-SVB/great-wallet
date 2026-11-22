@@ -29,8 +29,11 @@ class SealedVault {
 /// **The plaintext is padded to a random length** ([paddedMin] plus a random
 /// amount below [paddedSpread]): the payload's length (4 bytes, big-endian),
 /// the payload JSON, then zeros. So the file's size says nothing of how many
-/// stages or maps it holds, and it changes with every save. Fields to be sealed
-/// under other keys later (Star Clock) nest inside the payload.
+/// stages or maps it holds, and it changes with every save. A payload larger
+/// than [paddedMin] (stage 1's passes, kept while D is open) is padded to the
+/// next power of two instead: its size tells only its order of magnitude.
+/// Fields to be sealed under other keys later (Star Clock) nest inside the
+/// payload.
 ///
 /// The key is never an arbitrary password — always 128 bits, handled three ways
 /// (KISS): generated → byte-mode QR (hand-coloured, scanned back, never read);
@@ -93,25 +96,32 @@ class SetupCrypto {
     );
   }
 
+  /// The padded plaintext's length for [n] bytes of length prefix and JSON:
+  /// [paddedMin] plus a random amount below [paddedSpread]; above [paddedMin]
+  /// (a power of two), the next power of two.
+  static int paddedSize(int n, Random rng) {
+    if (n <= paddedMin) return paddedMin + rng.nextInt(paddedSpread);
+    int size = paddedMin;
+    while (size < n) {
+      size *= 2;
+    }
+    return size;
+  }
+
   /// Encrypt a JSON [payload] (the orbit vault's), padded to a random length,
   /// and return the file plus the key. Uses [providedKey] (the user's own
   /// entropy, 16 or 32 bytes) if given, else generates a fresh
   /// [genLenBytes]-byte key (128-bit by default, 32 for the 256-bit mode). The
   /// caller owns and wipes [SealedVault.key]; the plaintext is zeroed here.
-  /// Throws a [FormatException] if the payload does not fit [paddedMin].
   static Future<SealedVault> sealPayload(
     Map<String, dynamic> payload, {
     Uint8List? providedKey,
     int genLenBytes = keyLenBytes,
   }) async {
     final List<int> json = utf8.encode(jsonEncode(payload));
-    if (_lengthLen + json.length > paddedMin) {
-      _zero(json);
-      throw const FormatException('The setup is too large to save.');
-    }
     final Random rng = Random.secure();
-    final Uint8List plaintext =
-        Uint8List(paddedMin + rng.nextInt(paddedSpread)); // zeros: the padding
+    final Uint8List plaintext = Uint8List(
+        paddedSize(_lengthLen + json.length, rng)); // zeros: the padding
     ByteData.sublistView(plaintext).setUint32(0, json.length);
     plaintext.setRange(_lengthLen, _lengthLen + json.length, json);
     _zero(json);
