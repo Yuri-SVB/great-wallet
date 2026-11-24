@@ -1,6 +1,16 @@
 include: package:flutter_lints/flutter.yaml
 
 analyzer:
+  # Generated directories. Listed here, so `flutter pub get` does not add them
+  # itself and leave the tree changed.
+  exclude:
+    - build/**
+    - android/**
+    - ios/**
+    - linux/**
+    - macos/**
+    - windows/**
+    - web/**
   language:
     strict-casts: true
     strict-raw-types: true

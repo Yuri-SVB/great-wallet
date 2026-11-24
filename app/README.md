@@ -111,10 +111,12 @@ app/native/build_core.sh
 # 2. Run the app (desktop-first, per TECH_STACK.md)
 cd app
 flutter pub get
-# one-time: generate the platform runner. Pass --org so the application id is
-# not the Flutter default "com.example.*" (that id shows up in OS dialogs and
-# window classes).
-flutter create --platforms=linux --org org.greatwall --project-name great_wallet .
+# one-time: generate the platform runner (tool/build.sh does it when it is
+# missing). Pass --org so the application id is not the Flutter default
+# "com.example.*" (that id shows up in OS dialogs and window classes); --empty
+# leaves out the template's counter test.
+flutter create --empty --platforms=linux --org org.greatwall --project-name great_wallet .
+git checkout -- .metadata            # keep the committed Flutter revision
 flutter run -d linux                 # or macos / windows
 ```
 
