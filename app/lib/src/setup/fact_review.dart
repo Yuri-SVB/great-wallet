@@ -301,7 +301,7 @@ class _ProvenanceDialogState extends State<ProvenanceDialog> {
               hit: false,
               scored: false,
               message: 'This build\'s digest is unknown (it was built without '
-                  'app/tool/build.sh): only Again can be scored.',
+                  'build.sh): only Again can be scored.',
             );
           }
           if (!same) {

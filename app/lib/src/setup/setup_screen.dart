@@ -1350,7 +1350,7 @@ press.calibrate.target    tick_soft.wav
     } on NamtsoUnavailable catch (e) {
       if (mounted) {
         setState(() => _harvestNote = 'Namtso unavailable: ${e.message} — '
-            'build it with app/native/build_namtso.sh, or paste σ below.');
+            'build the app with ./build.sh, or paste σ below.');
       }
     } on NamtsoError catch (e) {
       if (mounted) setState(() => _harvestNote = e.message);

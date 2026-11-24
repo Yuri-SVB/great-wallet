@@ -60,7 +60,7 @@ const String kCustomPrefix = 'misc:';
 const int kMaxCustomFacts = 64;
 const int kMaxFactChars = 256;
 
-/// The commit this build was made from, embedded by `app/tool/build.sh`
+/// The commit this build was made from, embedded by `build.sh`
 /// (`--dart-define=GW_COMMIT=…`); empty when built without it.
 const String kBuildCommit = String.fromEnvironment('GW_COMMIT');
 
@@ -144,7 +144,7 @@ bool sigmaMatches(String given, String sigma) =>
     _hex(given).isNotEmpty && _hex(given) == _hex(sigma);
 
 /// Whether the pasted commit digest [given] is this build's [commit]: null
-/// when the build's digest is unknown (built without `app/tool/build.sh`).
+/// when the build's digest is unknown (built without `build.sh`).
 bool? digestMatches(String given, {String commit = kBuildCommit}) {
   if (commit.length != kCommitHexDigits) return null;
   return _hex(given) == commit.toLowerCase();

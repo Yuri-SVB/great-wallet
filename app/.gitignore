@@ -5,6 +5,8 @@
 .pub/
 build/
 pubspec.lock
+# Rewritten by every `flutter pub get`, with this machine's paths and a date.
+.flutter-plugins-dependencies
 
 # Generated platform runners (produced by `flutter create`)
 /android/
