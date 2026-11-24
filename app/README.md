@@ -101,30 +101,22 @@ until then this is the minimal bridge that leaves the library untouched.
 
 ## Build & run
 
+`./build.sh`, at the repository's root, builds the app in one step: see the root
+[README](../README.md#build). It embeds the commit it builds from, so the
+supply-chain card can check the digest you paste after cloning and building a
+release anew; a working tree with changes builds without a digest.
+
+For development, run `./build.sh` once (it fetches the libraries, builds the
+native parts and generates the platform runner), then:
+
 ```bash
-# from great-wallet/
-git submodule update --init great-wall-core great-wall-ux great-wall-docs
-
-# 1. Build the engine the FFI layer loads
-app/native/build_core.sh
-
-# 2. Run the app (desktop-first, per TECH_STACK.md)
 cd app
-flutter pub get
-# one-time: generate the platform runner (tool/build.sh does it when it is
-# missing). Pass --org so the application id is not the Flutter default
-# "com.example.*" (that id shows up in OS dialogs and window classes); --empty
-# leaves out the template's counter test.
-flutter create --empty --platforms=linux --org org.greatwall --project-name great_wallet .
-git checkout -- .metadata            # keep the committed Flutter revision
 flutter run -d linux                 # or macos / windows
 ```
 
-### Building a release
-
-`app/tool/build.sh [platform]` builds with the commit it is built from embedded,
-so the supply-chain card can check the digest you paste after cloning and
-building a release anew. A working tree with changes builds without a digest.
+The runner is generated with `--org org.greatwall`, so the application id is
+not Flutter's default `com.example.*`, and with `--empty`, so Flutter's
+template counter test is left out.
 
 ### Printable key templates
 

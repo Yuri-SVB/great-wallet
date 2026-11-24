@@ -79,8 +79,8 @@ class CoreLibraryNotFound implements Exception {
 
   @override
   String toString() =>
-      'CoreLibraryNotFound: could not find $fileName. Build it with '
-      'native/build_core.sh (cargo build --release in '
-      'great-wall-core/burning_ship/rust_engine). Tried:\n'
+      'CoreLibraryNotFound: could not find $fileName. Build the app with '
+      './build.sh at the repository\'s root, or the engine alone with '
+      'app/native/build_core.sh. Tried:\n'
       '${triedPaths.map((String p) => '  - $p').join('\n')}';
 }
