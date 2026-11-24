@@ -123,7 +123,7 @@ class _SetupScreenState extends State<SetupScreen>
   final FocusNode _exportLabelFocus = FocusNode(debugLabel: 'export-label');
   final FocusNode _hueFocus = FocusNode(debugLabel: 'hue');
 
-  /// Per-stage **master-secret export label** (e.g. `SIGNING-1`). Appended to
+  /// Per-stage **master-secret export label** (e.g. `RETIREMENT`). Appended to
   /// the Argon2id transcript message at the exporting stage, versioning the
   /// derived secret — DESIGN.md §"Master-Secret Export". Same restricted
   /// `[A-Z0-9-]` widget as Stage 0; shown on every non-0 stage in all modes. A
@@ -1390,8 +1390,11 @@ press.calibrate.target    tick_soft.wav
             const SizedBox(height: 8),
             Text(
               'The Namtso salt: a memorable date → σ (1024 bits derived from '
-              'Bitcoin block headers) → the orbit root o₀. σ is public; its job '
-              'is to rule out precomputation, not secrecy.',
+              'Bitcoin block headers) → the orbit root o₀. Keep the date to '
+              'yourself, but assume it can be guessed: σ does its job even '
+              'then — a little more entropy for o₁, and pre-computed tables '
+              'that pay off less and cannot exist some time from its '
+              'corresponding timestamp.',
               style: theme.textTheme.bodyMedium,
             ),
             const SizedBox(height: 20),
@@ -1787,7 +1790,7 @@ press.calibrate.target    tick_soft.wav
         return BoardCommand(
           name: 'Key label',
           help: 'Shows the key’s label: an optional salt that versions the '
-              'exported key (e.g. SIGNING-1).',
+              'exported key (e.g. RETIREMENT).',
           icon: Icons.label_outline,
           run: () =>
               _showField(_Field.exportLabel, _exportLabelFocus, 'key label'),
@@ -1896,7 +1899,7 @@ press.calibrate.target    tick_soft.wav
               ? 'Copies the full export digest, not just its first 32 '
                   'characters.'
               : 'Derives and copies this stage’s key, blind: never shown.',
-          icon: full ? Icons.fingerprint : Icons.key,
+          icon: full ? Icons.key : Icons.fingerprint,
           enabled: !_busy,
           run: () => _copyMasterSecret(full: full),
         );
@@ -6452,7 +6455,7 @@ press.calibrate.target    tick_soft.wav
           isDense: true,
           border: OutlineInputBorder(),
           labelText: 'Key label (optional)',
-          hintText: 'e.g. SIGNING-1',
+          hintText: 'e.g. RETIREMENT',
         ),
         style: const TextStyle(
           fontFamily: GreatWallTypography.fontFamily,
@@ -6531,8 +6534,8 @@ press.calibrate.target    tick_soft.wav
     // Confirmation never echoes the secret itself — only how much of it there is.
     _toast('${full ? 'Full key' : 'Key'} copied ($chars chars) — '
         '${_exportEntropyNote(_activeStage, chars * 4)}.'
-        '${_activeStage == 0 ? ' Stage 0 is σ-public and its points are assumed'
-            ' seizable, so this key carries no coercion resistance.' : ''}'
+        '${_activeStage == 0 ? ' The threat model assumes stage 0 is seized at'
+            ' once, so this key carries no coercion resistance.' : ''}'
         ' Paste it, then clear the clipboard.');
   }
 
@@ -6614,7 +6617,7 @@ press.calibrate.target    tick_soft.wav
             'label. '
             '${_exportEntropyNote(_activeStage, MasterSecret.displayChars * 4)}. '
             'Paste into another wallet or use as a downstream pepper. The '
-            'optional salt versions the key (e.g. SIGNING-1, '
+            'optional salt versions the key (e.g. RETIREMENT, '
             'uppercase/digits/hyphen). ${_hint(_Cmd.copyKey)} copies it — '
             'blind, never shown.';
       case _Field.hue:
