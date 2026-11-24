@@ -4,14 +4,16 @@ on:
   push:
   pull_request:
 
-# The submodules are fetched explicitly at their pinned commits rather than
-# with `submodules: true`: .gitmodules uses SSH host aliases a runner does not
-# have. Override the repositories with the GREAT_WALL_CORE_REPO /
-# GREAT_WALL_UX_REPO variables, and give SUBMODULES_TOKEN read access if
-# they are private.
+# The submodules the app builds from are fetched explicitly at their pinned
+# commits rather than with `submodules: true`: .gitmodules uses SSH host aliases
+# a runner does not have. Override the repositories with the *_REPO variables
+# below, and give SUBMODULES_TOKEN read access if they are private.
 env:
   CORE_REPO: ${{ vars.GREAT_WALL_CORE_REPO || 'Yuri-SVB/great-wall-core' }}
   UX_REPO: ${{ vars.GREAT_WALL_UX_REPO || 'yuri-svb/great-wall-ux' }}
+  DICE_REPO: ${{ vars.DRAGON_DICE_REPO || 'yuri-svb/dragon-dice' }}
+  NF_CORE_REPO: ${{ vars.CELESTIAL_PEACE_NF_CORE_REPO || 'Yuri-SVB/celestial-peace-nf-core' }}
+  FORMOSA_REPO: ${{ vars.FORMOSA_REPO || 'yuri-svb/formosa' }}
 
 jobs:
   app:
@@ -24,6 +26,9 @@ jobs:
         run: |
           echo "core=$(git rev-parse HEAD:great-wall-core)" >> "$GITHUB_OUTPUT"
           echo "ux=$(git rev-parse HEAD:great-wall-ux)" >> "$GITHUB_OUTPUT"
+          echo "dice=$(git rev-parse HEAD:dragon-dice)" >> "$GITHUB_OUTPUT"
+          echo "nf_core=$(git rev-parse HEAD:celestial-peace-nf-core)" >> "$GITHUB_OUTPUT"
+          echo "formosa=$(git rev-parse HEAD:formosa)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         with:
@@ -37,6 +42,27 @@ jobs:
           repository: ${{ env.UX_REPO }}
           ref: ${{ steps.pins.outputs.ux }}
           path: great-wall-ux
+          token: ${{ secrets.SUBMODULES_TOKEN || github.token }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DICE_REPO }}
+          ref: ${{ steps.pins.outputs.dice }}
+          path: dragon-dice
+          token: ${{ secrets.SUBMODULES_TOKEN || github.token }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.NF_CORE_REPO }}
+          ref: ${{ steps.pins.outputs.nf_core }}
+          path: celestial-peace-nf-core
+          token: ${{ secrets.SUBMODULES_TOKEN || github.token }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORMOSA_REPO }}
+          ref: ${{ steps.pins.outputs.formosa }}
+          path: formosa
           token: ${{ secrets.SUBMODULES_TOKEN || github.token }}
 
       - uses: dtolnay/rust-toolchain@stable
