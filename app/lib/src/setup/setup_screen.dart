@@ -1390,8 +1390,11 @@ press.calibrate.target    tick_soft.wav
             const SizedBox(height: 8),
             Text(
               'The Namtso salt: a memorable date → σ (1024 bits derived from '
-              'Bitcoin block headers) → the orbit root o₀. σ is public; its job '
-              'is to rule out precomputation, not secrecy.',
+              'Bitcoin block headers) → the orbit root o₀. Keep the date to '
+              'yourself, but assume it can be guessed: σ does its job even '
+              'then — a little more entropy for o₁, and pre-computed tables '
+              'that pay off less and cannot exist some time from its '
+              'corresponding timestamp.',
               style: theme.textTheme.bodyMedium,
             ),
             const SizedBox(height: 20),
@@ -6531,8 +6534,8 @@ press.calibrate.target    tick_soft.wav
     // Confirmation never echoes the secret itself — only how much of it there is.
     _toast('${full ? 'Full key' : 'Key'} copied ($chars chars) — '
         '${_exportEntropyNote(_activeStage, chars * 4)}.'
-        '${_activeStage == 0 ? ' Stage 0 is σ-public and its points are assumed'
-            ' seizable, so this key carries no coercion resistance.' : ''}'
+        '${_activeStage == 0 ? ' The threat model assumes stage 0 is seized at'
+            ' once, so this key carries no coercion resistance.' : ''}'
         ' Paste it, then clear the clipboard.');
   }
 
